@@ -1,0 +1,47 @@
+[package]
+name = "dicron"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A simple native DICOM viewer built with Rust and egui"
+license = "GPL-3.0-or-later"
+authors = ["0John-Hong0"]
+repository = "https://github.com/0John-Hong0/dicron"
+readme = "README.md"
+keywords = ["dicom", "viewer", "medical-imaging", "egui"]
+categories = ["graphics", "visualization"]
+
+[[bin]]
+name = "dicron"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+dicom-core = "0.9.1"
+dicom-dictionary-std = "0.9.0"
+dicom-object = "0.9.1"
+dicom-pixeldata = { version = "0.9.1", features = ["charls", "image"] }
+eframe = "0.34.3"
+egui = "0.34.3"
+image = "0.25.6"
+rfd = "0.17.2"
+walkdir = "2.5.0"
+winit = { version = "0.30.13", default-features = false, features = ["x11"] }
+
+[build-dependencies]
+winresource = "0.1.31"
+
+[package.metadata.deb]
+maintainer = "0John-Hong0"
+copyright = "2026, 0John-Hong0"
+extended-description = """
+A simple native DICOM viewer built with Rust and egui.
+"""
+depends = "$auto"
+section = "graphics"
+priority = "optional"
+assets = [
+    ["target/release/dicron", "usr/bin/dicron", "755"],
+    ["packaging/linux/dicron.desktop", "usr/share/applications/dicron.desktop", "644"],
+    ["assets/icon.png", "usr/share/icons/hicolor/256x256/apps/dicron.png", "644"],
+]

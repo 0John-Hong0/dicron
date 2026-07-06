@@ -1,0 +1,12 @@
+
+# Build outputs
+/target/
+/dist/
+
+# Ignore large/local font binaries by default
+/assets/fonts/*
+
+# But commit small bundled UI fonts
+!/assets/fonts/README.md
+!/assets/fonts/Geist-Regular.ttf
+!/assets/fonts/GeistMono-Regular.ttf
