@@ -1,0 +1,10 @@
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-g++"
+ar = "x86_64-w64-mingw32-ar"
+
+rustflags = [
+    "-C", "link-arg=-lstdc++",
+    "-C", "link-arg=-lgcc_s",
+    "-C", "link-arg=-lgcc_eh",
+    "-C", "link-arg=-lgcc",
+]

@@ -1,0 +1,359 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      replace_existing:
+        description: "Delete and recreate existing tag/release if the Cargo.toml version already exists"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  PACKAGE_NAME: dicron
+  BINARY_NAME: dicron
+  WINDOWS_INSTALLER_PREFIX: DicronSetup
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          VERSION="$(python3 - <<'PY'
+          import tomllib
+
+          with open("Cargo.toml", "rb") as cargo_file:
+              cargo_config = tomllib.load(cargo_file)
+
+          print(cargo_config["package"]["version"])
+          PY
+          )"
+
+          TAG_NAME="v${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+          echo "Version: ${VERSION}"
+          echo "Tag: ${TAG_NAME}"
+
+      - name: Handle existing tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
+          REPLACE_EXISTING="${{ github.event.inputs.replace_existing }}"
+
+          TAG_EXISTS=false
+          RELEASE_EXISTS=false
+
+          if git ls-remote --exit-code --tags origin "$TAG_NAME" >/dev/null 2>&1; then
+            TAG_EXISTS=true
+          fi
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            RELEASE_EXISTS=true
+          fi
+
+          if [[ "$TAG_EXISTS" == "true" || "$RELEASE_EXISTS" == "true" ]]; then
+            if [[ "$REPLACE_EXISTING" != "true" ]]; then
+              echo "ERROR: $TAG_NAME already exists."
+              echo "Run workflow again with replace_existing=true, or bump Cargo.toml version."
+              exit 1
+            fi
+
+            echo "Replacing existing release/tag: $TAG_NAME"
+
+            if [[ "$RELEASE_EXISTS" == "true" ]]; then
+              gh release delete "$TAG_NAME" --yes || true
+            fi
+
+            if [[ "$TAG_EXISTS" == "true" ]]; then
+              git push origin ":refs/tags/$TAG_NAME" || true
+              git tag -d "$TAG_NAME" || true
+            fi
+          fi
+
+      - name: Create and push tag
+        run: |
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag "$TAG_NAME"
+          git push origin "$TAG_NAME"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
+
+          gh release create "$TAG_NAME" \
+            --title "$TAG_NAME" \
+            --notes "Release $TAG_NAME"
+
+  build-deb:
+    needs: create-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.create-release.outputs.tag_name }}
+
+      - name: Install Rust
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Install Debian build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            dpkg-dev \
+            cmake \
+            clang \
+            curl \
+            unzip \
+            libssl-dev \
+            libgtk-3-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libx11-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            libwayland-dev \
+            libxkbcommon-dev
+
+      - name: Fetch fonts
+        run: bash scripts/fetch-fonts.sh
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build deb
+        run: cargo deb
+
+      - name: Upload deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ needs.create-release.outputs.tag_name }}" target/debian/*.deb --clobber
+
+  build-arch:
+    needs: create-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.create-release.outputs.tag_name }}
+
+      - name: Build Arch package
+        run: |
+          RELEASE_VERSION="${{ needs.create-release.outputs.version }}"
+
+          docker run --rm \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -e RELEASE_VERSION="$RELEASE_VERSION" \
+            -v "$PWD:/work" \
+            archlinux:latest \
+            bash -lc '
+              set -euo pipefail
+
+              pacman -Syu --noconfirm
+              pacman -S --noconfirm \
+                base-devel \
+                git \
+                rust \
+                cargo \
+                pkgconf \
+                cmake \
+                clang \
+                curl \
+                unzip \
+                gtk3 \
+                fontconfig \
+                freetype2 \
+                libx11 \
+                libxi \
+                libxcursor \
+                libxrandr \
+                libxinerama \
+                mesa \
+                wayland \
+                libxkbcommon \
+                charls \
+                zstd
+
+              groupadd -g "$HOST_GID" builder
+              useradd -m -u "$HOST_UID" -g "$HOST_GID" builder
+
+              chown -R "$HOST_UID:$HOST_GID" /work
+
+              su builder -c "cd /work/packaging/arch && sed -i \"s/^pkgver=.*/pkgver=$RELEASE_VERSION/\" PKGBUILD && makepkg -sf --noconfirm"
+            '
+
+      - name: Upload Arch package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PACKAGE_FILE="$(find packaging/arch -maxdepth 1 -type f \
+            -name "${PACKAGE_NAME}-*.pkg.tar.zst" \
+            ! -name "${PACKAGE_NAME}-debug-*.pkg.tar.zst" \
+            | head -n 1)"
+
+          if [[ -z "$PACKAGE_FILE" ]]; then
+            echo "ERROR: Arch package not found"
+            exit 1
+          fi
+
+          gh release upload "${{ needs.create-release.outputs.tag_name }}" "$PACKAGE_FILE" --clobber
+
+  build-macos:
+    needs: create-release
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            package_suffix: macos-arm64
+          - runner: macos-15-intel
+            package_suffix: macos-x86_64
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.create-release.outputs.tag_name }}
+
+      - name: Install Rust
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Fetch fonts
+        run: bash scripts/fetch-fonts.sh
+
+      - name: Build macOS binary
+        run: cargo build --release --locked
+
+      - name: Package macOS app
+        env:
+          MACOS_PACKAGE_SUFFIX: ${{ matrix.package_suffix }}
+        run: bash scripts/package-macos.sh
+
+      - name: Upload macOS DMG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DMG_FILE="$(find dist/macos -maxdepth 1 -type f -name '*.dmg' | head -n 1)"
+
+          if [[ -z "$DMG_FILE" ]]; then
+            echo "ERROR: macOS DMG not found"
+            exit 1
+          fi
+
+          gh release upload "${{ needs.create-release.outputs.tag_name }}" "$DMG_FILE" --clobber
+
+  build-windows:
+    needs: create-release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.create-release.outputs.tag_name }}
+
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Fetch fonts
+        shell: bash
+        run: bash scripts/fetch-fonts.sh
+
+      - name: Build Windows exe
+        shell: pwsh
+        run: cargo build --release --locked
+
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis -y
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $appVersion = "${{ needs.create-release.outputs.version }}"
+
+          Remove-Item -Recurse -Force "dist/windows/app" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force "dist/windows/app"
+
+          Write-Host "Checking target/release..."
+          Get-ChildItem "target/release"
+
+          $exePath = Get-ChildItem "target/release" -Filter "*.exe" | Select-Object -First 1
+
+          if (-not $exePath) {
+            throw "No Windows exe found in target/release"
+          }
+
+          Write-Host "Using exe: $($exePath.FullName)"
+
+          Copy-Item $exePath.FullName "dist/windows/app/dicron.exe"
+
+          if (Test-Path "assets/licenses") {
+            New-Item -ItemType Directory -Force "dist/windows/app/licenses"
+            Copy-Item "assets/licenses/*" "dist/windows/app/licenses/"
+          }
+
+          Write-Host "Checking dist/windows/app..."
+          Get-ChildItem "dist/windows/app" -Recurse
+
+          & "C:\Program Files (x86)\NSIS\makensis.exe" `
+            "/DAPP_VERSION=$appVersion" `
+            "packaging/windows/dicron.nsi"
+
+      - name: Upload Windows installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $appVersion = "${{ needs.create-release.outputs.version }}"
+          gh release upload "${{ needs.create-release.outputs.tag_name }}" "dist/${env:WINDOWS_INSTALLER_PREFIX}-$appVersion.exe" --clobber

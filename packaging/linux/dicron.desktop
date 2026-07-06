@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Dicron
+Comment=Simple DICOM viewer
+Exec=dicron
+Icon=dicron
+Terminal=false
+Categories=Graphics;Viewer;
+StartupNotify=true

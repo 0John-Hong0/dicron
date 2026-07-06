@@ -1,0 +1,86 @@
+# Maintainer: 0John-Hong0
+
+pkgname=dicron
+pkgver=0.0.0
+pkgrel=1
+pkgdesc="Native DICOM image viewer"
+arch=("x86_64")
+url="https://github.com/0John-Hong0/dicron"
+license=("GPL-3.0-or-later" "OFL-1.1")
+options=("!debug")
+
+depends=(
+  "gcc-libs"
+  "glibc"
+  "fontconfig"
+  "freetype2"
+  "libx11"
+  "libxi"
+  "libxcursor"
+  "libxrandr"
+  "libxinerama"
+  "mesa"
+  "wayland"
+  "libxkbcommon"
+  "gtk3"
+  "charls"
+)
+
+makedepends=(
+  "cargo"
+  "git"
+  "curl"
+  "unzip"
+)
+
+source=("${pkgname}::git+file://${startdir}/../..")
+sha256sums=("SKIP")
+
+prepare() {
+  cd "${srcdir}/${pkgname}"
+  bash scripts/fetch-fonts.sh
+}
+
+build() {
+  cd "${srcdir}/${pkgname}"
+
+  echo "Checking system CharLS library..."
+  ls -lh /usr/lib/libcharls.so*
+
+  echo "Checking required CharLS symbols..."
+  readelf -Ws /usr/lib/libcharls.so | grep -E \
+    "charls_get_error_message|charls_jpegls_decoder_create|charls_jpegls_encoder_create"
+
+  RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--no-as-needed -C link-arg=/usr/lib/libcharls.so" \
+    cargo build --release --locked
+}
+
+package() {
+  cd "${srcdir}/${pkgname}"
+
+  install -Dm755 "target/release/dicron" \
+    "${pkgdir}/usr/bin/dicron"
+
+  install -Dm644 "packaging/linux/dicron.desktop" \
+    "${pkgdir}/usr/share/applications/dicron.desktop"
+
+  if [[ -f "assets/icon.png" ]]; then
+    install -Dm644 "assets/icon.png" \
+      "${pkgdir}/usr/share/icons/hicolor/256x256/apps/dicron.png"
+  fi
+
+  if [[ -f "assets/icon.svg" ]]; then
+    install -Dm644 "assets/icon.svg" \
+      "${pkgdir}/usr/share/icons/hicolor/scalable/apps/dicron.svg"
+  fi
+
+  if [[ -f "assets/icon.ico" ]]; then
+    install -Dm644 "assets/icon.ico" \
+      "${pkgdir}/usr/share/pixmaps/dicron.ico"
+  fi
+
+  if [[ -d "assets/licenses" ]]; then
+    install -d "${pkgdir}/usr/share/licenses/${pkgname}"
+    install -m644 assets/licenses/* "${pkgdir}/usr/share/licenses/${pkgname}/"
+  fi
+}
