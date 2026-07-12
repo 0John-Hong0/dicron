@@ -12,6 +12,10 @@ pub fn show(ui: &mut egui::Ui, metadata_items: &[&MetadataItem]) {
 
     egui::ScrollArea::both()
         .id_salt("dicom_metadata_table_scroll_area")
+        .scroll_source(
+            egui::scroll_area::ScrollSource::SCROLL_BAR
+                | egui::scroll_area::ScrollSource::MOUSE_WHEEL,
+        )
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.set_min_width(TABLE_MIN_WIDTH);
@@ -57,12 +61,18 @@ fn header_cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str) {
     );
 }
 
-fn cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, height),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend));
-        },
-    );
+fn cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str) -> egui::Response {
+    let layout = egui::Layout::left_to_right(egui::Align::Center)
+        .with_main_align(egui::Align::Min)
+        .with_main_justify(true)
+        .with_cross_justify(true);
+
+    ui.allocate_ui_with_layout(egui::vec2(width, height), layout, |ui| {
+        ui.add(
+            egui::Label::new(text)
+                .selectable(true)
+                .wrap_mode(egui::TextWrapMode::Extend),
+        )
+    })
+    .inner
 }

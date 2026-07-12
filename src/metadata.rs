@@ -1,8 +1,12 @@
 use dicom_core::header::{HasLength, Header};
 use dicom_core::value::Value;
-use dicom_core::{DataDictionary, dictionary::DataDictionaryEntry};
-use dicom_dictionary_std::StandardDataDictionary;
+use dicom_core::{
+    DataDictionary, Tag,
+    dictionary::{DataDictionaryEntry, UidDictionary, UidDictionaryEntry},
+};
+use dicom_dictionary_std::{StandardDataDictionary, StandardSopClassDictionary, tags};
 use dicom_object::DefaultDicomObject;
+use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
 
 use crate::dicom::value as dicom_value;
 
@@ -55,12 +59,18 @@ fn extract_curated_dicom_metadata(dicom_object: &DefaultDicomObject) -> Vec<Meta
         MetadataItem::new(
             "(0002,0010)".to_owned(),
             "Transfer Syntax UID".to_owned(),
-            dicom_object.meta().transfer_syntax().to_owned(),
+            format_dicom_text_value(
+                tags::TRANSFER_SYNTAX_UID,
+                dicom_object.meta().transfer_syntax(),
+            ),
         ),
         MetadataItem::new(
             "(0002,0002)".to_owned(),
             "Media Storage SOP Class UID".to_owned(),
-            dicom_object.meta().media_storage_sop_class_uid().to_owned(),
+            format_dicom_text_value(
+                tags::MEDIA_STORAGE_SOP_CLASS_UID,
+                dicom_object.meta().media_storage_sop_class_uid(),
+            ),
         ),
         MetadataItem::new(
             "(0002,0003)".to_owned(),
@@ -390,18 +400,130 @@ where
         return "<non-text value>".to_owned();
     };
 
-    let cleaned_value = dicom_value::clean_text_value(raw_value.as_ref());
+    format_dicom_text_value(element.tag(), raw_value.as_ref())
+}
+
+fn format_dicom_text_value(tag: Tag, raw_value: &str) -> String {
+    let cleaned_value = dicom_value::clean_text_value(raw_value);
 
     if cleaned_value.is_empty() {
-        "-".to_owned()
-    } else {
-        cleaned_value
+        return "-".to_owned();
     }
+
+    match known_dicom_value_name(tag, &cleaned_value) {
+        Some(name) => format!("{name} ({cleaned_value})"),
+        None => cleaned_value,
+    }
+}
+
+fn known_dicom_value_name(tag: Tag, raw_value: &str) -> Option<String> {
+    let name = match tag {
+        tags::TRANSFER_SYNTAX_UID => {
+            return TransferSyntaxRegistry
+                .get(raw_value)
+                .map(|transfer_syntax| transfer_syntax.name().to_owned());
+        }
+        tags::MEDIA_STORAGE_SOP_CLASS_UID | tags::SOP_CLASS_UID => {
+            return StandardSopClassDictionary
+                .by_uid(raw_value)
+                .map(|entry| entry.name().to_owned());
+        }
+        tags::PIXEL_REPRESENTATION => match raw_value {
+            "0" => "Unsigned integer",
+            "1" => "Signed two's-complement integer",
+            _ => return None,
+        },
+        tags::PLANAR_CONFIGURATION => match raw_value {
+            "0" => "Color-by-pixel",
+            "1" => "Color-by-plane",
+            _ => return None,
+        },
+        tags::LOSSY_IMAGE_COMPRESSION => match raw_value {
+            "00" => "Has not undergone lossy compression",
+            "01" => "Has undergone lossy compression",
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    Some(name.to_owned())
 }
 
 fn summarize_large_value(label: &str, length: dicom_core::Length) -> String {
     match length.get() {
         Some(byte_count) => format!("<{label}: {byte_count} bytes>"),
         None => format!("<{label}: undefined length>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_known_transfer_syntax_with_raw_uid() {
+        assert_eq!(
+            format_dicom_text_value(tags::TRANSFER_SYNTAX_UID, "1.2.840.10008.1.2.4.50\0"),
+            "JPEG Baseline (Process 1) (1.2.840.10008.1.2.4.50)"
+        );
+    }
+
+    #[test]
+    fn formats_known_sop_class_but_not_instance_uid() {
+        let ct_image_storage_uid = "1.2.840.10008.5.1.4.1.1.2";
+
+        assert_eq!(
+            format_dicom_text_value(tags::SOP_CLASS_UID, ct_image_storage_uid),
+            "CT Image Storage (1.2.840.10008.5.1.4.1.1.2)"
+        );
+        assert_eq!(
+            format_dicom_text_value(tags::SOP_INSTANCE_UID, ct_image_storage_uid),
+            ct_image_storage_uid
+        );
+    }
+
+    #[test]
+    fn formats_small_standard_value_sets() {
+        let cases = [
+            (
+                tags::PIXEL_REPRESENTATION,
+                "1",
+                "Signed two's-complement integer (1)",
+            ),
+            (tags::PLANAR_CONFIGURATION, "0", "Color-by-pixel (0)"),
+            (
+                tags::LOSSY_IMAGE_COMPRESSION,
+                "00",
+                "Has not undergone lossy compression (00)",
+            ),
+        ];
+
+        for (tag, raw_value, expected) in cases {
+            assert_eq!(format_dicom_text_value(tag, raw_value), expected);
+        }
+    }
+
+    #[test]
+    fn leaves_unknown_values_unchanged() {
+        assert_eq!(
+            format_dicom_text_value(tags::TRANSFER_SYNTAX_UID, "1.2.3.4.5"),
+            "1.2.3.4.5"
+        );
+        assert_eq!(
+            format_dicom_text_value(tags::PIXEL_REPRESENTATION, "2"),
+            "2"
+        );
+    }
+
+    #[test]
+    fn friendly_and_raw_values_are_searchable() {
+        let item = MetadataItem::new(
+            "(0002,0010)".to_owned(),
+            "Transfer Syntax UID".to_owned(),
+            format_dicom_text_value(tags::TRANSFER_SYNTAX_UID, "1.2.840.10008.1.2.1"),
+        );
+
+        assert!(item.matches_search("explicit vr little endian"));
+        assert!(item.matches_search("1.2.840.10008.1.2.1"));
     }
 }
