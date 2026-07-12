@@ -6,6 +6,9 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Show friendlier labels for known DICOM metadata values while keeping raw UIDs and codes visible.
+- Make metadata table values selectable for easier copying.
+
 ## [0.1.0] - 2026-07-06
 
 - Initial open-source release of Dicron.
