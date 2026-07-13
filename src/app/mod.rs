@@ -164,6 +164,9 @@ struct WindowLevel {
 
 impl Default for DicronApp {
     fn default() -> Self {
+        let dialog_directories = DialogDirectories::load();
+        let about_dialog = AboutDialog::new(dialog_directories.check_for_updates_on_startup);
+
         Self {
             selected_dicom_path: None,
             selected_dicom_frame_index: 0,
@@ -178,7 +181,7 @@ impl Default for DicronApp {
             all_metadata_items: Vec::new(),
             metadata_search_text: String::new(),
             show_all_metadata: false,
-            about_dialog: AboutDialog::new(),
+            about_dialog,
             error_message: None,
 
             window_center: 128.0,
@@ -207,7 +210,7 @@ impl Default for DicronApp {
             left_panel_width: LEFT_PANEL_DEFAULT_WIDTH,
             right_panel_width: RIGHT_PANEL_DEFAULT_WIDTH,
             tree_view_generation: 0,
-            dialog_directories: DialogDirectories::load(),
+            dialog_directories,
         }
     }
 }

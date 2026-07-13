@@ -2,6 +2,10 @@ use super::*;
 
 impl eframe::App for DicronApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let check_for_updates_on_startup = self.dialog_directories.check_for_updates_on_startup;
+        self.about_dialog
+            .poll(ui.ctx(), check_for_updates_on_startup);
+
         self.receive_scan_messages(ui.ctx());
         self.handle_dropped_paths(ui.ctx());
         self.handle_keyboard_shortcuts(ui.ctx());
@@ -12,7 +16,8 @@ impl eframe::App for DicronApp {
             panel_content_frame().show(ui, |ui| {
                 self.show_toolbar_actions(ui);
 
-                self.about_dialog.show(ui.ctx());
+                self.about_dialog
+                    .show(ui.ctx(), &mut self.dialog_directories);
 
                 if let Some(selected_dicom_path) = &self.selected_dicom_path {
                     if self.selected_dicom_frame_count > 1 {
@@ -171,6 +176,8 @@ impl eframe::App for DicronApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.show_viewer_panel(ui);
         });
+
+        self.about_dialog.show_notification(ui.ctx());
     }
 }
 
@@ -186,7 +193,7 @@ impl DicronApp {
             }
 
             if ui.button("About").clicked() {
-                self.about_dialog.open();
+                self.about_dialog.open(ui.ctx());
             }
         });
     }

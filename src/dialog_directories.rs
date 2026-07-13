@@ -5,6 +5,8 @@ pub struct DialogDirectories {
     pub open_folder_directory: Option<PathBuf>,
     /// Whether newly loaded Patient/Study/Series nodes start expanded.
     pub expand_tree_by_default: bool,
+    /// Whether Dicron checks GitHub for a newer release when it starts.
+    pub check_for_updates_on_startup: bool,
 }
 
 impl Default for DialogDirectories {
@@ -13,6 +15,7 @@ impl Default for DialogDirectories {
             open_dicom_directory: None,
             open_folder_directory: None,
             expand_tree_by_default: true,
+            check_for_updates_on_startup: true,
         }
     }
 }
@@ -50,6 +53,9 @@ impl DialogDirectories {
                 "expand_tree_by_default" => {
                     dialog_directories.expand_tree_by_default = value.trim() != "false";
                 }
+                "check_for_updates_on_startup" => {
+                    dialog_directories.check_for_updates_on_startup = value.trim() != "false";
+                }
                 _ => {}
             }
         }
@@ -59,6 +65,11 @@ impl DialogDirectories {
 
     pub fn set_expand_tree_by_default(&mut self, expand_tree_by_default: bool) {
         self.expand_tree_by_default = expand_tree_by_default;
+        self.save();
+    }
+
+    pub fn set_check_for_updates_on_startup(&mut self, check_for_updates_on_startup: bool) {
+        self.check_for_updates_on_startup = check_for_updates_on_startup;
         self.save();
     }
 
@@ -104,6 +115,14 @@ impl DialogDirectories {
 
         settings_text.push_str("expand_tree_by_default=");
         settings_text.push_str(if self.expand_tree_by_default {
+            "true"
+        } else {
+            "false"
+        });
+        settings_text.push('\n');
+
+        settings_text.push_str("check_for_updates_on_startup=");
+        settings_text.push_str(if self.check_for_updates_on_startup {
             "true"
         } else {
             "false"
