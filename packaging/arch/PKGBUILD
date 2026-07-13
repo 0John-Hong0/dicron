@@ -23,12 +23,13 @@ depends=(
   "wayland"
   "libxkbcommon"
   "gtk3"
-  "charls"
 )
 
 makedepends=(
   "cargo"
+  "cmake"
   "git"
+  "pkgconf"
   "curl"
   "unzip"
 )
@@ -44,15 +45,7 @@ prepare() {
 build() {
   cd "${srcdir}/${pkgname}"
 
-  echo "Checking system CharLS library..."
-  ls -lh /usr/lib/libcharls.so*
-
-  echo "Checking required CharLS symbols..."
-  readelf -Ws /usr/lib/libcharls.so | grep -E \
-    "charls_get_error_message|charls_jpegls_decoder_create|charls_jpegls_encoder_create"
-
-  RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--no-as-needed -C link-arg=/usr/lib/libcharls.so" \
-    cargo build --release --locked
+  cargo build --release --locked
 }
 
 package() {
