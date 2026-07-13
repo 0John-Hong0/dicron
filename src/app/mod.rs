@@ -20,12 +20,14 @@ use crate::metadata::{DicomMetadata, MetadataItem};
 use crate::metadata_table;
 use crate::texture::{fit_image_to_available_space, upload_color_image};
 
+mod about_dialog;
 mod cache;
 mod io;
 mod layout;
 mod tree;
 mod viewer;
 
+use about_dialog::AboutDialog;
 use cache::DecodedCache;
 
 const LEFT_PANEL_DEFAULT_WIDTH: f32 = 450.0;
@@ -62,7 +64,6 @@ const PLAYBACK_BAR_VERTICAL_PADDING: f32 = 4.0;
 const DEFAULT_AUTOPLAY_FPS: f32 = 15.0;
 const MIN_AUTOPLAY_FPS: f32 = 0.5;
 const MAX_AUTOPLAY_FPS: f32 = 120.0;
-const APP_AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
 
 type SeriesKey = (usize, usize, usize);
 type SliceKey = (usize, usize, usize, usize);
@@ -108,7 +109,7 @@ pub struct DicronApp {
     all_metadata_items: Vec<MetadataItem>,
     metadata_search_text: String,
     show_all_metadata: bool,
-    show_about_dialog: bool,
+    about_dialog: AboutDialog,
     error_message: Option<String>,
 
     window_center: f64,
@@ -177,7 +178,7 @@ impl Default for DicronApp {
             all_metadata_items: Vec::new(),
             metadata_search_text: String::new(),
             show_all_metadata: false,
-            show_about_dialog: false,
+            about_dialog: AboutDialog::new(),
             error_message: None,
 
             window_center: 128.0,
