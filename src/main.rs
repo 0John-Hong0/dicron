@@ -6,6 +6,7 @@ mod dicom;
 mod metadata;
 mod metadata_table;
 mod texture;
+mod update;
 
 use std::path::PathBuf;
 use std::sync::Arc;

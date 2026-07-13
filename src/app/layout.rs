@@ -2,6 +2,10 @@ use super::*;
 
 impl eframe::App for DicronApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let check_for_updates_on_startup = self.dialog_directories.check_for_updates_on_startup;
+        self.about_dialog
+            .poll(ui.ctx(), check_for_updates_on_startup);
+
         self.receive_scan_messages(ui.ctx());
         self.handle_dropped_paths(ui.ctx());
         self.handle_keyboard_shortcuts(ui.ctx());
@@ -12,7 +16,8 @@ impl eframe::App for DicronApp {
             panel_content_frame().show(ui, |ui| {
                 self.show_toolbar_actions(ui);
 
-                self.show_about_dialog(ui.ctx());
+                self.about_dialog
+                    .show(ui.ctx(), &mut self.dialog_directories);
 
                 if let Some(selected_dicom_path) = &self.selected_dicom_path {
                     if self.selected_dicom_frame_count > 1 {
@@ -171,6 +176,8 @@ impl eframe::App for DicronApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.show_viewer_panel(ui);
         });
+
+        self.about_dialog.show_notification(ui.ctx());
     }
 }
 
@@ -186,53 +193,9 @@ impl DicronApp {
             }
 
             if ui.button("About").clicked() {
-                self.show_about_dialog = true;
+                self.about_dialog.open(ui.ctx());
             }
         });
-    }
-
-    pub(super) fn show_about_dialog(&mut self, context: &egui::Context) {
-        if !self.show_about_dialog {
-            return;
-        }
-
-        egui::Window::new("About Dicron")
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut self.show_about_dialog)
-            .show(context, |ui| {
-                ui.heading("Dicron");
-                ui.separator();
-
-                egui::Grid::new("about_dialog_grid")
-                    .num_columns(2)
-                    .spacing(egui::vec2(12.0, 6.0))
-                    .show(ui, |ui| {
-                        ui.label("Version");
-                        ui.monospace(env!("CARGO_PKG_VERSION"));
-                        ui.end_row();
-
-                        ui.label("Description");
-                        ui.label(env!("CARGO_PKG_DESCRIPTION"));
-                        ui.end_row();
-
-                        ui.label("Maintainer");
-                        ui.label(format_authors(APP_AUTHORS));
-                        ui.end_row();
-
-                        ui.label("License");
-                        ui.label(env!("CARGO_PKG_LICENSE"));
-                        ui.end_row();
-
-                        ui.label("Platform");
-                        ui.label(format!(
-                            "{} / {}",
-                            std::env::consts::OS,
-                            std::env::consts::ARCH
-                        ));
-                        ui.end_row();
-                    });
-            });
     }
 
     pub(super) fn clamp_panel_widths(&mut self, ui: &egui::Ui) {
@@ -376,15 +339,6 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-/// `CARGO_PKG_AUTHORS` is colon-separated and may be empty; render it for display.
-fn format_authors(authors: &str) -> String {
-    if authors.trim().is_empty() {
-        "unknown".to_owned()
-    } else {
-        authors.replace(':', ", ")
-    }
-}
-
 fn pointer_position_inside_content(ui: &egui::Ui) -> Option<egui::Pos2> {
     let content_rect = ui.ctx().content_rect();
 
@@ -414,13 +368,5 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(90)), "1m 30s");
         assert_eq!(format_duration(Duration::from_secs(3661)), "1h 1m 1s");
         assert_eq!(format_duration(Duration::from_secs(7200)), "2h 0m 0s");
-    }
-
-    #[test]
-    fn format_authors_handles_empty_and_multiple() {
-        assert_eq!(format_authors(""), "unknown");
-        assert_eq!(format_authors("   "), "unknown");
-        assert_eq!(format_authors("Alice"), "Alice");
-        assert_eq!(format_authors("Alice:Bob"), "Alice, Bob");
     }
 }
