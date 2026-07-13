@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-13
+
 - Add project and release links to the About dialog.
 - Add a manual update check against the latest GitHub release.
 - Show friendlier labels for known DICOM metadata values while keeping raw UIDs and codes visible.
