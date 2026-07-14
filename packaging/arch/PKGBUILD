@@ -7,7 +7,9 @@ pkgdesc="Native DICOM image viewer"
 arch=("x86_64")
 url="https://github.com/0John-Hong0/dicron"
 license=("GPL-3.0-or-later" "OFL-1.1")
-options=("!debug")
+# rust-lld cannot link GCC slim-LTO objects bundled by native Rust dependencies
+# such as ring, so keep makepkg's native LTO disabled for this package.
+options=("!debug" "!lto")
 
 depends=(
   "gcc-libs"
