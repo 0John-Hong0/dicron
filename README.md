@@ -1,10 +1,8 @@
 # Dicron
 
-A small native DICOM image viewer built with Rust and egui.
+Dicron is a native desktop viewer for quickly opening local DICOM files and folders, browsing studies, inspecting metadata, and adjusting window/level.
 
-`dicron` is focused on quickly opening local DICOM files and folders, browsing studies as a patient / study / series tree, inspecting tags, and adjusting window level without pulling in a large PACS workstation stack.
-
-> This project is not a diagnostic medical device. Do not use it for clinical decisions.
+> Dicron is not a diagnostic medical device. Do not use it for clinical decisions.
 
 ## Features
 
@@ -12,122 +10,40 @@ A small native DICOM image viewer built with Rust and egui.
 - Drag and drop DICOM files or folders onto the viewer.
 - Browse indexed studies in a Patient / Study / Series / Slice tree.
 - View single-frame and multi-frame DICOM images.
-- Step through slices with arrow keys, the viewer scroll wheel, or side scrollbar.
+- Step through slices with the keyboard, mouse wheel, or viewer scrollbar.
 - Autoplay image stacks with adjustable FPS and loop mode.
-- Adjust window center and window width interactively.
+- Adjust window center and width interactively.
 - Inspect curated DICOM tags or search across all loaded tags.
 - Native desktop builds for Linux, macOS, and Windows.
-- Bundled Geist UI fonts, with Source Han Sans CJK fallback support.
 
-## Status
+## Download
 
-This is a local inspection tool for DICOM images, metadata, and series structure. It is intended for development, exploration, and troubleshooting workflows.
+Download the latest version from [GitHub Releases](https://github.com/0John-Hong0/dicron/releases):
 
-The Linux build currently forces the X11 windowing backend because file drag and drop is handled reliably there by the current `winit` stack.
+- Windows: installer executable
+- macOS: DMG for Apple Silicon or Intel
+- Debian and Ubuntu: `.deb` package
+- Arch Linux: `.pkg.tar.zst` package
 
-## Getting Started
+macOS builds are currently unsigned and not notarized. On Linux, Dicron currently uses X11/XWayland.
 
-Download packaged builds from [GitHub Releases](https://github.com/0John-Hong0/dicron/releases), or build locally from source.
+## Usage
 
-Install Rust, then clone and build the project:
+Open Dicron and choose **Open DICOM** or **Open Folder**, or drag files and folders directly onto the window.
 
-```sh
-./scripts/fetch-fonts.sh
-cargo build --release
-```
-
-Run the viewer:
+You can also open one or more paths when launching Dicron from a terminal:
 
 ```sh
-cargo run --release
+dicron /path/to/dicom-or-folder
 ```
 
-You can also pass files or folders on the command line:
+Viewer controls:
 
-```sh
-cargo run --release -- /path/to/dicom-or-folder
-```
-
-## Fonts
-
-The repository includes Geist font files. Source Han Sans is intentionally fetched by script because the font file is large:
-
-```sh
-./scripts/fetch-fonts.sh
-```
-
-Run this before release/package builds if `assets/fonts/SourceHanSans.ttc` is not present.
-
-Font licenses are stored in `assets/licenses/`; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-## Development
-
-Useful local checks:
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo build --release
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution expectations and pull request guidance.
-
-## Packaging
-
-Release builds are driven by `.github/workflows/release.yml` from `main`.
-
-The current workflow builds:
-
-- Debian package with `cargo deb`
-- Arch package
-- macOS app bundle packaged as Apple Silicon and Intel DMGs
-- Windows executable and NSIS installer
-
-For Debian packaging:
-
-```sh
-./scripts/fetch-fonts.sh
-cargo install cargo-deb --locked
-cargo deb
-```
-
-For Windows cross-build helpers, see:
-
-```sh
-./scripts/build-windows.sh
-./scripts/package-windows-installer.sh
-```
-
-For macOS packaging, build on macOS and run:
-
-```sh
-./scripts/fetch-fonts.sh
-cargo build --release --locked
-./scripts/package-macos.sh
-```
-
-macOS DMGs are currently unsigned and not notarized.
-
-Release maintainers should follow [docs/RELEASING.md](docs/RELEASING.md).
-
-## Project Layout
-
-```text
-src/
-  app/                egui app state, layout, viewer controls, tree, and loading flow
-  dicom/              Folder indexing, pixel loading, and DICOM value helpers
-  metadata.rs         DICOM metadata extraction
-  metadata_table.rs   Tag table UI
-assets/
-  fonts/              Bundled/fetched fonts
-  licenses/           Font license texts
-packaging/
-  linux/              Desktop entry and Linux package assets
-  macos/              macOS app bundle metadata
-  windows/            NSIS installer definition
-scripts/              Build and packaging helpers
-```
+- **Arrow keys** or **mouse wheel**: move through slices.
+- **Page Up / Page Down**: move ten slices at a time.
+- **Home / End**: jump to the first or last slice.
+- **Drag horizontally over the image**: adjust window width.
+- **Drag vertically over the image**: adjust window center.
 
 ## Community
 
@@ -137,20 +53,8 @@ scripts/              Build and packaging helpers
 - Security reports: see [SECURITY.md](SECURITY.md)
 - Support notes: see [SUPPORT.md](SUPPORT.md)
 
-## Copyright and License
+## License
 
-Copyright (C) 2026 0John-Hong0
+Dicron is licensed under the [GNU General Public License v3.0 or later](LICENSE).
 
-Dicron is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-See [LICENSE](LICENSE) for details.
-
-Bundled fonts have their own licenses:
-
-- Geist: `assets/licenses/LICENSE-Geist.txt`
-- Source Han Sans: `assets/licenses/LICENSE-SourceHanSans.txt`
-
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for more detail.
+Bundled fonts have separate licenses. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
