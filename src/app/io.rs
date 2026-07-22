@@ -51,7 +51,7 @@ impl DicronApp {
             .set_title("Open DICOM")
             .add_filter("DICOM", &["dcm", "dicom"]);
 
-        if let Some(open_dicom_directory) = &self.dialog_directories.open_dicom_directory {
+        if let Some(open_dicom_directory) = &self.settings.open_dicom_directory {
             file_dialog = file_dialog.set_directory(open_dicom_directory);
         }
 
@@ -67,8 +67,7 @@ impl DicronApp {
         context: &egui::Context,
         selected_dicom_path: PathBuf,
     ) {
-        self.dialog_directories
-            .remember_open_dicom_path(&selected_dicom_path);
+        self.settings.remember_open_dicom_path(&selected_dicom_path);
 
         self.cancel_active_scan();
         self.clear_loaded_dicom_state();
@@ -91,7 +90,7 @@ impl DicronApp {
     pub(super) fn open_dicom_folder(&mut self, context: &egui::Context) {
         let mut file_dialog = FileDialog::new().set_title("Open DICOM Folder");
 
-        if let Some(open_folder_directory) = &self.dialog_directories.open_folder_directory {
+        if let Some(open_folder_directory) = &self.settings.open_folder_directory {
             file_dialog = file_dialog.set_directory(open_folder_directory);
         }
 
@@ -107,7 +106,7 @@ impl DicronApp {
         context: &egui::Context,
         selected_folder_path: PathBuf,
     ) {
-        self.dialog_directories
+        self.settings
             .remember_open_folder_path(&selected_folder_path);
 
         self.cancel_active_scan();
@@ -192,13 +191,11 @@ impl DicronApp {
         dropped_paths: Vec<PathBuf>,
     ) {
         if let Some(first_file_path) = dropped_paths.iter().find(|path| path.is_file()) {
-            self.dialog_directories
-                .remember_open_dicom_path(first_file_path);
+            self.settings.remember_open_dicom_path(first_file_path);
         }
 
         if let Some(first_folder_path) = dropped_paths.iter().find(|path| path.is_dir()) {
-            self.dialog_directories
-                .remember_open_folder_path(first_folder_path);
+            self.settings.remember_open_folder_path(first_folder_path);
         }
 
         self.cancel_active_scan();

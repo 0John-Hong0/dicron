@@ -2,7 +2,7 @@ use super::*;
 
 impl eframe::App for DicronApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let check_for_updates_on_startup = self.dialog_directories.check_for_updates_on_startup;
+        let check_for_updates_on_startup = self.settings.check_for_updates_on_startup;
         self.about_dialog
             .poll(ui.ctx(), check_for_updates_on_startup);
 
@@ -16,8 +16,7 @@ impl eframe::App for DicronApp {
             panel_content_frame().show(ui, |ui| {
                 self.show_toolbar_actions(ui);
 
-                self.about_dialog
-                    .show(ui.ctx(), &mut self.dialog_directories);
+                self.about_dialog.show(ui.ctx(), &mut self.settings);
 
                 if let Some(selected_dicom_path) = &self.selected_dicom_path {
                     if self.selected_dicom_frame_count > 1 {
@@ -113,7 +112,7 @@ impl eframe::App for DicronApp {
                     ui.heading("DICOM Tree");
                     ui.separator();
 
-                    let mut expand_tree = self.dialog_directories.expand_tree_by_default;
+                    let mut expand_tree = self.settings.expand_tree_by_default;
                     if ui
                         .checkbox(&mut expand_tree, "Expand all by default")
                         .on_hover_text(
@@ -122,8 +121,7 @@ impl eframe::App for DicronApp {
                         )
                         .changed()
                     {
-                        self.dialog_directories
-                            .set_expand_tree_by_default(expand_tree);
+                        self.settings.set_expand_tree_by_default(expand_tree);
                         self.tree_view_generation = self.tree_view_generation.wrapping_add(1);
                     }
 

@@ -1,3 +1,5 @@
+//! GitHub release lookup and semantic-version comparison.
+
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -9,7 +11,7 @@ const GITHUB_LATEST_RELEASE_API_URL: &str =
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
-pub enum UpdateCheckOutcome {
+pub(crate) enum UpdateCheckOutcome {
     UpToDate {
         latest_tag: String,
     },
@@ -25,7 +27,7 @@ struct GitHubRelease {
     html_url: String,
 }
 
-pub fn check_latest_release(current_version: &str) -> Result<UpdateCheckOutcome> {
+pub(crate) fn check_latest_release(current_version: &str) -> Result<UpdateCheckOutcome> {
     let release = fetch_latest_release()?;
     compare_release_versions(current_version, &release.tag_name, release.html_url)
 }

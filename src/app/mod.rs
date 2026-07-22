@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use rfd::FileDialog;
 
-use crate::dialog_directories::DialogDirectories;
 use crate::dicom::index::{
     DicomIndex, DicomIndexProgress, PatientGroup, SliceItem, StudyGroup,
     build_dicom_index_for_file, build_dicom_index_for_inputs_with_progress,
@@ -18,17 +17,18 @@ use crate::dicom::index::{
 use crate::dicom::loader::{DecodedFrame, DicomWindow, load_dicom_frame, render_frame};
 use crate::metadata::{DicomMetadata, MetadataItem};
 use crate::metadata_table;
-use crate::texture::{fit_image_to_available_space, upload_color_image};
+use crate::settings::AppSettings;
 
-mod about_dialog;
 mod cache;
 mod io;
 mod layout;
-mod tree;
+mod ui;
 mod viewer;
 
-use about_dialog::AboutDialog;
 use cache::DecodedCache;
+use ui::AboutDialog;
+pub(crate) use ui::viewer::color_image_from_dynamic_image;
+use ui::viewer::{fit_image_to_available_space, upload_color_image};
 
 const LEFT_PANEL_DEFAULT_WIDTH: f32 = 450.0;
 const RIGHT_PANEL_DEFAULT_WIDTH: f32 = 340.0;
@@ -140,7 +140,7 @@ pub struct DicronApp {
     // Bumped when the "expand by default" preference changes so the tree's
     // CollapsingHeaders get fresh ids and re-apply their default open state.
     tree_view_generation: u64,
-    dialog_directories: DialogDirectories,
+    settings: AppSettings,
 }
 
 struct DicomFolderScanState {
@@ -164,8 +164,8 @@ struct WindowLevel {
 
 impl Default for DicronApp {
     fn default() -> Self {
-        let dialog_directories = DialogDirectories::load();
-        let about_dialog = AboutDialog::new(dialog_directories.check_for_updates_on_startup);
+        let settings = AppSettings::load();
+        let about_dialog = AboutDialog::new(settings.check_for_updates_on_startup);
 
         Self {
             selected_dicom_path: None,
@@ -210,7 +210,7 @@ impl Default for DicronApp {
             left_panel_width: LEFT_PANEL_DEFAULT_WIDTH,
             right_panel_width: RIGHT_PANEL_DEFAULT_WIDTH,
             tree_view_generation: 0,
-            dialog_directories,
+            settings,
         }
     }
 }

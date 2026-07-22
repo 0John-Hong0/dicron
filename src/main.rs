@@ -1,12 +1,11 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod app;
-mod dialog_directories;
 mod dicom;
 mod metadata;
 mod metadata_table;
-mod texture;
-mod update;
+mod release_check;
+mod settings;
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -6,8 +6,8 @@ use dicom_pixeldata::{ConvertOptions, DecodedPixelData, PixelDecoder, VoiLutOpti
 use eframe::egui;
 
 use super::value as dicom_value;
+use crate::app::color_image_from_dynamic_image;
 use crate::metadata::{DicomMetadata, extract_dicom_metadata};
-use crate::texture::color_image_from_dynamic_image;
 
 #[derive(Clone, Copy)]
 pub struct DicomWindow {

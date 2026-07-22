@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::dialog_directories::DialogDirectories;
-use crate::update::{self, UpdateCheckOutcome};
+use crate::release_check::{self, UpdateCheckOutcome};
+use crate::settings::AppSettings;
 
 const APP_AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
 const APP_REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
@@ -25,7 +25,7 @@ impl UpdateCheckStatus {
     }
 }
 
-pub(super) struct AboutDialog {
+pub(in crate::app) struct AboutDialog {
     open: bool,
     update_receiver: Option<Receiver<UpdateCheckResult>>,
     update_status: UpdateCheckStatus,
@@ -35,7 +35,7 @@ pub(super) struct AboutDialog {
 }
 
 impl AboutDialog {
-    pub(super) fn new(check_for_updates_on_startup: bool) -> Self {
+    pub(in crate::app) fn new(check_for_updates_on_startup: bool) -> Self {
         Self {
             open: false,
             update_receiver: None,
@@ -46,7 +46,11 @@ impl AboutDialog {
         }
     }
 
-    pub(super) fn poll(&mut self, context: &egui::Context, check_for_updates_on_startup: bool) {
+    pub(in crate::app) fn poll(
+        &mut self,
+        context: &egui::Context,
+        check_for_updates_on_startup: bool,
+    ) {
         if std::mem::take(&mut self.startup_check_pending) {
             self.start_update_check(context, true);
         }
@@ -54,7 +58,7 @@ impl AboutDialog {
         self.receive_update_result(context, check_for_updates_on_startup);
     }
 
-    pub(super) fn open(&mut self, context: &egui::Context) {
+    pub(in crate::app) fn open(&mut self, context: &egui::Context) {
         self.open = true;
 
         if matches!(self.update_status, UpdateCheckStatus::NotChecked) {
@@ -62,11 +66,7 @@ impl AboutDialog {
         }
     }
 
-    pub(super) fn show(
-        &mut self,
-        context: &egui::Context,
-        dialog_directories: &mut DialogDirectories,
-    ) {
+    pub(in crate::app) fn show(&mut self, context: &egui::Context, settings: &mut AppSettings) {
         if !self.open {
             return;
         }
@@ -87,7 +87,7 @@ impl AboutDialog {
                 ui.hyperlink_to("GitHub", APP_REPOSITORY_URL);
             });
 
-            self.show_update_controls(ui, context, dialog_directories);
+            self.show_update_controls(ui, context, settings);
 
             ui.separator();
             ui.add_space(4.0);
@@ -134,7 +134,7 @@ impl AboutDialog {
         }
     }
 
-    pub(super) fn show_notification(&mut self, context: &egui::Context) {
+    pub(in crate::app) fn show_notification(&mut self, context: &egui::Context) {
         if !self.notification_visible || self.open {
             return;
         }
@@ -177,7 +177,7 @@ impl AboutDialog {
         &mut self,
         ui: &mut egui::Ui,
         context: &egui::Context,
-        dialog_directories: &mut DialogDirectories,
+        settings: &mut AppSettings,
     ) {
         ui.add_space(4.0);
         ui.separator();
@@ -205,7 +205,7 @@ impl AboutDialog {
 
         ui.add_space(4.0);
 
-        let mut check_for_updates_on_startup = dialog_directories.check_for_updates_on_startup;
+        let mut check_for_updates_on_startup = settings.check_for_updates_on_startup;
 
         if ui
             .checkbox(
@@ -214,7 +214,7 @@ impl AboutDialog {
             )
             .changed()
         {
-            dialog_directories.set_check_for_updates_on_startup(check_for_updates_on_startup);
+            settings.set_check_for_updates_on_startup(check_for_updates_on_startup);
 
             if !check_for_updates_on_startup {
                 self.notification_visible = false;
@@ -264,7 +264,7 @@ impl AboutDialog {
         let context = context.clone();
 
         thread::spawn(move || {
-            let result = update::check_latest_release(env!("CARGO_PKG_VERSION"))
+            let result = release_check::check_latest_release(env!("CARGO_PKG_VERSION"))
                 .map_err(|error| format!("{error:#}"));
 
             let _ = sender.send(result);

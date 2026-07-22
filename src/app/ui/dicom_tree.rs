@@ -1,8 +1,8 @@
-use super::*;
+use crate::app::*;
 
 impl DicronApp {
-    pub(super) fn show_dicom_tree(&mut self, ui: &mut egui::Ui) {
-        let expand_all = self.dialog_directories.expand_tree_by_default;
+    pub(in crate::app) fn show_dicom_tree(&mut self, ui: &mut egui::Ui) {
+        let expand_all = self.settings.expand_tree_by_default;
         let tree_generation = self.tree_view_generation;
 
         let Some(dicom_index) = &self.dicom_index else {
@@ -90,7 +90,7 @@ impl DicronApp {
         }
     }
 
-    pub(super) fn load_first_available_slice(&mut self, context: &egui::Context) {
+    pub(in crate::app) fn load_first_available_slice(&mut self, context: &egui::Context) {
         let first_available_indices = {
             let Some(dicom_index) = &self.dicom_index else {
                 return;
@@ -125,7 +125,7 @@ impl DicronApp {
         }
     }
 
-    pub(super) fn load_slice_by_indices(
+    pub(in crate::app) fn load_slice_by_indices(
         &mut self,
         context: &egui::Context,
         patient_index: usize,
@@ -147,7 +147,7 @@ impl DicronApp {
         self.load_dicom_path(context, slice_item.path, slice_item.frame_index);
     }
 
-    pub(super) fn get_slice_by_indices(
+    pub(in crate::app) fn get_slice_by_indices(
         &self,
         patient_index: usize,
         study_index: usize,
@@ -163,7 +163,7 @@ impl DicronApp {
         Some(slice.clone())
     }
 
-    pub(super) fn get_selected_series_slice_count(&self) -> Option<usize> {
+    pub(in crate::app) fn get_selected_series_slice_count(&self) -> Option<usize> {
         let dicom_index = self.dicom_index.as_ref()?;
         let patient = dicom_index.patients.get(self.selected_patient_index?)?;
         let study = patient.studies.get(self.selected_study_index?)?;
@@ -172,7 +172,7 @@ impl DicronApp {
         Some(series.slices.len())
     }
 
-    pub(super) fn current_slice_index(&self) -> Option<usize> {
+    pub(in crate::app) fn current_slice_index(&self) -> Option<usize> {
         if let Some(selected_slice_index) = self.selected_slice_index {
             Some(selected_slice_index)
         } else if self.selected_dicom_path.is_some() && self.selected_dicom_frame_count > 1 {
@@ -182,7 +182,7 @@ impl DicronApp {
         }
     }
 
-    pub(super) fn current_slice_count(&self) -> Option<usize> {
+    pub(in crate::app) fn current_slice_count(&self) -> Option<usize> {
         self.get_selected_series_slice_count().or_else(|| {
             if self.selected_dicom_path.is_some() && self.selected_dicom_frame_count > 1 {
                 Some(self.selected_dicom_frame_count as usize)
@@ -192,7 +192,7 @@ impl DicronApp {
         })
     }
 
-    pub(super) fn selected_indices(&self) -> Option<SliceKey> {
+    pub(in crate::app) fn selected_indices(&self) -> Option<SliceKey> {
         Some((
             self.selected_patient_index?,
             self.selected_study_index?,
@@ -201,7 +201,7 @@ impl DicronApp {
         ))
     }
 
-    pub(super) fn clear_selected_indices(&mut self) {
+    pub(in crate::app) fn clear_selected_indices(&mut self) {
         self.stop_autoplay();
         self.selected_patient_index = None;
         self.selected_study_index = None;

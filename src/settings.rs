@@ -1,15 +1,17 @@
+//! Persisted local settings and remembered filesystem locations.
+
 use std::path::{Path, PathBuf};
 
-pub struct DialogDirectories {
-    pub open_dicom_directory: Option<PathBuf>,
-    pub open_folder_directory: Option<PathBuf>,
+pub(crate) struct AppSettings {
+    pub(crate) open_dicom_directory: Option<PathBuf>,
+    pub(crate) open_folder_directory: Option<PathBuf>,
     /// Whether newly loaded Patient/Study/Series nodes start expanded.
-    pub expand_tree_by_default: bool,
+    pub(crate) expand_tree_by_default: bool,
     /// Whether Dicron checks GitHub for a newer release when it starts.
-    pub check_for_updates_on_startup: bool,
+    pub(crate) check_for_updates_on_startup: bool,
 }
 
-impl Default for DialogDirectories {
+impl Default for AppSettings {
     fn default() -> Self {
         Self {
             open_dicom_directory: None,
@@ -20,8 +22,8 @@ impl Default for DialogDirectories {
     }
 }
 
-impl DialogDirectories {
-    pub fn load() -> Self {
+impl AppSettings {
+    pub(crate) fn load() -> Self {
         let Some(settings_path) = settings_path() else {
             return Self::default();
         };
@@ -30,7 +32,7 @@ impl DialogDirectories {
             return Self::default();
         };
 
-        let mut dialog_directories = Self::default();
+        let mut settings = Self::default();
 
         for settings_line in settings_text.lines() {
             let Some((key, value)) = settings_line.split_once('=') else {
@@ -41,46 +43,46 @@ impl DialogDirectories {
                 "open_dicom_directory" => {
                     let directory = PathBuf::from(value);
                     if directory.is_dir() {
-                        dialog_directories.open_dicom_directory = Some(directory);
+                        settings.open_dicom_directory = Some(directory);
                     }
                 }
                 "open_folder_directory" => {
                     let directory = PathBuf::from(value);
                     if directory.is_dir() {
-                        dialog_directories.open_folder_directory = Some(directory);
+                        settings.open_folder_directory = Some(directory);
                     }
                 }
                 "expand_tree_by_default" => {
-                    dialog_directories.expand_tree_by_default = value.trim() != "false";
+                    settings.expand_tree_by_default = value.trim() != "false";
                 }
                 "check_for_updates_on_startup" => {
-                    dialog_directories.check_for_updates_on_startup = value.trim() != "false";
+                    settings.check_for_updates_on_startup = value.trim() != "false";
                 }
                 _ => {}
             }
         }
 
-        dialog_directories
+        settings
     }
 
-    pub fn set_expand_tree_by_default(&mut self, expand_tree_by_default: bool) {
+    pub(crate) fn set_expand_tree_by_default(&mut self, expand_tree_by_default: bool) {
         self.expand_tree_by_default = expand_tree_by_default;
         self.save();
     }
 
-    pub fn set_check_for_updates_on_startup(&mut self, check_for_updates_on_startup: bool) {
+    pub(crate) fn set_check_for_updates_on_startup(&mut self, check_for_updates_on_startup: bool) {
         self.check_for_updates_on_startup = check_for_updates_on_startup;
         self.save();
     }
 
-    pub fn remember_open_dicom_path(&mut self, selected_dicom_path: &Path) {
+    pub(crate) fn remember_open_dicom_path(&mut self, selected_dicom_path: &Path) {
         if let Some(directory) = selected_dicom_path.parent().filter(|path| path.is_dir()) {
             self.open_dicom_directory = Some(directory.to_path_buf());
             self.save();
         }
     }
 
-    pub fn remember_open_folder_path(&mut self, selected_folder_path: &Path) {
+    pub(crate) fn remember_open_folder_path(&mut self, selected_folder_path: &Path) {
         if let Some(directory) = selected_folder_path.parent().filter(|path| path.is_dir()) {
             self.open_folder_directory = Some(directory.to_path_buf());
             self.save();
