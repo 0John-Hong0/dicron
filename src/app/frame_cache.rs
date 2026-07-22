@@ -1,22 +1,34 @@
-use super::*;
+//! Most-recently-used cache of synchronously decoded DICOM frames and metadata.
 
-pub(super) struct DecodedCacheEntry {
-    pub(super) path: PathBuf,
-    pub(super) frame_index: u32,
-    pub(super) frame: DecodedFrame,
-    pub(super) metadata: DicomMetadata,
+use std::path::{Path, PathBuf};
+
+use crate::dicom::{DecodedFrame, DicomMetadata};
+
+const DEFAULT_CACHE_CAPACITY: usize = 32;
+
+pub(in crate::app) struct DecodedCacheEntry {
+    pub(in crate::app) path: PathBuf,
+    pub(in crate::app) frame_index: u32,
+    pub(in crate::app) frame: DecodedFrame,
+    pub(in crate::app) metadata: DicomMetadata,
 }
 
 /// Small most-recently-used cache of decoded frames + metadata, so navigating
 /// back to a slice (or looping/ping-ponging in autoplay) skips the open+decode
 /// entirely instead of re-reading and re-decompressing the file each time.
-pub(super) struct DecodedCache {
+pub(in crate::app) struct DecodedCache {
     entries: Vec<DecodedCacheEntry>,
     capacity: usize,
 }
 
+impl Default for DecodedCache {
+    fn default() -> Self {
+        Self::new(DEFAULT_CACHE_CAPACITY)
+    }
+}
+
 impl DecodedCache {
-    pub(super) fn new(capacity: usize) -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
             entries: Vec::new(),
             capacity: capacity.max(1),
@@ -30,14 +42,18 @@ impl DecodedCache {
     }
 
     /// Fetch an entry, promoting it to most-recently-used.
-    pub(super) fn get(&mut self, path: &Path, frame_index: u32) -> Option<&DecodedCacheEntry> {
+    pub(in crate::app) fn get(
+        &mut self,
+        path: &Path,
+        frame_index: u32,
+    ) -> Option<&DecodedCacheEntry> {
         let position = self.position(path, frame_index)?;
         let entry = self.entries.remove(position);
         self.entries.push(entry);
         self.entries.last()
     }
 
-    pub(super) fn insert(&mut self, entry: DecodedCacheEntry) {
+    pub(in crate::app) fn insert(&mut self, entry: DecodedCacheEntry) {
         if let Some(position) = self.position(&entry.path, entry.frame_index) {
             self.entries.remove(position);
         }
@@ -49,7 +65,7 @@ impl DecodedCache {
         }
     }
 
-    pub(super) fn clear(&mut self) {
+    pub(in crate::app) fn clear(&mut self) {
         self.entries.clear();
     }
 }

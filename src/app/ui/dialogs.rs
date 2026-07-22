@@ -1,56 +1,16 @@
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
-use std::time::Duration;
+//! About, update notification, and small informational dialogs.
 
 use eframe::egui;
 
-use crate::release_check::{self, UpdateCheckOutcome};
+use crate::app::state::{AboutDialogState, UpdateCheckStatus};
+use crate::release_check::UpdateCheckOutcome;
 use crate::settings::AppSettings;
 
 const APP_AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
 const APP_REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
 
-type UpdateCheckResult = std::result::Result<UpdateCheckOutcome, String>;
-
-enum UpdateCheckStatus {
-    NotChecked,
-    Checking,
-    Finished(UpdateCheckOutcome),
-    Failed(String),
-}
-
-impl UpdateCheckStatus {
-    fn is_checking(&self) -> bool {
-        matches!(self, Self::Checking)
-    }
-}
-
-pub(in crate::app) struct AboutDialog {
-    open: bool,
-    update_receiver: Option<Receiver<UpdateCheckResult>>,
-    update_status: UpdateCheckStatus,
-    notify_when_finished: bool,
-    startup_check_pending: bool,
-    notification_visible: bool,
-}
-
-impl AboutDialog {
-    pub(in crate::app) fn new(check_for_updates_on_startup: bool) -> Self {
-        Self {
-            open: false,
-            update_receiver: None,
-            update_status: UpdateCheckStatus::NotChecked,
-            notify_when_finished: false,
-            startup_check_pending: check_for_updates_on_startup,
-            notification_visible: false,
-        }
-    }
-
-    pub(in crate::app) fn poll(
-        &mut self,
-        context: &egui::Context,
-        check_for_updates_on_startup: bool,
-    ) {
+impl AboutDialogState {
+    pub(super) fn poll(&mut self, context: &egui::Context, check_for_updates_on_startup: bool) {
         if std::mem::take(&mut self.startup_check_pending) {
             self.start_update_check(context, true);
         }
@@ -58,7 +18,7 @@ impl AboutDialog {
         self.receive_update_result(context, check_for_updates_on_startup);
     }
 
-    pub(in crate::app) fn open(&mut self, context: &egui::Context) {
+    pub(super) fn open(&mut self, context: &egui::Context) {
         self.open = true;
 
         if matches!(self.update_status, UpdateCheckStatus::NotChecked) {
@@ -66,7 +26,7 @@ impl AboutDialog {
         }
     }
 
-    pub(in crate::app) fn show(&mut self, context: &egui::Context, settings: &mut AppSettings) {
+    pub(super) fn show(&mut self, context: &egui::Context, settings: &mut AppSettings) {
         if !self.open {
             return;
         }
@@ -88,7 +48,6 @@ impl AboutDialog {
             });
 
             self.show_update_controls(ui, context, settings);
-
             ui.separator();
             ui.add_space(4.0);
             egui::CollapsingHeader::new("System information")
@@ -105,7 +64,6 @@ impl AboutDialog {
                 });
 
             ui.add_space(4.0);
-
             ui.horizontal(|ui| {
                 let footer_text_color = ui
                     .visuals()
@@ -134,7 +92,7 @@ impl AboutDialog {
         }
     }
 
-    pub(in crate::app) fn show_notification(&mut self, context: &egui::Context) {
+    pub(super) fn show_notification(&mut self, context: &egui::Context) {
         if !self.notification_visible || self.open {
             return;
         }
@@ -204,7 +162,6 @@ impl AboutDialog {
         }
 
         ui.add_space(4.0);
-
         let mut check_for_updates_on_startup = settings.check_for_updates_on_startup;
 
         if ui
@@ -222,7 +179,6 @@ impl AboutDialog {
         }
 
         ui.add_space(4.0);
-
         match &self.update_status {
             UpdateCheckStatus::NotChecked => {}
             UpdateCheckStatus::Checking => {
@@ -256,20 +212,11 @@ impl AboutDialog {
             return;
         }
 
-        let (sender, receiver) = mpsc::channel();
-        self.update_receiver = Some(receiver);
+        if !self.update_job.start(context) {
+            return;
+        }
         self.update_status = UpdateCheckStatus::Checking;
         self.notify_when_finished = notify_if_available;
-
-        let context = context.clone();
-
-        thread::spawn(move || {
-            let result = release_check::check_latest_release(env!("CARGO_PKG_VERSION"))
-                .map_err(|error| format!("{error:#}"));
-
-            let _ = sender.send(result);
-            context.request_repaint();
-        });
     }
 
     fn receive_update_result(
@@ -277,15 +224,12 @@ impl AboutDialog {
         context: &egui::Context,
         check_for_updates_on_startup: bool,
     ) {
-        let Some(update_receiver) = self.update_receiver.take() else {
+        let Some(result) = self.update_job.poll(context) else {
             return;
         };
 
-        let mut should_keep_receiver = true;
-
-        match update_receiver.try_recv() {
-            Ok(Ok(outcome)) => {
-                should_keep_receiver = false;
+        match result {
+            Ok(outcome) => {
                 self.notification_visible = (self.notification_visible
                     || self.notify_when_finished)
                     && check_for_updates_on_startup
@@ -293,23 +237,10 @@ impl AboutDialog {
                 self.notify_when_finished = false;
                 self.update_status = UpdateCheckStatus::Finished(outcome);
             }
-            Ok(Err(error_message)) => {
-                should_keep_receiver = false;
+            Err(error_message) => {
                 self.notify_when_finished = false;
                 self.update_status = UpdateCheckStatus::Failed(error_message);
             }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                should_keep_receiver = false;
-                self.notify_when_finished = false;
-                self.update_status =
-                    UpdateCheckStatus::Failed("Update check stopped unexpectedly.".to_owned());
-            }
-        }
-
-        if should_keep_receiver {
-            self.update_receiver = Some(update_receiver);
-            context.request_repaint_after(Duration::from_millis(100));
         }
     }
 }

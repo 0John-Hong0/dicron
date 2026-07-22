@@ -16,7 +16,7 @@ pub(in crate::app) fn upload_display_pixels(
     context.load_texture(texture_name, color_image, egui::TextureOptions::LINEAR)
 }
 
-pub(in crate::app) fn fit_image_to_available_space(
+pub(super) fn fit_image_to_available_space(
     texture_size: egui::Vec2,
     available_size: egui::Vec2,
 ) -> egui::Vec2 {
