@@ -1,225 +1,35 @@
+//! Construction, sorting, and querying of the in-memory DICOM index.
+
 use std::cmp::Ordering;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::path::Path;
+use std::str::FromStr;
 
-use anyhow::Result;
-use dicom_dictionary_std::tags;
-use dicom_object::{DefaultDicomObject, OpenFileOptions};
-use walkdir::WalkDir;
+use dicom_object::DefaultDicomObject;
 
-use super::value as dicom_value;
+use super::model::{PatientGroup, SeriesGroup, SliceItem, StudyGroup};
 
-#[derive(Clone)]
-pub struct DicomIndex {
-    pub patients: Vec<PatientGroup>,
-    pub total_file_count: usize,
-}
-
-#[derive(Clone)]
-pub struct PatientGroup {
-    pub patient_key: String,
-    pub display_name: String,
-    pub studies: Vec<StudyGroup>,
-}
-
-#[derive(Clone)]
-pub struct StudyGroup {
-    pub study_key: String,
-    pub display_name: String,
-    pub study_date: Option<String>,
-    pub study_time: Option<String>,
-    pub series_groups: Vec<SeriesGroup>,
-}
-
-#[derive(Clone)]
-pub struct SeriesGroup {
-    pub series_key: String,
-    pub display_name: String,
-    pub series_number: Option<i32>,
-    pub slices: Vec<SliceItem>,
-}
-
-#[derive(Clone)]
-pub struct SliceItem {
-    pub path: PathBuf,
-    pub display_name: String,
-    pub frame_index: u32,
-    pub instance_number: Option<i32>,
-    /// Signed through-plane position used to order slices: the projection of
-    /// `ImagePositionPatient` onto the slice normal when orientation is known
-    /// (correct for sagittal/coronal/oblique stacks), otherwise the raw Z.
-    pub sort_position: Option<f64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct DicomIndexProgress {
-    pub processed_file_count: usize,
-    pub total_file_count: usize,
-    pub readable_dicom_count: usize,
-}
-
-pub fn build_dicom_index_with_progress<F>(
-    folder_path: &Path,
-    cancel: &AtomicBool,
-    mut on_progress: F,
-) -> Result<DicomIndex>
-where
-    F: FnMut(DicomIndexProgress),
-{
-    let file_paths = collect_walkdir_files(folder_path, cancel)?;
-
-    build_dicom_index_for_files_with_progress(&file_paths, cancel, &mut on_progress)
-}
-
-pub fn build_dicom_index_for_inputs_with_progress<F>(
-    input_paths: &[PathBuf],
-    cancel: &AtomicBool,
-    mut on_progress: F,
-) -> Result<DicomIndex>
-where
-    F: FnMut(DicomIndexProgress),
-{
-    let file_paths = collect_file_paths(input_paths, cancel)?;
-
-    build_dicom_index_for_files_with_progress(&file_paths, cancel, &mut on_progress)
-}
-
-fn build_dicom_index_for_files_with_progress<F>(
-    file_paths: &[PathBuf],
-    cancel: &AtomicBool,
-    mut on_progress: F,
-) -> Result<DicomIndex>
-where
-    F: FnMut(DicomIndexProgress),
-{
-    let total_input_file_count = file_paths.len();
-    let mut readable_dicom_count = 0;
-    let mut patients: Vec<PatientGroup> = Vec::new();
-
-    on_progress(DicomIndexProgress {
-        processed_file_count: 0,
-        total_file_count: total_input_file_count,
-        readable_dicom_count: 0,
-    });
-
-    for (file_index, file_path) in file_paths.iter().enumerate() {
-        if cancel.load(AtomicOrdering::Relaxed) {
-            return Err(scan_cancelled());
-        }
-
-        let processed_file_count = file_index + 1;
-
-        let Ok(dicom_object) = open_dicom_metadata(file_path) else {
-            on_progress(DicomIndexProgress {
-                processed_file_count,
-                total_file_count: total_input_file_count,
-                readable_dicom_count,
-            });
-            continue;
-        };
-
-        readable_dicom_count += 1;
-
-        add_dicom_object_to_patients(&mut patients, file_path, &dicom_object);
-
-        on_progress(DicomIndexProgress {
-            processed_file_count,
-            total_file_count: total_input_file_count,
-            readable_dicom_count,
-        });
-    }
-
-    sort_dicom_index(&mut patients);
-
-    Ok(DicomIndex {
-        patients,
-        total_file_count: readable_dicom_count,
-    })
-}
-
-fn collect_file_paths(input_paths: &[PathBuf], cancel: &AtomicBool) -> Result<Vec<PathBuf>> {
-    let mut file_paths = Vec::new();
-
-    for input_path in input_paths {
-        if cancel.load(AtomicOrdering::Relaxed) {
-            return Err(scan_cancelled());
-        }
-
-        if input_path.is_dir() {
-            file_paths.extend(collect_walkdir_files(input_path, cancel)?);
-        } else if input_path.is_file() {
-            file_paths.push(input_path.clone());
-        }
-    }
-
-    Ok(file_paths)
-}
-
-fn collect_walkdir_files(folder_path: &Path, cancel: &AtomicBool) -> Result<Vec<PathBuf>> {
-    let mut file_paths = Vec::new();
-
-    for entry_result in WalkDir::new(folder_path) {
-        if cancel.load(AtomicOrdering::Relaxed) {
-            return Err(scan_cancelled());
-        }
-
-        let Ok(entry) = entry_result else {
-            continue;
-        };
-
-        if entry.file_type().is_file() {
-            file_paths.push(entry.path().to_path_buf());
-        }
-    }
-
-    Ok(file_paths)
-}
-
-fn scan_cancelled() -> anyhow::Error {
-    anyhow::anyhow!("scan cancelled")
-}
-
-pub fn build_dicom_index_for_file(file_path: &Path) -> Result<DicomIndex> {
-    let dicom_object = open_dicom_metadata(file_path)?;
-    let mut patients: Vec<PatientGroup> = Vec::new();
-
-    add_dicom_object_to_patients(&mut patients, file_path, &dicom_object);
-    sort_dicom_index(&mut patients);
-
-    Ok(DicomIndex {
-        patients,
-        total_file_count: 1,
-    })
-}
-
-fn open_dicom_metadata(file_path: &Path) -> Result<DefaultDicomObject> {
-    Ok(OpenFileOptions::new()
-        .read_until(tags::PIXEL_DATA)
-        .open_file(file_path)?)
-}
-
-fn add_dicom_object_to_patients(
+pub(in crate::dicom) fn add_dicom_object_to_index(
     patients: &mut Vec<PatientGroup>,
     file_path: &Path,
     dicom_object: &DefaultDicomObject,
 ) {
-    let patient_id = dicom_value::text(dicom_object, "PatientID");
-    let patient_name = dicom_value::text(dicom_object, "PatientName");
+    let patient_id = text(dicom_object, "PatientID");
+    let patient_name = text(dicom_object, "PatientName");
 
-    let study_instance_uid = dicom_value::text(dicom_object, "StudyInstanceUID")
-        .unwrap_or_else(|| "Unknown Study".to_owned());
-    let study_description = dicom_value::text(dicom_object, "StudyDescription");
-    let study_date = dicom_value::text(dicom_object, "StudyDate");
-    let study_time = dicom_value::text(dicom_object, "StudyTime");
+    let study_instance_uid =
+        text(dicom_object, "StudyInstanceUID").unwrap_or_else(|| "Unknown Study".to_owned());
+    let study_description = text(dicom_object, "StudyDescription");
+    let study_date = text(dicom_object, "StudyDate");
+    let study_time = text(dicom_object, "StudyTime");
 
-    let series_instance_uid = dicom_value::text(dicom_object, "SeriesInstanceUID")
-        .unwrap_or_else(|| "Unknown Series".to_owned());
-    let series_description = dicom_value::text(dicom_object, "SeriesDescription");
-    let series_number = dicom_value::first_parsed(dicom_object, "SeriesNumber");
+    let series_instance_uid =
+        text(dicom_object, "SeriesInstanceUID").unwrap_or_else(|| "Unknown Series".to_owned());
+    let series_description = text(dicom_object, "SeriesDescription");
+    let series_number = first_parsed(dicom_object, "SeriesNumber");
 
-    let instance_number = dicom_value::first_parsed(dicom_object, "InstanceNumber");
+    let instance_number = first_parsed(dicom_object, "InstanceNumber");
     let sort_position = compute_slice_sort_position(dicom_object);
-    let number_of_frames = dicom_value::first_parsed::<u32>(dicom_object, "NumberOfFrames")
+    let number_of_frames = first_parsed::<u32>(dicom_object, "NumberOfFrames")
         .unwrap_or(1)
         .max(1);
 
@@ -343,7 +153,7 @@ fn get_or_insert_series(
     series_groups.len() - 1
 }
 
-fn sort_dicom_index(patients: &mut [PatientGroup]) {
+pub(in crate::dicom) fn sort_index(patients: &mut [PatientGroup]) {
     patients.sort_by(|left, right| left.display_name.cmp(&right.display_name));
 
     for patient in patients {
@@ -496,7 +306,7 @@ fn get_image_position_patient(dicom_object: &DefaultDicomObject) -> Option<[f64;
     let mut values = [0.0_f64; 3];
 
     for (index, slot) in values.iter_mut().enumerate() {
-        *slot = dicom_value::parsed_at(dicom_object, "ImagePositionPatient", index)?;
+        *slot = parsed_at(dicom_object, "ImagePositionPatient", index)?;
     }
 
     Some(values)
@@ -506,10 +316,42 @@ fn get_image_orientation_patient(dicom_object: &DefaultDicomObject) -> Option<[f
     let mut values = [0.0_f64; 6];
 
     for (index, slot) in values.iter_mut().enumerate() {
-        *slot = dicom_value::parsed_at(dicom_object, "ImageOrientationPatient", index)?;
+        *slot = parsed_at(dicom_object, "ImageOrientationPatient", index)?;
     }
 
     Some(values)
+}
+
+fn text(dicom_object: &DefaultDicomObject, keyword: &str) -> Option<String> {
+    let raw_value = dicom_object.element_by_name(keyword).ok()?.to_str().ok()?;
+    let value = raw_value.trim().trim_matches('\0').replace('\\', ", ");
+
+    (!value.is_empty()).then_some(value)
+}
+
+fn first_parsed<T>(dicom_object: &DefaultDicomObject, keyword: &str) -> Option<T>
+where
+    T: FromStr,
+{
+    parsed_at(dicom_object, keyword, 0)
+}
+
+fn parsed_at<T>(dicom_object: &DefaultDicomObject, keyword: &str, index: usize) -> Option<T>
+where
+    T: FromStr,
+{
+    dicom_object
+        .element_by_name(keyword)
+        .ok()?
+        .to_str()
+        .ok()?
+        .trim()
+        .trim_matches('\0')
+        .split('\\')
+        .nth(index)?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]

@@ -9,13 +9,12 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use rfd::FileDialog;
 
-use crate::dicom::index::{
-    DicomIndex, DicomIndexProgress, PatientGroup, SliceItem, StudyGroup,
-    build_dicom_index_for_file, build_dicom_index_for_inputs_with_progress,
-    build_dicom_index_with_progress,
+use crate::dicom::{
+    BuildProgress, DecodedFrame, DicomIndex, DicomMetadata, DicomWindow, DisplayPixels,
+    MetadataItem, PatientGroup, SliceItem, StudyGroup, build_for_file,
+    build_for_inputs_with_progress, build_from_folder_with_progress, is_candidate_path,
+    load_dicom_frame, render_frame,
 };
-use crate::dicom::loader::{DecodedFrame, DicomWindow, load_dicom_frame, render_frame};
-use crate::metadata::{DicomMetadata, MetadataItem};
 use crate::metadata_table;
 use crate::settings::AppSettings;
 
@@ -27,8 +26,7 @@ mod viewer;
 
 use cache::DecodedCache;
 use ui::AboutDialog;
-pub(crate) use ui::viewer::color_image_from_dynamic_image;
-use ui::viewer::{fit_image_to_available_space, upload_color_image};
+use ui::viewer::{fit_image_to_available_space, upload_display_pixels};
 
 const LEFT_PANEL_DEFAULT_WIDTH: f32 = 450.0;
 const RIGHT_PANEL_DEFAULT_WIDTH: f32 = 340.0;
@@ -152,7 +150,7 @@ struct DicomFolderScanState {
 }
 
 enum DicomFolderScanMessage {
-    Progress(DicomIndexProgress),
+    Progress(BuildProgress),
     Finished(std::result::Result<DicomIndex, String>),
 }
 

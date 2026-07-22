@@ -12,7 +12,7 @@ struct PreparedFrame {
     frame_count: u32,
     value_range: (f64, f64),
     metadata: DicomMetadata,
-    render: anyhow::Result<egui::ColorImage>,
+    pixels: anyhow::Result<DisplayPixels>,
 }
 
 impl DicronApp {
@@ -74,7 +74,7 @@ impl DicronApp {
         self.scan_receiver = None;
         self.scan_state = None;
 
-        match build_dicom_index_for_file(&selected_dicom_path) {
+        match build_for_file(&selected_dicom_path) {
             Ok(dicom_index) => {
                 self.dicom_index = Some(dicom_index);
                 self.error_message = None;
@@ -118,7 +118,7 @@ impl DicronApp {
         let scan_cancel_for_thread = scan_cancel.clone();
 
         thread::spawn(move || {
-            let scan_result = build_dicom_index_with_progress(
+            let scan_result = build_from_folder_with_progress(
                 &folder_path_for_thread,
                 &scan_cancel_for_thread,
                 |progress| {
@@ -207,7 +207,7 @@ impl DicronApp {
         let scan_cancel_for_thread = scan_cancel.clone();
 
         thread::spawn(move || {
-            let scan_result = build_dicom_index_for_inputs_with_progress(
+            let scan_result = build_for_inputs_with_progress(
                 &input_paths_for_thread,
                 &scan_cancel_for_thread,
                 |progress| {
@@ -372,12 +372,12 @@ impl DicronApp {
                 frame_count: entry.frame.frame_count,
                 value_range: entry.frame.value_range,
                 metadata: entry.metadata.clone(),
-                render: render_frame(&entry.frame, effective_window),
+                pixels: render_frame(&entry.frame, effective_window),
             }
         };
 
-        let color_image = match prepared.render {
-            Ok(color_image) => color_image,
+        let pixels = match prepared.pixels {
+            Ok(pixels) => pixels,
             Err(error) => {
                 self.error_message = Some(format!("Failed to render DICOM: {error:#}"));
                 return;
@@ -392,10 +392,10 @@ impl DicronApp {
         self.current_value_range = prepared.value_range;
         self.selected_dicom_frame_index = frame_index;
         self.selected_dicom_frame_count = prepared.frame_count;
-        self.loaded_texture = Some(upload_color_image(
+        self.loaded_texture = Some(upload_display_pixels(
             context,
             texture_name(&dicom_path),
-            color_image,
+            pixels,
         ));
         self.curated_metadata_items = prepared.metadata.curated_items;
         self.all_metadata_items = prepared.metadata.all_items;
@@ -422,12 +422,9 @@ impl DicronApp {
         };
 
         match rendered {
-            Ok(color_image) => {
-                self.loaded_texture = Some(upload_color_image(
-                    context,
-                    texture_name(&path),
-                    color_image,
-                ));
+            Ok(pixels) => {
+                self.loaded_texture =
+                    Some(upload_display_pixels(context, texture_name(&path), pixels));
                 self.error_message = None;
             }
             Err(error) => {
@@ -447,45 +444,6 @@ fn texture_name(dicom_path: &Path) -> &str {
 fn filter_accepted_dropped_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths
         .into_iter()
-        .filter(|path| path.is_dir() || looks_like_dicom_file(path))
+        .filter(|path| path.is_dir() || is_candidate_path(path))
         .collect()
-}
-
-/// Cheap accept-filter for dropped / CLI paths. The previous implementation
-/// fully parsed every file (up to pixel data) on the UI thread, which froze the
-/// app when many loose files were dropped. Here we only check the DICOM Part 10
-/// `DICM` preamble or a `.dcm`/`.dicom` extension; the background scan still does
-/// the authoritative parse, so a false positive is harmless.
-fn looks_like_dicom_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-
-    if has_dicom_preamble(path) {
-        return true;
-    }
-
-    matches!(
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("dcm") | Some("dicom")
-    )
-}
-
-fn has_dicom_preamble(path: &Path) -> bool {
-    use std::io::Read;
-
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-
-    let mut header = [0u8; 132];
-
-    if file.read_exact(&mut header).is_err() {
-        return false;
-    }
-
-    &header[128..132] == b"DICM"
 }

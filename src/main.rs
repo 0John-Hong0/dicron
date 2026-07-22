@@ -2,7 +2,6 @@
 
 mod app;
 mod dicom;
-mod metadata;
 mod metadata_table;
 mod release_check;
 mod settings;

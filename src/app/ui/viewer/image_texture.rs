@@ -1,22 +1,18 @@
+//! Conversion of neutral display pixels to egui textures and viewer image sizing.
+
 use eframe::egui;
 
-/// CPU-side conversion of a decoded image to an egui `ColorImage`. Kept separate
-/// from the GPU upload so it can run off the UI thread.
-pub(crate) fn color_image_from_dynamic_image(
-    dynamic_image: &image::DynamicImage,
-) -> egui::ColorImage {
-    let rgba_image = dynamic_image.to_rgba8();
-    let image_size = [rgba_image.width() as usize, rgba_image.height() as usize];
-
-    egui::ColorImage::from_rgba_unmultiplied(image_size, rgba_image.as_raw())
-}
+use crate::dicom::DisplayPixels;
 
 /// Upload a prepared `ColorImage` to the GPU. Must run on the UI thread.
-pub(in crate::app) fn upload_color_image(
+pub(in crate::app) fn upload_display_pixels(
     context: &egui::Context,
     texture_name: &str,
-    color_image: egui::ColorImage,
+    pixels: DisplayPixels,
 ) -> egui::TextureHandle {
+    let color_image =
+        egui::ColorImage::from_rgba_unmultiplied([pixels.width, pixels.height], &pixels.rgba);
+
     context.load_texture(texture_name, color_image, egui::TextureOptions::LINEAR)
 }
 

@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::metadata::MetadataItem;
+use crate::dicom::MetadataItem;
 
 pub fn show(ui: &mut egui::Ui, metadata_items: &[&MetadataItem]) {
     const TAG_COLUMN_WIDTH: f32 = 96.0;

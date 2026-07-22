@@ -1,3 +1,5 @@
+//! UI-independent extraction and formatting of DICOM metadata.
+
 use dicom_core::header::{HasLength, Header};
 use dicom_core::value::Value;
 use dicom_core::{
@@ -8,22 +10,20 @@ use dicom_dictionary_std::{StandardDataDictionary, StandardSopClassDictionary, t
 use dicom_object::DefaultDicomObject;
 use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
 
-use crate::dicom::value as dicom_value;
-
 const MAX_INLINE_METADATA_VALUE_BYTES: u32 = 4096;
 
 #[derive(Clone)]
-pub struct MetadataItem {
-    pub tag: String,
-    pub description: String,
-    pub value: String,
+pub(crate) struct MetadataItem {
+    pub(crate) tag: String,
+    pub(crate) description: String,
+    pub(crate) value: String,
     // Lowercased "tag\ndescription\nvalue", precomputed once so filtering does
     // not re-lowercase every field of every tag on every UI frame.
     search_haystack: String,
 }
 
 impl MetadataItem {
-    pub fn new(tag: String, description: String, value: String) -> Self {
+    pub(crate) fn new(tag: String, description: String, value: String) -> Self {
         let search_haystack = format!("{tag}\n{description}\n{value}").to_lowercase();
 
         Self {
@@ -35,18 +35,18 @@ impl MetadataItem {
     }
 
     /// `search_text` is expected to already be lowercased by the caller.
-    pub fn matches_search(&self, search_text: &str) -> bool {
+    pub(crate) fn matches_search(&self, search_text: &str) -> bool {
         self.search_haystack.contains(search_text)
     }
 }
 
 #[derive(Clone)]
-pub struct DicomMetadata {
-    pub curated_items: Vec<MetadataItem>,
-    pub all_items: Vec<MetadataItem>,
+pub(crate) struct DicomMetadata {
+    pub(crate) curated_items: Vec<MetadataItem>,
+    pub(crate) all_items: Vec<MetadataItem>,
 }
 
-pub fn extract_dicom_metadata(dicom_object: &DefaultDicomObject) -> DicomMetadata {
+pub(crate) fn extract_dicom_metadata(dicom_object: &DefaultDicomObject) -> DicomMetadata {
     DicomMetadata {
         curated_items: extract_curated_dicom_metadata(dicom_object),
         all_items: extract_all_dicom_metadata(dicom_object),
@@ -404,7 +404,7 @@ where
 }
 
 fn format_dicom_text_value(tag: Tag, raw_value: &str) -> String {
-    let cleaned_value = dicom_value::clean_text_value(raw_value);
+    let cleaned_value = clean_text_value(raw_value);
 
     if cleaned_value.is_empty() {
         return "-".to_owned();
@@ -456,9 +456,78 @@ fn summarize_large_value(label: &str, length: dicom_core::Length) -> String {
     }
 }
 
+fn clean_text_value(raw_value: &str) -> String {
+    raw_value.trim().trim_matches('\0').replace('\\', ", ")
+}
+
 #[cfg(test)]
 mod tests {
+    use dicom_core::{DataElement, VR, dicom_value};
+    use dicom_dictionary_std::uids;
+    use dicom_object::{FileDicomObject, FileMetaTableBuilder};
+
     use super::*;
+
+    const EXPECTED_CURATED_ROWS: &[(&str, &str)] = &[
+        ("-", "File Type"),
+        ("(0002,0010)", "Transfer Syntax UID"),
+        ("(0002,0002)", "Media Storage SOP Class UID"),
+        ("(0002,0003)", "Media Storage SOP Instance UID"),
+        ("(0010,0010)", "Patient Name"),
+        ("(0010,0020)", "Patient ID"),
+        ("(0010,0040)", "Patient Sex"),
+        ("(0010,0030)", "Patient Birth Date"),
+        ("(0008,0060)", "Modality"),
+        ("(0008,0020)", "Study Date"),
+        ("(0008,0030)", "Study Time"),
+        ("(0008,1030)", "Study Description"),
+        ("(0008,103E)", "Series Description"),
+        ("(0020,000D)", "Study Instance UID"),
+        ("(0020,000E)", "Series Instance UID"),
+        ("(0008,0018)", "SOP Instance UID"),
+        ("(0020,0011)", "Series Number"),
+        ("(0020,0013)", "Instance Number"),
+        ("(0028,0010)", "Rows"),
+        ("(0028,0011)", "Columns"),
+        ("(0028,0008)", "Number of Frames"),
+        ("(0028,0002)", "Samples Per Pixel"),
+        ("(0028,0004)", "Photometric Interpretation"),
+        ("(0028,0100)", "Bits Allocated"),
+        ("(0028,0101)", "Bits Stored"),
+        ("(0028,0102)", "High Bit"),
+        ("(0028,0103)", "Pixel Representation"),
+        ("(0028,0030)", "Pixel Spacing"),
+        ("(0018,0050)", "Slice Thickness"),
+        ("(0020,0032)", "Image Position Patient"),
+        ("(0020,0037)", "Image Orientation Patient"),
+        ("(0028,1050)", "Window Center"),
+        ("(0028,1051)", "Window Width"),
+        ("(0028,1052)", "Rescale Intercept"),
+        ("(0028,1053)", "Rescale Slope"),
+    ];
+
+    fn metadata_test_object() -> DefaultDicomObject {
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .media_storage_sop_class_uid(uids::CT_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid("2.25.101")
+            .build()
+            .unwrap();
+        let mut object = FileDicomObject::new_empty_with_meta(meta);
+
+        object.put_element(DataElement::new(
+            tags::PATIENT_NAME,
+            VR::PN,
+            dicom_value!(Str, "Doe^Jane"),
+        ));
+        object.put_element(DataElement::new(
+            tags::PIXEL_REPRESENTATION,
+            VR::US,
+            dicom_value!(U16, 1),
+        ));
+
+        object
+    }
 
     #[test]
     fn formats_known_transfer_syntax_with_raw_uid() {
@@ -525,5 +594,90 @@ mod tests {
 
         assert!(item.matches_search("explicit vr little endian"));
         assert!(item.matches_search("1.2.840.10008.1.2.1"));
+    }
+
+    #[test]
+    fn curated_metadata_preserves_order_labels_and_placeholders() {
+        let metadata = extract_dicom_metadata(&metadata_test_object());
+        let row_identity: Vec<_> = metadata
+            .curated_items
+            .iter()
+            .map(|item| (item.tag.as_str(), item.description.as_str()))
+            .collect();
+
+        assert_eq!(row_identity, EXPECTED_CURATED_ROWS);
+
+        let leading_rows: Vec<_> = metadata
+            .curated_items
+            .iter()
+            .take(6)
+            .map(|item| {
+                (
+                    item.tag.as_str(),
+                    item.description.as_str(),
+                    item.value.as_str(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            leading_rows,
+            [
+                ("-", "File Type", "DICOM"),
+                (
+                    "(0002,0010)",
+                    "Transfer Syntax UID",
+                    "Explicit VR Little Endian (1.2.840.10008.1.2.1)",
+                ),
+                (
+                    "(0002,0002)",
+                    "Media Storage SOP Class UID",
+                    "CT Image Storage (1.2.840.10008.5.1.4.1.1.2)",
+                ),
+                ("(0002,0003)", "Media Storage SOP Instance UID", "2.25.101"),
+                ("(0010,0010)", "Patient Name", "Doe^Jane"),
+                ("(0010,0020)", "Patient ID", "-"),
+            ]
+        );
+
+        let pixel_representation = metadata
+            .curated_items
+            .iter()
+            .find(|item| item.tag == "(0028,0103)")
+            .unwrap();
+        assert_eq!(
+            pixel_representation.value,
+            "Signed two's-complement integer (1)"
+        );
+    }
+
+    #[test]
+    fn all_metadata_combines_file_meta_and_dataset_in_tag_order() {
+        let metadata = extract_dicom_metadata(&metadata_test_object());
+
+        assert!(
+            metadata
+                .all_items
+                .windows(2)
+                .all(|items| items[0].tag <= items[1].tag)
+        );
+
+        let transfer_syntax = metadata
+            .all_items
+            .iter()
+            .find(|item| item.tag == "(0002,0010)")
+            .unwrap();
+        assert_eq!(
+            transfer_syntax.value,
+            "Explicit VR Little Endian (1.2.840.10008.1.2.1)"
+        );
+
+        let patient_name = metadata
+            .all_items
+            .iter()
+            .find(|item| item.tag == "(0010,0010)")
+            .unwrap();
+        assert_eq!(patient_name.description, "PatientName");
+        assert_eq!(patient_name.value, "Doe^Jane");
     }
 }
