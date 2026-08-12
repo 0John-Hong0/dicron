@@ -5,6 +5,7 @@ use eframe::egui;
 use crate::app::state::{AboutDialogState, UpdateCheckStatus};
 use crate::release_check::UpdateCheckOutcome;
 use crate::settings::AppSettings;
+use crate::theme;
 
 const APP_AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
 const APP_REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
@@ -39,7 +40,7 @@ impl AboutDialogState {
                 ui.heading("Dicron");
                 ui.separator();
                 ui.add(egui::Label::new(env!("CARGO_PKG_DESCRIPTION")).wrap());
-                ui.add_space(4.0);
+                ui.add_space(theme::SPACE_XS);
                 ui.label(
                     egui::RichText::new(format!("Version v{}", env!("CARGO_PKG_VERSION")))
                         .monospace(),
@@ -48,8 +49,9 @@ impl AboutDialogState {
             });
 
             self.show_update_controls(ui, context, settings);
+
             ui.separator();
-            ui.add_space(4.0);
+            ui.add_space(theme::SPACE_XS);
             egui::CollapsingHeader::new("System information")
                 .id_salt("about_system_information")
                 .show(ui, |ui| {
@@ -63,7 +65,8 @@ impl AboutDialogState {
                     });
                 });
 
-            ui.add_space(4.0);
+            ui.add_space(theme::SPACE_XS);
+
             ui.horizontal(|ui| {
                 let footer_text_color = ui
                     .visuals()
@@ -111,7 +114,10 @@ impl AboutDialogState {
         egui::Window::new("Update available")
             .id(egui::Id::new("update_available_notification"))
             .open(&mut notification_open)
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -12.0))
+            .anchor(
+                egui::Align2::RIGHT_BOTTOM,
+                egui::vec2(-theme::SPACE_MD, -theme::SPACE_MD),
+            )
             .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
@@ -137,9 +143,9 @@ impl AboutDialogState {
         context: &egui::Context,
         settings: &mut AppSettings,
     ) {
-        ui.add_space(4.0);
+        ui.add_space(theme::SPACE_XS);
         ui.separator();
-        ui.add_space(4.0);
+        ui.add_space(theme::SPACE_XS);
 
         let can_check_for_updates = !self.update_status.is_checking();
         let check_button_clicked = ui
@@ -161,7 +167,8 @@ impl AboutDialogState {
             self.start_update_check(context, false);
         }
 
-        ui.add_space(4.0);
+        ui.add_space(theme::SPACE_XS);
+
         let mut check_for_updates_on_startup = settings.check_for_updates_on_startup;
 
         if ui
@@ -178,7 +185,8 @@ impl AboutDialogState {
             }
         }
 
-        ui.add_space(4.0);
+        ui.add_space(theme::SPACE_XS);
+
         match &self.update_status {
             UpdateCheckStatus::NotChecked => {}
             UpdateCheckStatus::Checking => {
@@ -204,7 +212,7 @@ impl AboutDialogState {
             }
         }
 
-        ui.add_space(4.0);
+        ui.add_space(theme::SPACE_XS);
     }
 
     fn start_update_check(&mut self, context: &egui::Context, notify_if_available: bool) {
