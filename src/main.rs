@@ -4,6 +4,7 @@ mod app;
 mod dicom;
 mod release_check;
 mod settings;
+mod theme;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +37,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |creation_context| {
             configure_fonts(&creation_context.egui_ctx);
+            theme::configure(&creation_context.egui_ctx);
 
             let mut app = DicronApp::default();
 

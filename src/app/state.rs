@@ -112,16 +112,37 @@ impl Default for WindowLevelState {
     }
 }
 
+pub(super) struct SidePanelLayout {
+    pub(super) width: f32,
+    pub(super) collapsed: bool,
+    pub(super) resize_drag: Option<PanelResizeDrag>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PanelResizeDrag {
+    pub(super) start_width: f32,
+}
+
+impl SidePanelLayout {
+    const fn expanded(width: f32) -> Self {
+        Self {
+            width,
+            collapsed: false,
+            resize_drag: None,
+        }
+    }
+}
+
 pub(super) struct PanelLayout {
-    pub(super) left_width: f32,
-    pub(super) right_width: f32,
+    pub(super) left: SidePanelLayout,
+    pub(super) right: SidePanelLayout,
 }
 
 impl Default for PanelLayout {
     fn default() -> Self {
         Self {
-            left_width: 450.0,
-            right_width: 340.0,
+            left: SidePanelLayout::expanded(450.0),
+            right: SidePanelLayout::expanded(340.0),
         }
     }
 }

@@ -6,19 +6,45 @@ use crate::app::state::MetadataPanelState;
 use crate::dicom::{DicomMetadata, MetadataItem};
 
 mod table {
+    //! Rendering for the tabular DICOM metadata view.
+
     use eframe::egui;
 
     use crate::dicom::MetadataItem;
+    use crate::theme;
+
+    const TAG_COLUMN_PREFERRED_WIDTH: f32 = 92.0;
+    const DESCRIPTION_COLUMN_MAX_WIDTH: f32 = 190.0;
+    const DESCRIPTION_COLUMN_SHARE: f32 = 0.60;
+    const ROW_HEIGHT: f32 = 18.0;
+    const COLUMN_GAP: f32 = theme::SPACE_SM;
+
+    #[derive(Clone, Copy)]
+    struct ColumnWidths {
+        tag: f32,
+        description: f32,
+        value: f32,
+    }
+
+    impl ColumnWidths {
+        fn for_available_width(available_width: f32) -> Self {
+            let content_width = (available_width - COLUMN_GAP * 2.0).max(0.0);
+            let tag = TAG_COLUMN_PREFERRED_WIDTH.min(content_width * 0.35);
+            let remaining_width = (content_width - tag).max(0.0);
+            let description =
+                (remaining_width * DESCRIPTION_COLUMN_SHARE).min(DESCRIPTION_COLUMN_MAX_WIDTH);
+            let value = (remaining_width - description).max(0.0);
+
+            Self {
+                tag,
+                description,
+                value,
+            }
+        }
+    }
 
     pub(super) fn show(ui: &mut egui::Ui, metadata_items: &[&MetadataItem]) {
-        const TAG_COLUMN_WIDTH: f32 = 96.0;
-        const DESCRIPTION_COLUMN_WIDTH: f32 = 190.0;
-        const VALUE_COLUMN_WIDTH: f32 = 430.0;
-        const ROW_HEIGHT: f32 = 18.0;
-        const TABLE_MIN_WIDTH: f32 =
-            TAG_COLUMN_WIDTH + DESCRIPTION_COLUMN_WIDTH + VALUE_COLUMN_WIDTH + 64.0;
-
-        egui::ScrollArea::both()
+        egui::ScrollArea::vertical()
             .id_salt("dicom_metadata_table_scroll_area")
             .scroll_source(
                 egui::scroll_area::ScrollSource::SCROLL_BAR
@@ -26,32 +52,40 @@ mod table {
             )
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.set_min_width(TABLE_MIN_WIDTH);
+                let column_widths = ColumnWidths::for_available_width(ui.available_width());
 
                 egui::Grid::new("dicom_metadata_table_grid")
                     .num_columns(3)
                     .striped(true)
-                    .spacing([16.0, 6.0])
+                    .spacing([COLUMN_GAP, theme::SPACE_XS])
                     .min_col_width(0.0)
                     .show(ui, |ui| {
-                        header_cell(ui, TAG_COLUMN_WIDTH, ROW_HEIGHT, "Tag ID");
-                        header_cell(ui, DESCRIPTION_COLUMN_WIDTH, ROW_HEIGHT, "Description");
-                        header_cell(ui, VALUE_COLUMN_WIDTH, ROW_HEIGHT, "Value");
+                        header_cell(ui, column_widths.tag, ROW_HEIGHT, "Tag ID");
+                        header_cell(ui, column_widths.description, ROW_HEIGHT, "Description");
+                        header_cell(ui, column_widths.value, ROW_HEIGHT, "Value");
                         ui.end_row();
 
                         for metadata_item in metadata_items {
-                            cell(ui, TAG_COLUMN_WIDTH, ROW_HEIGHT, metadata_item.tag.as_str());
                             cell(
                                 ui,
-                                DESCRIPTION_COLUMN_WIDTH,
+                                column_widths.tag,
                                 ROW_HEIGHT,
-                                metadata_item.description.as_str(),
+                                metadata_item.tag.as_str(),
+                                "Copy tag ID",
                             );
                             cell(
                                 ui,
-                                VALUE_COLUMN_WIDTH,
+                                column_widths.description,
+                                ROW_HEIGHT,
+                                metadata_item.description.as_str(),
+                                "Copy description",
+                            );
+                            cell(
+                                ui,
+                                column_widths.value,
                                 ROW_HEIGHT,
                                 metadata_item.value.as_str(),
+                                "Copy full value",
                             );
                             ui.end_row();
                         }
@@ -64,25 +98,59 @@ mod table {
             egui::vec2(width, height),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(egui::RichText::new(text).strong());
+                ui.add(egui::Label::new(egui::RichText::new(text).strong()).truncate());
             },
         );
     }
 
-    fn cell(ui: &mut egui::Ui, width: f32, height: f32, text: &str) -> egui::Response {
+    fn cell(
+        ui: &mut egui::Ui,
+        width: f32,
+        height: f32,
+        text: &str,
+        copy_action: &str,
+    ) -> egui::Response {
         let layout = egui::Layout::left_to_right(egui::Align::Center)
             .with_main_align(egui::Align::Min)
             .with_main_justify(true)
             .with_cross_justify(true);
 
-        ui.allocate_ui_with_layout(egui::vec2(width, height), layout, |ui| {
-            ui.add(
-                egui::Label::new(text)
-                    .selectable(true)
-                    .wrap_mode(egui::TextWrapMode::Extend),
-            )
-        })
-        .inner
+        let response = ui
+            .allocate_ui_with_layout(egui::vec2(width, height), layout, |ui| {
+                ui.add(
+                    egui::Label::new(text)
+                        .selectable(true)
+                        .wrap_mode(egui::TextWrapMode::Truncate),
+                )
+            })
+            .inner;
+
+        response.context_menu(|ui| {
+            if ui.button(copy_action).clicked() {
+                ui.ctx().copy_text(text.to_owned());
+                ui.close();
+            }
+        });
+
+        response
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn responsive_columns_fit_without_horizontal_overflow() {
+            for available_width in [100.0, 236.0, 316.0, 776.0] {
+                let widths = ColumnWidths::for_available_width(available_width);
+                let used_width = widths.tag + widths.description + widths.value + COLUMN_GAP * 2.0;
+
+                assert!((used_width - available_width).abs() < f32::EPSILON);
+                assert!(widths.tag <= TAG_COLUMN_PREFERRED_WIDTH);
+                assert!(widths.description <= DESCRIPTION_COLUMN_MAX_WIDTH);
+                assert!(widths.value >= 0.0);
+            }
+        }
     }
 }
 

@@ -7,6 +7,17 @@ mod window_level;
 
 pub(in crate::app) use image_texture::upload_display_pixels;
 
+pub(super) enum ViewerControlAction {
+    ResetWindowLevel,
+}
+
+pub(super) fn show_controls(
+    app: &mut crate::app::DicronApp,
+    ui: &mut eframe::egui::Ui,
+) -> Option<ViewerControlAction> {
+    controls::show_control_row(app, ui)
+}
+
 pub(super) fn show(app: &mut crate::app::DicronApp, ui: &mut eframe::egui::Ui) {
     viewport::show(app, ui);
 }
