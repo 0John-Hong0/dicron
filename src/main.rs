@@ -39,7 +39,7 @@ fn main() -> eframe::Result {
             configure_fonts(&creation_context.egui_ctx);
             theme::configure(&creation_context.egui_ctx);
 
-            let mut app = DicronApp::default();
+            let mut app = DicronApp::new(&creation_context.egui_ctx);
 
             if !startup_paths.is_empty() {
                 app.open_startup_paths(&creation_context.egui_ctx, startup_paths.clone());
