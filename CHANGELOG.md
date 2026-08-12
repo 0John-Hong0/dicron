@@ -10,6 +10,7 @@ This project uses semantic versioning while it remains practical for a small des
 - Improve spacing and responsive layout throughout the viewer, including controls that wrap at narrow window widths.
 - Refine the DICOM tree with clearer hierarchy, compact slice rows, full-row selection, and tooltips for truncated labels.
 - Make the metadata table adapt to the available width without horizontal scrolling, with full text on hover and right-click copy actions.
+- Add a persistent System, Light, and Dark theme selector styled consistently with the toolbar.
 
 ## [0.1.1] - 2026-07-13
 

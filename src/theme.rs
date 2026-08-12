@@ -13,13 +13,23 @@ pub(crate) const SPACE_LG: f32 = 16.0;
 const SPACE_SM_I8: i8 = SPACE_SM as i8;
 const SPACE_MD_I8: i8 = SPACE_MD as i8;
 
+fn button_padding() -> egui::Vec2 {
+    egui::vec2(SPACE_XS, SPACE_XXS)
+}
+
 pub(crate) fn configure(context: &egui::Context) {
     context.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(SPACE_SM, SPACE_XS);
         style.spacing.window_margin = egui::Margin::same(SPACE_MD_I8);
         style.spacing.menu_margin = egui::Margin::same(SPACE_MD_I8);
-        style.spacing.button_padding = egui::vec2(SPACE_XS, SPACE_XXS);
+        style.spacing.button_padding = button_padding();
     });
+}
+
+/// Keep popup choices compact while retaining the application's button padding.
+pub(crate) fn popup_menu_style(style: &mut egui::Style) {
+    egui::containers::menu::menu_style(style);
+    style.spacing.button_padding = button_padding();
 }
 
 /// Toolbar and inspector panels share one explicit content inset.
@@ -48,11 +58,16 @@ mod tests {
             assert_eq!(style.spacing.item_spacing, egui::vec2(SPACE_SM, SPACE_XS));
             assert_eq!(style.spacing.window_margin, egui::Margin::same(SPACE_MD_I8));
             assert_eq!(style.spacing.menu_margin, egui::Margin::same(SPACE_MD_I8));
-            assert_eq!(
-                style.spacing.button_padding,
-                egui::vec2(SPACE_XS, SPACE_XXS)
-            );
+            assert_eq!(style.spacing.button_padding, button_padding());
         }
+    }
+
+    #[test]
+    fn popup_menus_retain_application_button_padding() {
+        let mut style = egui::Style::default();
+        popup_menu_style(&mut style);
+
+        assert_eq!(style.spacing.button_padding, button_padding());
     }
 
     #[test]
