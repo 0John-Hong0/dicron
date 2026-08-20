@@ -20,7 +20,7 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
     panel_resize::clamp_panel_widths(ui, &mut app.panel_layout);
 
     egui::Panel::top("toolbar_panel")
-        .frame(theme::content_panel_frame(ui.style()))
+        .frame(theme::toolbar_panel_frame(ui.style()))
         .show_inside(ui, |ui| {
             if let Some(action) = toolbar::show_actions(ui, app.settings.theme_preference) {
                 app.handle_toolbar_action(ui.ctx(), action);
@@ -29,7 +29,7 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
             app.about_dialog.show(ui.ctx(), &mut app.settings);
 
             if toolbar::show_loaded_dicom_status(ui, app.selected_dicom_path.as_deref()) {
-                ui.separator();
+                ui.add(egui::Separator::default().spacing(theme::SPACE_XXS));
 
                 if let Some(action) = viewer::show_controls(app, ui) {
                     app.handle_viewer_control_action(ui.ctx(), action);
@@ -100,6 +100,7 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
         });
 
     app.about_dialog.show_notification(ui.ctx());
+    app.show_edit_windowing_dialog(ui.ctx());
 }
 
 impl DicronApp {
@@ -121,6 +122,10 @@ impl DicronApp {
     ) {
         match action {
             viewer::ViewerControlAction::ResetWindowLevel => self.reset_window_level(context),
+            viewer::ViewerControlAction::ApplyWindowPreset(preset) => {
+                self.apply_window_preset(context, preset);
+            }
+            viewer::ViewerControlAction::OpenEditWindowing => self.open_edit_windowing_dialog(),
         }
     }
 }

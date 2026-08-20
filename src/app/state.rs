@@ -81,10 +81,90 @@ impl Default for PlaybackState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct WindowLevel {
     pub(super) center: f64,
     pub(super) width: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WindowPreset {
+    Default,
+    FullDynamic,
+    Skull,
+    Lung,
+    Abdomen,
+    Mediastinum,
+    Bone,
+    Spine,
+    Postmyelo,
+    Felsenbein,
+}
+
+pub(super) const WINDOW_PRESETS: [WindowPreset; 10] = [
+    WindowPreset::Default,
+    WindowPreset::FullDynamic,
+    WindowPreset::Skull,
+    WindowPreset::Lung,
+    WindowPreset::Abdomen,
+    WindowPreset::Mediastinum,
+    WindowPreset::Bone,
+    WindowPreset::Spine,
+    WindowPreset::Postmyelo,
+    WindowPreset::Felsenbein,
+];
+
+impl WindowPreset {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::FullDynamic => "Full Dynamic",
+            Self::Skull => "Skull",
+            Self::Lung => "Lung",
+            Self::Abdomen => "Abdomen",
+            Self::Mediastinum => "Mediastinum",
+            Self::Bone => "Bone",
+            Self::Spine => "Spine",
+            Self::Postmyelo => "Postmyelo",
+            Self::Felsenbein => "Felsenbein",
+        }
+    }
+
+    pub(super) fn shortcut(self) -> char {
+        match self {
+            Self::Default => '0',
+            Self::FullDynamic => '1',
+            Self::Skull => '2',
+            Self::Lung => '3',
+            Self::Abdomen => '4',
+            Self::Mediastinum => '5',
+            Self::Bone => '6',
+            Self::Spine => '7',
+            Self::Postmyelo => '8',
+            Self::Felsenbein => '9',
+        }
+    }
+
+    pub(super) fn fixed_window(self) -> Option<WindowLevel> {
+        let (center, width) = match self {
+            Self::Skull => (25.0, 95.0),
+            Self::Lung => (-400.0, 1600.0),
+            Self::Abdomen | Self::Mediastinum => (10.0, 400.0),
+            Self::Bone => (300.0, 2500.0),
+            Self::Spine => (20.0, 300.0),
+            Self::Postmyelo => (200.0, 1000.0),
+            Self::Felsenbein => (500.0, 4000.0),
+            Self::Default | Self::FullDynamic => return None,
+        };
+
+        Some(WindowLevel { center, width })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct SavedWindowLevel {
+    pub(super) window: WindowLevel,
+    pub(super) preset: Option<WindowPreset>,
 }
 
 pub(super) struct WindowLevelState {
@@ -92,7 +172,9 @@ pub(super) struct WindowLevelState {
     pub(super) default: WindowLevel,
     pub(super) value_range: (f64, f64),
     pub(super) customized: bool,
-    pub(super) by_series: HashMap<SeriesKey, WindowLevel>,
+    pub(super) available: bool,
+    pub(super) active_preset: Option<WindowPreset>,
+    pub(super) by_series: HashMap<SeriesKey, SavedWindowLevel>,
 }
 
 impl Default for WindowLevelState {
@@ -107,6 +189,8 @@ impl Default for WindowLevelState {
             default: initial,
             value_range: (-1024.0, 3071.0),
             customized: false,
+            available: false,
+            active_preset: Some(WindowPreset::Default),
             by_series: HashMap::new(),
         }
     }
@@ -129,6 +213,22 @@ impl SidePanelLayout {
             width,
             collapsed: false,
             resize_drag: None,
+        }
+    }
+}
+
+pub(super) struct EditWindowingDialogState {
+    pub(super) open: bool,
+    pub(super) center: f64,
+    pub(super) width: f64,
+}
+
+impl Default for EditWindowingDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            center: 0.0,
+            width: 1.0,
         }
     }
 }
@@ -190,6 +290,7 @@ pub(crate) struct DicronApp {
     pub(super) decoded_cache: DecodedCache,
     pub(super) current_frame_key: Option<(PathBuf, u32)>,
     pub(super) window_level: WindowLevelState,
+    pub(super) edit_windowing_dialog: EditWindowingDialogState,
     pub(super) metadata: MetadataPanelState,
     pub(super) about_dialog: AboutDialogState,
     pub(super) error_message: Option<String>,
@@ -217,6 +318,7 @@ impl Default for DicronApp {
             decoded_cache: DecodedCache::default(),
             current_frame_key: None,
             window_level: WindowLevelState::default(),
+            edit_windowing_dialog: EditWindowingDialogState::default(),
             metadata: MetadataPanelState::default(),
             about_dialog,
             error_message: None,

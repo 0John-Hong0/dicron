@@ -32,6 +32,7 @@ pub(crate) struct DecodedFrame {
     /// Rescaled (modality-LUT) value range, used to seed a sane default window
     /// when the file carries none and to bound interactive windowing.
     pub(crate) value_range: (f64, f64),
+    window_level_available: bool,
 }
 
 impl DecodedFrame {
@@ -47,6 +48,24 @@ impl DecodedFrame {
         let center = minimum + width / 2.0;
 
         (center, width)
+    }
+
+    pub(crate) fn full_dynamic_window(&self) -> Option<DicomWindow> {
+        if !self.window_level_available {
+            return None;
+        }
+
+        let values = self.decoded.to_vec_frame::<f64>(0).ok()?;
+        let (minimum, maximum) = finite_value_range(&values)?;
+
+        Some(DicomWindow {
+            center: minimum / 2.0 + maximum / 2.0,
+            width: (maximum - minimum).max(1.0),
+        })
+    }
+
+    pub(crate) fn window_level_available(&self) -> bool {
+        self.window_level_available
     }
 }
 
@@ -83,11 +102,14 @@ fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<D
         .unwrap_or(1)
         .max(1);
 
+    let window_level_available = decoded.photometric_interpretation().is_monochrome();
+
     Ok(DecodedFrame {
         decoded,
         frame_count,
         default_window: read_default_window(dicom_object),
         value_range: compute_value_range(dicom_object),
+        window_level_available,
     })
 }
 
@@ -160,6 +182,17 @@ fn compute_value_range(dicom_object: &DefaultDicomObject) -> (f64, f64) {
     (first.min(second), first.max(second))
 }
 
+fn finite_value_range(values: &[f64]) -> Option<(f64, f64)> {
+    values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(None, |range, value| match range {
+            Some((minimum, maximum)) => Some((minimum.min(value), maximum.max(value))),
+            None => Some((value, value)),
+        })
+}
+
 fn finite_or(value: Option<f64>, fallback: f64) -> f64 {
     match value {
         Some(value) if value.is_finite() => value,
@@ -187,7 +220,21 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::finite_value_range;
     use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
+
+    #[test]
+    fn finite_value_range_ignores_non_finite_values() {
+        assert_eq!(
+            finite_value_range(&[f64::NAN, 12.0, -4.0, f64::INFINITY, 7.0]),
+            Some((-4.0, 12.0))
+        );
+    }
+
+    #[test]
+    fn finite_value_range_requires_a_finite_value() {
+        assert_eq!(finite_value_range(&[f64::NAN, f64::NEG_INFINITY]), None);
+    }
 
     #[test]
     fn jpeg2000_lossless_has_a_pixel_decoder() {

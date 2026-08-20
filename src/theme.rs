@@ -12,6 +12,7 @@ pub(crate) const SPACE_LG: f32 = 16.0;
 
 const SPACE_SM_I8: i8 = SPACE_SM as i8;
 const SPACE_MD_I8: i8 = SPACE_MD as i8;
+const SPACE_XS_I8: i8 = SPACE_XS as i8;
 
 fn button_padding() -> egui::Vec2 {
     egui::vec2(SPACE_XS, SPACE_XXS)
@@ -30,6 +31,22 @@ pub(crate) fn configure(context: &egui::Context) {
 pub(crate) fn popup_menu_style(style: &mut egui::Style) {
     egui::containers::menu::menu_style(style);
     style.spacing.button_padding = button_padding();
+}
+
+/// Toolbar rows use the shared control padding and wrap gaps explicitly.
+pub(crate) fn toolbar_row<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    ui.spacing_mut().item_spacing = egui::vec2(SPACE_SM, SPACE_XS);
+    ui.spacing_mut().button_padding = button_padding();
+    ui.horizontal_wrapped(add_contents)
+}
+
+/// The multi-row toolbar is denser vertically than inspector panels.
+pub(crate) fn toolbar_panel_frame(style: &egui::Style) -> egui::Frame {
+    egui::Frame::side_top_panel(style)
+        .inner_margin(egui::Margin::symmetric(SPACE_MD_I8, SPACE_XS_I8))
 }
 
 /// Toolbar and inspector panels share one explicit content inset.
@@ -71,12 +88,28 @@ mod tests {
     }
 
     #[test]
+    fn toolbar_rows_use_application_control_spacing() {
+        let context = egui::Context::default();
+
+        let _ = context.run_ui(Default::default(), |ui| {
+            toolbar_row(ui, |ui| {
+                assert_eq!(ui.spacing().item_spacing, egui::vec2(SPACE_SM, SPACE_XS));
+                assert_eq!(ui.spacing().button_padding, button_padding());
+            });
+        });
+    }
+
+    #[test]
     fn application_frames_have_explicit_insets() {
         let style = egui::Style::default();
 
         assert_eq!(
             content_panel_frame(&style).inner_margin,
             egui::Margin::symmetric(SPACE_MD_I8, SPACE_SM_I8)
+        );
+        assert_eq!(
+            toolbar_panel_frame(&style).inner_margin,
+            egui::Margin::symmetric(SPACE_MD_I8, SPACE_XS_I8)
         );
         assert_eq!(
             viewer_frame(&style).inner_margin,
