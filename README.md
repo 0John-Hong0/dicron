@@ -12,7 +12,7 @@ Dicron is a native desktop viewer for quickly opening local DICOM files and fold
 - View single-frame and multi-frame DICOM images.
 - Step through slices with the keyboard, mouse wheel, or viewer scrollbar.
 - Autoplay image stacks with adjustable FPS and loop mode.
-- Adjust window center and width interactively.
+- Adjust window center and width interactively or apply common window presets.
 - Inspect curated DICOM tags or search across all loaded tags.
 - Native desktop builds for Linux, macOS, and Windows.
 
@@ -44,6 +44,10 @@ Viewer controls:
 - **Home / End**: jump to the first or last slice.
 - **Drag horizontally over the image**: adjust window width.
 - **Drag vertically over the image**: adjust window center.
+- **0–9**: apply the corresponding entry in the **Preset** menu. `0` restores
+  the DICOM window and `1` fits the current image's full value range.
+
+Use **Edit WL** to enter an exact window level and width.
 
 ## Community
 

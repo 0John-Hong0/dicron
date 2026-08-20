@@ -9,7 +9,8 @@ use rfd::FileDialog;
 use crate::app::DicronApp;
 use crate::app::frame_cache::DecodedCacheEntry;
 use crate::app::state::{
-    PLAYBACK_MAX_FPS, PLAYBACK_MIN_FPS, PlaybackLoopMode, SliceSelection, WindowLevel,
+    PLAYBACK_MAX_FPS, PLAYBACK_MIN_FPS, PlaybackLoopMode, SliceSelection, WINDOW_PRESETS,
+    WindowLevel, WindowPreset,
 };
 use crate::app::ui::upload_display_pixels;
 use crate::dicom::{
@@ -280,10 +281,11 @@ impl DicronApp {
     }
 
     pub(in crate::app) fn handle_keyboard_shortcuts(&mut self, context: &egui::Context) {
-        if context.egui_wants_keyboard_input() {
+        if self.edit_windowing_dialog.open || context.egui_wants_keyboard_input() {
             return;
         }
 
+        let preset_shortcuts_enabled = self.window_level.is_available();
         let keyboard_action = context.input_mut(|input_state| {
             let mut slice_delta = 0;
 
@@ -310,11 +312,23 @@ impl DicronApp {
 
             let jump_to_start = input_state.consume_key(egui::Modifiers::NONE, egui::Key::Home);
             let jump_to_end = input_state.consume_key(egui::Modifiers::NONE, egui::Key::End);
+            let window_preset = preset_shortcuts_enabled
+                .then(|| {
+                    WINDOW_PRESETS
+                        .iter()
+                        .copied()
+                        .find(|preset| consume_window_preset_key(input_state, *preset))
+                })
+                .flatten();
 
-            (slice_delta, jump_to_start, jump_to_end)
+            (slice_delta, jump_to_start, jump_to_end, window_preset)
         });
 
-        let (slice_delta, jump_to_start, jump_to_end) = keyboard_action;
+        let (slice_delta, jump_to_start, jump_to_end, window_preset) = keyboard_action;
+
+        if let Some(window_preset) = window_preset {
+            self.apply_window_preset(context, window_preset);
+        }
 
         if jump_to_start {
             self.viewer_scroll_accumulator = 0.0;
@@ -431,6 +445,44 @@ impl DicronApp {
     }
 }
 
+fn window_preset_key(preset: WindowPreset) -> egui::Key {
+    match preset {
+        WindowPreset::Default => egui::Key::Num0,
+        WindowPreset::FullDynamic => egui::Key::Num1,
+        WindowPreset::Skull => egui::Key::Num2,
+        WindowPreset::Lung => egui::Key::Num3,
+        WindowPreset::Abdomen => egui::Key::Num4,
+        WindowPreset::Mediastinum => egui::Key::Num5,
+        WindowPreset::Bone => egui::Key::Num6,
+        WindowPreset::Spine => egui::Key::Num7,
+        WindowPreset::Postmyelo => egui::Key::Num8,
+        WindowPreset::Felsenbein => egui::Key::Num9,
+    }
+}
+
+fn consume_window_preset_key(input_state: &mut egui::InputState, preset: WindowPreset) -> bool {
+    let preset_key = window_preset_key(preset);
+    let mut consumed = false;
+
+    input_state.events.retain(|event| {
+        let matches_preset = matches!(
+            event,
+            egui::Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.matches_logically(egui::Modifiers::NONE)
+                && (*key == preset_key || *physical_key == Some(preset_key))
+        );
+        consumed |= matches_preset;
+        !matches_preset
+    });
+
+    consumed
+}
+
 impl DicronApp {
     pub(in crate::app) fn handle_autoplay(&mut self, context: &egui::Context) {
         if !self.playback.enabled {
@@ -535,8 +587,10 @@ struct PreparedFrame {
     default_window: WindowLevel,
     current_window: WindowLevel,
     window_customized: bool,
+    active_window_preset: Option<WindowPreset>,
     frame_count: u32,
     value_range: (f64, f64),
+    window_level_available: bool,
     metadata: crate::dicom::DicomMetadata,
     pixels: anyhow::Result<crate::dicom::DisplayPixels>,
 }
@@ -571,8 +625,8 @@ impl DicronApp {
             };
             let (default_center, default_width) = entry.frame.default_center_width();
             let window_customized = saved_window_level.is_some();
-            let center = saved_window_level.map_or(default_center, |window| window.center);
-            let width = saved_window_level.map_or(default_width, |window| window.width);
+            let center = saved_window_level.map_or(default_center, |saved| saved.window.center);
+            let width = saved_window_level.map_or(default_width, |saved| saved.window.width);
             let effective_window = window_customized.then_some(DicomWindow { center, width });
 
             PreparedFrame {
@@ -582,8 +636,10 @@ impl DicronApp {
                 },
                 current_window: WindowLevel { center, width },
                 window_customized,
+                active_window_preset: saved_window_level.and_then(|saved| saved.preset),
                 frame_count: entry.frame.frame_count,
                 value_range: entry.frame.value_range,
+                window_level_available: entry.frame.window_level_available(),
                 metadata: entry.metadata.clone(),
                 pixels: render_frame(&entry.frame, effective_window),
             }
@@ -602,6 +658,8 @@ impl DicronApp {
             prepared.current_window,
             prepared.value_range,
             prepared.window_customized,
+            prepared.window_level_available,
+            prepared.active_window_preset,
         );
         self.selected_dicom_frame_index = frame_index;
         self.selected_dicom_frame_count = prepared.frame_count;
@@ -655,9 +713,33 @@ impl DicronApp {
         self.decoded_cache.clear();
         self.current_frame_key = None;
         self.window_level.clear_for_new_document();
+        self.edit_windowing_dialog.open = false;
         self.metadata.clear();
         self.dicom_index = None;
         self.clear_selected_indices();
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    #[test]
+    fn shifted_one_uses_the_physical_digit_for_the_full_dynamic_preset() {
+        let mut input_state = egui::InputState::default();
+        input_state.events.push(egui::Event::Key {
+            key: egui::Key::Exclamationmark,
+            physical_key: Some(egui::Key::Num1),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+
+        assert!(consume_window_preset_key(
+            &mut input_state,
+            WindowPreset::FullDynamic
+        ));
+        assert!(input_state.events.is_empty());
     }
 }
 

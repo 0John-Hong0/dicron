@@ -9,6 +9,8 @@ pub(in crate::app) use image_texture::upload_display_pixels;
 
 pub(super) enum ViewerControlAction {
     ResetWindowLevel,
+    ApplyWindowPreset(crate::app::state::WindowPreset),
+    OpenEditWindowing,
 }
 
 pub(super) fn show_controls(

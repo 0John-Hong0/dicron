@@ -6,7 +6,9 @@ use eframe::egui;
 
 use super::ViewerControlAction;
 use crate::app::DicronApp;
-use crate::app::state::{PLAYBACK_MAX_FPS, PLAYBACK_MIN_FPS, PlaybackLoopMode};
+use crate::app::state::{
+    PLAYBACK_MAX_FPS, PLAYBACK_MIN_FPS, PlaybackLoopMode, WINDOW_PRESETS, WindowPreset,
+};
 use crate::theme;
 
 impl PlaybackLoopMode {
@@ -24,17 +26,75 @@ pub(super) fn show_control_row(
     ui: &mut egui::Ui,
 ) -> Option<ViewerControlAction> {
     let mut action = None;
+    let window_level_available = app.window_level.is_available();
+    let active_window_preset = app.window_level.active_preset;
+    let preset_button_label = format!("Preset: {}", app.window_level.active_preset_label());
 
-    ui.horizontal_wrapped(|ui| {
-        if ui.button("Reset WL").clicked() {
+    theme::toolbar_row(ui, |ui| {
+        if ui
+            .add_enabled(window_level_available, egui::Button::new("Reset WL"))
+            .clicked()
+        {
             action = Some(ViewerControlAction::ResetWindowLevel);
         }
+
+        if ui
+            .add_enabled(window_level_available, egui::Button::new("Edit WL"))
+            .clicked()
+        {
+            action = Some(ViewerControlAction::OpenEditWindowing);
+        }
+
+        show_window_preset_menu(
+            ui,
+            &preset_button_label,
+            window_level_available,
+            active_window_preset,
+            &mut action,
+        );
 
         ui.separator();
         app.show_autoplay_controls(ui);
     });
 
     action
+}
+
+fn show_window_preset_menu(
+    ui: &mut egui::Ui,
+    button_label: &str,
+    window_level_available: bool,
+    active_preset: Option<WindowPreset>,
+    action: &mut Option<ViewerControlAction>,
+) {
+    if !window_level_available {
+        ui.add_enabled(false, egui::Button::new(button_label));
+        return;
+    }
+
+    egui::containers::menu::MenuButton::from_button(egui::Button::new(button_label))
+        .config(egui::containers::menu::MenuConfig::new().style(theme::popup_menu_style))
+        .ui(ui, |ui| {
+            ui.set_min_width(190.0);
+
+            for preset in WINDOW_PRESETS {
+                let response = ui.selectable_label(
+                    active_preset == Some(preset),
+                    format!("{}  {}", preset.shortcut(), preset.label()),
+                );
+                let response = if let Some(window) = preset.fixed_window() {
+                    response
+                        .on_hover_text(format!("WL {:.0} / WW {:.0}", window.center, window.width))
+                } else {
+                    response
+                };
+
+                if response.clicked() {
+                    *action = Some(ViewerControlAction::ApplyWindowPreset(preset));
+                    ui.close();
+                }
+            }
+        });
 }
 
 impl DicronApp {
@@ -77,28 +137,83 @@ impl DicronApp {
             self.playback.last_tick = Some(Instant::now());
         }
 
-        ui.add_enabled_ui(can_autoplay, |ui| {
-            egui::ComboBox::from_id_salt("autoplay_loop_mode")
-                .selected_text(self.playback.loop_mode.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.playback.loop_mode,
-                        PlaybackLoopMode::StopAtEnd,
-                        PlaybackLoopMode::StopAtEnd.label(),
-                    );
-                    ui.selectable_value(
-                        &mut self.playback.loop_mode,
-                        PlaybackLoopMode::Loop,
-                        PlaybackLoopMode::Loop.label(),
-                    );
-                    ui.selectable_value(
-                        &mut self.playback.loop_mode,
-                        PlaybackLoopMode::PingPong,
-                        PlaybackLoopMode::PingPong.label(),
-                    );
-                });
-        });
+        show_autoplay_loop_menu(ui, can_autoplay, &mut self.playback.loop_mode);
     }
+}
+
+fn show_autoplay_loop_menu(
+    ui: &mut egui::Ui,
+    can_autoplay: bool,
+    loop_mode: &mut PlaybackLoopMode,
+) {
+    let chevron_size = egui::vec2(theme::SPACE_SM, theme::SPACE_XS);
+    let chevron_id = ui.id().with("autoplay_loop_menu_chevron");
+    let button = egui::Button::new(loop_mode.label())
+        .right_text(egui::Atom::custom(chevron_id, chevron_size))
+        .min_size(egui::vec2(
+            ui.spacing().combo_width,
+            ui.spacing().interact_size.y,
+        ));
+
+    if !can_autoplay {
+        let response = ui.add_enabled(false, button);
+        paint_menu_chevron(ui, &response, false);
+        return;
+    }
+
+    let (response, _) = egui::containers::menu::MenuButton::from_button(button)
+        .config(egui::containers::menu::MenuConfig::new().style(theme::popup_menu_style))
+        .ui(ui, |ui| {
+            ui.selectable_value(
+                loop_mode,
+                PlaybackLoopMode::StopAtEnd,
+                PlaybackLoopMode::StopAtEnd.label(),
+            );
+            ui.selectable_value(
+                loop_mode,
+                PlaybackLoopMode::Loop,
+                PlaybackLoopMode::Loop.label(),
+            );
+            ui.selectable_value(
+                loop_mode,
+                PlaybackLoopMode::PingPong,
+                PlaybackLoopMode::PingPong.label(),
+            );
+        });
+
+    paint_menu_chevron(ui, &response, true);
+}
+
+fn paint_menu_chevron(ui: &egui::Ui, response: &egui::Response, enabled: bool) {
+    if !ui.is_rect_visible(response.rect) {
+        return;
+    }
+
+    let icon_center = egui::pos2(
+        response.rect.right() - ui.spacing().button_padding.x - theme::SPACE_XS,
+        response.rect.center().y,
+    );
+    let icon_rect = egui::Rect::from_center_size(
+        icon_center,
+        egui::vec2(theme::SPACE_SM * 0.7, theme::SPACE_XS),
+    );
+    let color = if enabled {
+        ui.style().interact(response).fg_stroke.color
+    } else {
+        ui.visuals()
+            .weak_text_color()
+            .gamma_multiply(ui.visuals().disabled_alpha())
+    };
+
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            icon_rect.left_top(),
+            icon_rect.right_top(),
+            icon_rect.center_bottom(),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 pub(super) fn show_slice_scrollbar(
