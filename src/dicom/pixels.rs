@@ -184,3 +184,19 @@ where
         .parse()
         .ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
+
+    #[test]
+    fn jpeg2000_lossless_has_a_pixel_decoder() {
+        const JPEG2000_LOSSLESS_UID: &str = "1.2.840.10008.1.2.4.90";
+
+        let transfer_syntax = TransferSyntaxRegistry
+            .get(JPEG2000_LOSSLESS_UID)
+            .expect("JPEG 2000 Lossless transfer syntax should be registered");
+
+        assert!(transfer_syntax.pixel_data_reader().is_some());
+    }
+}
