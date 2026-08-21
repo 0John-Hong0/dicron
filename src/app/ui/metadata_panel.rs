@@ -158,11 +158,13 @@ impl MetadataPanelState {
     pub(in crate::app) fn replace(&mut self, metadata: DicomMetadata) {
         self.curated_items = metadata.curated_items;
         self.all_items = metadata.all_items;
+        self.overlay = Some(metadata.overlay);
     }
 
     pub(in crate::app) fn clear(&mut self) {
         self.curated_items.clear();
         self.all_items.clear();
+        self.overlay = None;
     }
 }
 

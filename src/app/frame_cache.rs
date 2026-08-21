@@ -53,6 +53,10 @@ impl DecodedCache {
         self.entries.last()
     }
 
+    pub(in crate::app) fn peek(&self, path: &Path, frame_index: u32) -> Option<&DecodedCacheEntry> {
+        self.entries.get(self.position(path, frame_index)?)
+    }
+
     pub(in crate::app) fn insert(&mut self, entry: DecodedCacheEntry) {
         if let Some(position) = self.position(&entry.path, entry.frame_index) {
             self.entries.remove(position);

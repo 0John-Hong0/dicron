@@ -96,6 +96,8 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
     egui::CentralPanel::default()
         .frame(theme::viewer_frame(ui.style()))
         .show_inside(ui, |ui| {
+            let dark_style = ui.ctx().style_of(egui::Theme::Dark);
+            ui.set_style(dark_style);
             viewer::show(app, ui);
         });
 

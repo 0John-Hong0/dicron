@@ -57,7 +57,9 @@ pub(crate) fn content_panel_frame(style: &egui::Style) -> egui::Frame {
 
 /// The image canvas uses the smaller inset so screen area remains image-first.
 pub(crate) fn viewer_frame(style: &egui::Style) -> egui::Frame {
-    egui::Frame::central_panel(style).inner_margin(egui::Margin::same(SPACE_SM_I8))
+    egui::Frame::central_panel(style)
+        .fill(egui::Color32::BLACK)
+        .inner_margin(egui::Margin::same(SPACE_SM_I8))
 }
 
 #[cfg(test)]
@@ -115,5 +117,6 @@ mod tests {
             viewer_frame(&style).inner_margin,
             egui::Margin::same(SPACE_SM_I8)
         );
+        assert_eq!(viewer_frame(&style).fill, egui::Color32::BLACK);
     }
 }
