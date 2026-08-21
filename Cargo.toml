@@ -24,6 +24,7 @@ dicom-object = "0.9.1"
 dicom-parser = "0.9.1"
 dicom-pixeldata = { version = "0.9.1", features = ["charls", "image", "openjpeg-sys"] }
 dicom-transfer-syntax-registry = "0.9.1"
+dirs-next = "1.0.2"
 eframe = "0.34.3"
 egui = "0.34.3"
 image = "0.25.6"

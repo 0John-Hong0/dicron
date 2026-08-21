@@ -16,6 +16,7 @@ This project uses semantic versioning while it remains practical for a small des
 - Expand image overlays with patient, study, series, orientation, slice, pixel, and windowing information.
 - Keep slice and frame changes transactional so failed loads preserve the currently displayed image and navigation state.
 - Exclude non-image DICOM objects from the image hierarchy and accept parseable extensionless or markerless DICOM datasets.
+- Store settings in the platform configuration directory while migrating the previous settings file.
 
 ## [0.1.1] - 2026-07-13
 
