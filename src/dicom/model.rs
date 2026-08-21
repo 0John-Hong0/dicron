@@ -10,14 +10,12 @@ pub(crate) struct DicomIndex {
 
 #[derive(Clone)]
 pub(crate) struct PatientGroup {
-    pub(crate) patient_key: String,
     pub(crate) display_name: String,
     pub(crate) studies: Vec<StudyGroup>,
 }
 
 #[derive(Clone)]
 pub(crate) struct StudyGroup {
-    pub(crate) study_key: String,
     pub(crate) display_name: String,
     pub(crate) study_date: Option<String>,
     pub(crate) study_time: Option<String>,
@@ -26,7 +24,6 @@ pub(crate) struct StudyGroup {
 
 #[derive(Clone)]
 pub(crate) struct SeriesGroup {
-    pub(crate) series_key: String,
     pub(crate) display_name: String,
     pub(crate) series_number: Option<i32>,
     pub(crate) slices: Vec<SliceItem>,
