@@ -13,6 +13,8 @@ This project uses semantic versioning while it remains practical for a small des
 - Add a persistent System, Light, and Dark theme selector styled consistently with the toolbar.
 - Fix opening DICOM images encoded with the JPEG 2000 Lossless transfer syntax.
 - Add viewer window presets, exact window-level editing, and consistent number-key shortcuts.
+- Add right-drag zoom, middle-drag pan, and double-click image fitting.
+- Add viewer flip, rotate, and reset-view controls.
 - Expand image overlays with patient, study, series, orientation, slice, pixel, and windowing information.
 - Keep slice and frame changes transactional so failed loads preserve the currently displayed image and navigation state.
 - Exclude non-image DICOM objects from the image hierarchy and accept parseable extensionless or markerless DICOM datasets.

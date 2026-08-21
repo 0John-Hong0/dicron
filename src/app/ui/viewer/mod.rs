@@ -8,7 +8,10 @@ mod window_level;
 pub(in crate::app) use image_texture::upload_display_pixels;
 
 pub(super) enum ViewerControlAction {
-    ResetWindowLevel,
+    ResetView,
+    FlipHorizontal,
+    FlipVertical,
+    RotateClockwise,
     ApplyWindowPreset(crate::app::state::WindowPreset),
     OpenEditWindowing,
 }

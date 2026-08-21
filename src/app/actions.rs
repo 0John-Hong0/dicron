@@ -260,6 +260,25 @@ const SCROLL_SLICE_STEP: f32 = 40.0;
 const PAGE_SLICE_STEP: isize = 10;
 
 impl DicronApp {
+    pub(in crate::app) fn reset_view(&mut self, context: &egui::Context) {
+        self.viewport_transform = Default::default();
+        self.viewport_zoom_anchor = None;
+        self.reset_window_level(context);
+    }
+
+    pub(in crate::app) fn flip_viewer_horizontal(&mut self) {
+        self.viewport_transform.flip_horizontal = !self.viewport_transform.flip_horizontal;
+    }
+
+    pub(in crate::app) fn flip_viewer_vertical(&mut self) {
+        self.viewport_transform.flip_vertical = !self.viewport_transform.flip_vertical;
+    }
+
+    pub(in crate::app) fn rotate_viewer_clockwise(&mut self) {
+        self.viewport_transform.rotation_quarters =
+            (self.viewport_transform.rotation_quarters + 1) % 4;
+    }
+
     pub(super) fn handle_viewer_scroll(&mut self, context: &egui::Context, ui: &egui::Ui) {
         let scroll_delta_y = ui.input(|input_state| input_state.smooth_scroll_delta.y);
 
@@ -603,6 +622,11 @@ impl DicronApp {
         frame_index: u32,
         target_selection: Option<SliceSelection>,
     ) -> bool {
+        let should_fit_viewport = target_selection.is_some_and(|target| {
+            self.selected_slice
+                .is_none_or(|current| current.series_key() != target.series_key())
+        });
+
         if self.decoded_cache.get(&dicom_path, frame_index).is_none() {
             match load_dicom_frame(&dicom_path, frame_index) {
                 Ok(loaded) => self.decoded_cache.insert(DecodedCacheEntry {
@@ -656,6 +680,10 @@ impl DicronApp {
 
         let loaded_texture = upload_display_pixels(context, texture_name(&dicom_path), pixels);
 
+        if should_fit_viewport {
+            self.viewport_transform = Default::default();
+            self.viewport_zoom_anchor = None;
+        }
         self.selected_slice = target_selection;
         self.window_level.apply_loaded_frame(
             prepared.default_window,
@@ -714,6 +742,8 @@ impl DicronApp {
         self.decoded_cache.clear();
         self.current_frame_key = None;
         self.window_level.clear_for_new_document();
+        self.viewport_transform = Default::default();
+        self.viewport_zoom_anchor = None;
         self.edit_windowing_dialog.open = false;
         self.metadata.clear();
         self.dicom_index = None;
@@ -866,6 +896,11 @@ mod loading_tests {
             ..Default::default()
         };
         assert!(app.load_slice_by_indices(&context, 0, 0, 0, 1));
+        app.viewport_transform = crate::app::state::ViewportTransform {
+            zoom: 2.0,
+            pan: egui::vec2(12.0, -8.0),
+            ..Default::default()
+        };
         let displayed_selection = app.selected_slice;
         let displayed_path = app.selected_dicom_path.clone();
         let displayed_frame_key = app.current_frame_key.clone();
@@ -888,6 +923,7 @@ mod loading_tests {
         let displayed_window_customized = app.window_level.customized;
         let displayed_window_available = app.window_level.available;
         let displayed_window_preset = app.window_level.active_preset;
+        let displayed_viewport_transform = app.viewport_transform;
 
         app.playback.loop_mode = PlaybackLoopMode::PingPong;
         app.playback.direction = 1;
@@ -919,6 +955,7 @@ mod loading_tests {
         assert_eq!(app.window_level.customized, displayed_window_customized);
         assert_eq!(app.window_level.available, displayed_window_available);
         assert_eq!(app.window_level.active_preset, displayed_window_preset);
+        assert_eq!(app.viewport_transform, displayed_viewport_transform);
         assert_eq!(app.selected_dicom_frame_index, 0);
         assert_eq!(app.selected_dicom_frame_count, 1);
         assert_eq!(app.playback.direction, 1);
@@ -928,6 +965,38 @@ mod loading_tests {
                 .is_some_and(|message| { message.starts_with("Failed to open DICOM:") })
         );
 
+        std::fs::remove_file(valid_path).unwrap();
+    }
+
+    #[test]
+    fn loading_a_different_series_fits_the_new_image() {
+        let valid_path = temporary_file_path("series-fit");
+        write_single_pixel_dicom(&valid_path);
+        let mut index = build_for_file(&valid_path).unwrap();
+        let mut second_series = index.patients[0].studies[0].series_groups[0].clone();
+        second_series.series_key = "second-series".to_owned();
+        index.patients[0].studies[0]
+            .series_groups
+            .push(second_series);
+
+        let context = egui::Context::default();
+        let mut app = DicronApp {
+            dicom_index: Some(index),
+            ..Default::default()
+        };
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
+        app.viewport_transform = crate::app::state::ViewportTransform {
+            zoom: 3.0,
+            pan: egui::vec2(20.0, 10.0),
+            ..Default::default()
+        };
+
+        assert!(app.load_slice_by_indices(&context, 0, 0, 1, 0));
+
+        assert_eq!(
+            app.viewport_transform,
+            crate::app::state::ViewportTransform::default()
+        );
         std::fs::remove_file(valid_path).unwrap();
     }
 }
