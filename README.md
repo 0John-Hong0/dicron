@@ -14,18 +14,17 @@ Dicron is a native desktop viewer for quickly opening local DICOM files and fold
 - Autoplay image stacks with adjustable FPS and loop mode.
 - Adjust window center and width interactively or apply common window presets.
 - Inspect curated DICOM tags or search across all loaded tags.
-- Native desktop builds for Linux, macOS, and Windows.
+- Native desktop builds for Linux and Windows.
 
 ## Download
 
 Download the latest version from [GitHub Releases](https://github.com/0John-Hong0/dicron/releases):
 
 - Windows: installer executable
-- macOS: DMG for Apple Silicon or Intel
 - Debian and Ubuntu: `.deb` package
 - Arch Linux: `.pkg.tar.zst` package
 
-macOS builds are currently unsigned and not notarized. On Linux, Dicron currently uses X11/XWayland.
+On Linux, Dicron currently uses X11/XWayland.
 
 ## Usage
 

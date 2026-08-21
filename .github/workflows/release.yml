@@ -3,11 +3,24 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      replace_existing:
-        description: "Delete and recreate existing tag/release if the Cargo.toml version already exists"
+      release_mode:
+        description: "Create a new release or retry the current unfinished release"
         required: true
-        default: false
-        type: boolean
+        default: new
+        type: choice
+        options:
+          - new
+          - retry
+
+      bump_type:
+        description: "Semantic version increment (ignored when retrying)"
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: write
@@ -22,7 +35,7 @@ env:
   WINDOWS_INSTALLER_PREFIX: DicronSetup
 
 jobs:
-  create-release:
+  prepare-release:
     runs-on: ubuntu-latest
 
     outputs:
@@ -35,6 +48,93 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+
+      # ------------------------------------------------------------
+      # NEW RELEASE
+      # ------------------------------------------------------------
+
+      - name: Bump package version
+        if: ${{ inputs.release_mode == 'new' }}
+        env:
+          BUMP_TYPE: ${{ inputs.bump_type }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          bump_type = os.environ["BUMP_TYPE"]
+
+          if bump_type not in {"patch", "minor", "major"}:
+              raise SystemExit(f"Unsupported bump type: {bump_type}")
+
+          cargo_toml_path = Path("Cargo.toml")
+          cargo_toml_text = cargo_toml_path.read_text()
+          cargo_config = tomllib.loads(cargo_toml_text)
+
+          current_version = cargo_config["package"]["version"]
+
+          try:
+              major, minor, patch = (
+                  int(part) for part in current_version.split(".")
+              )
+          except ValueError as error:
+              raise SystemExit(
+                  f"Unsupported version format: {current_version}"
+              ) from error
+
+          if bump_type == "major":
+              major += 1
+              minor = 0
+              patch = 0
+          elif bump_type == "minor":
+              minor += 1
+              patch = 0
+          else:
+              patch += 1
+
+          new_version = f"{major}.{minor}.{patch}"
+
+          cargo_toml_text, replacements = re.subn(
+              r'(?m)^(version\s*=\s*")[^"]+("\s*)$',
+              rf"\g<1>{new_version}\g<2>",
+              cargo_toml_text,
+              count=1,
+          )
+
+          if replacements != 1:
+              raise SystemExit(
+                  "Could not update package version in Cargo.toml"
+              )
+
+          cargo_toml_path.write_text(cargo_toml_text)
+
+          cargo_lock_path = Path("Cargo.lock")
+          cargo_lock_text = cargo_lock_path.read_text()
+
+          cargo_lock_text, replacements = re.subn(
+              r'(?ms)(\[\[package\]\]\n'
+              r'name = "dicron"\n'
+              r'version = ")[^"]+("\n)',
+              rf"\g<1>{new_version}\g<2>",
+              cargo_lock_text,
+              count=1,
+          )
+
+          if replacements != 1:
+              raise SystemExit(
+                  "Could not update dicron package version in Cargo.lock"
+              )
+
+          cargo_lock_path.write_text(cargo_lock_text)
+
+          print(f"Bumped version: {current_version} -> {new_version}")
+          PY
+
+      # ------------------------------------------------------------
+      # BOTH NEW + RETRY
+      # ------------------------------------------------------------
 
       - name: Read version from Cargo.toml
         id: version
@@ -57,44 +157,197 @@ jobs:
           echo "Version: ${VERSION}"
           echo "Tag: ${TAG_NAME}"
 
-      - name: Handle existing tag and release
+      # ------------------------------------------------------------
+      # NEW RELEASE
+      # ------------------------------------------------------------
+
+      - name: Validate new version does not already exist
+        if: ${{ inputs.release_mode == 'new' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           TAG_NAME="${{ steps.version.outputs.tag_name }}"
-          REPLACE_EXISTING="${{ github.event.inputs.replace_existing }}"
 
-          TAG_EXISTS=false
-          RELEASE_EXISTS=false
-
-          if git ls-remote --exit-code --tags origin "$TAG_NAME" >/dev/null 2>&1; then
-            TAG_EXISTS=true
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+            echo "ERROR: Tag $TAG_NAME already exists."
+            exit 1
           fi
 
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            RELEASE_EXISTS=true
+            echo "ERROR: Release $TAG_NAME already exists."
+            exit 1
           fi
 
-          if [[ "$TAG_EXISTS" == "true" || "$RELEASE_EXISTS" == "true" ]]; then
-            if [[ "$REPLACE_EXISTING" != "true" ]]; then
-              echo "ERROR: $TAG_NAME already exists."
-              echo "Run workflow again with replace_existing=true, or bump Cargo.toml version."
-              exit 1
-            fi
+      - name: Promote changelog entry
+        if: ${{ inputs.release_mode == 'new' }}
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          RELEASE_DATE="$(date -u +%Y-%m-%d)"
+          export RELEASE_DATE
 
-            echo "Replacing existing release/tag: $TAG_NAME"
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
 
-            if [[ "$RELEASE_EXISTS" == "true" ]]; then
-              gh release delete "$TAG_NAME" --yes || true
-            fi
+          changelog_path = Path("CHANGELOG.md")
+          lines = changelog_path.read_text().splitlines()
 
-            if [[ "$TAG_EXISTS" == "true" ]]; then
-              git push origin ":refs/tags/$TAG_NAME" || true
-              git tag -d "$TAG_NAME" || true
-            fi
+          version = os.environ["RELEASE_VERSION"]
+          release_date = os.environ["RELEASE_DATE"]
+
+          unreleased_index = next(
+              (
+                  index
+                  for index, line in enumerate(lines)
+                  if line.strip() == "## [Unreleased]"
+              ),
+              None,
+          )
+
+          if unreleased_index is None:
+              raise SystemExit(
+                  "CHANGELOG.md does not contain an [Unreleased] section."
+              )
+
+          next_section_index = next(
+              (
+                  index
+                  for index in range(unreleased_index + 1, len(lines))
+                  if lines[index].startswith("## ")
+              ),
+              len(lines),
+          )
+
+          unreleased_body = "\n".join(
+              lines[unreleased_index + 1:next_section_index]
+          ).strip()
+
+          if not unreleased_body:
+              raise SystemExit(
+                  "CHANGELOG.md has no entries under [Unreleased]."
+              )
+
+          version_pattern = re.compile(
+              rf"^## \[{re.escape(version)}\](?: |$)"
+          )
+
+          if any(version_pattern.match(line) for line in lines):
+              raise SystemExit(
+                  f"CHANGELOG.md already contains version [{version}]."
+              )
+
+          updated_lines = (
+              lines[:unreleased_index + 1]
+              + [
+                  "",
+                  f"## [{version}] - {release_date}",
+              ]
+              + lines[unreleased_index + 1:]
+          )
+
+          changelog_path.write_text(
+              "\n".join(updated_lines) + "\n"
+          )
+
+          print(
+              f"Promoted [Unreleased] to [{version}] - {release_date}"
+          )
+          PY
+
+      # ------------------------------------------------------------
+      # BOTH NEW + RETRY
+      #
+      # Generates notes from the actual version section in CHANGELOG.
+      # For new releases that section was created immediately above.
+      # For retries it already exists from the original release attempt.
+      # ------------------------------------------------------------
+
+      - name: Generate release notes
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          changelog_path = Path("CHANGELOG.md")
+          lines = changelog_path.read_text().splitlines()
+
+          version = os.environ["RELEASE_VERSION"]
+
+          version_pattern = re.compile(
+              rf"^## \[{re.escape(version)}\](?: |$)"
+          )
+
+          version_index = next(
+              (
+                  index
+                  for index, line in enumerate(lines)
+                  if version_pattern.match(line)
+              ),
+              None,
+          )
+
+          if version_index is None:
+              raise SystemExit(
+                  f"CHANGELOG.md does not contain release [{version}]."
+              )
+
+          section_end = next(
+              (
+                  index
+                  for index in range(version_index + 1, len(lines))
+                  if lines[index].startswith("## ")
+              ),
+              len(lines),
+          )
+
+          release_notes = "\n".join(
+              lines[version_index + 1:section_end]
+          ).strip()
+
+          if not release_notes:
+              raise SystemExit(
+                  f"CHANGELOG.md release [{version}] has no entries."
+              )
+
+          Path("release-notes.md").write_text(
+              "## What's Changed\n\n"
+              + release_notes
+              + "\n"
+          )
+
+          print(f"Generated release notes for {version}")
+          PY
+
+      # ------------------------------------------------------------
+      # NEW RELEASE
+      # ------------------------------------------------------------
+
+      - name: Commit release preparation
+        if: ${{ inputs.release_mode == 'new' }}
+        run: |
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+
+          if git diff --cached --quiet; then
+            echo "ERROR: No release preparation changes found."
+            exit 1
           fi
+
+          git commit -m "Prepare release $TAG_NAME"
+          git push origin HEAD:main
 
       - name: Create and push tag
+        if: ${{ inputs.release_mode == 'new' }}
         run: |
           TAG_NAME="${{ steps.version.outputs.tag_name }}"
 
@@ -104,25 +357,78 @@ jobs:
           git tag "$TAG_NAME"
           git push origin "$TAG_NAME"
 
-      - name: Create GitHub release
+      - name: Create draft GitHub release
+        if: ${{ inputs.release_mode == 'new' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           TAG_NAME="${{ steps.version.outputs.tag_name }}"
 
           gh release create "$TAG_NAME" \
+            --verify-tag \
+            --draft \
             --title "$TAG_NAME" \
-            --notes "Release $TAG_NAME"
+            --notes-file release-notes.md
+
+      # ------------------------------------------------------------
+      # RETRY
+      # ------------------------------------------------------------
+
+      - name: Validate retry release
+        if: ${{ inputs.release_mode == 'retry' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
+
+          echo "Retrying release: $TAG_NAME"
+
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+            echo "ERROR: Tag $TAG_NAME does not exist."
+            echo "A retry requires an existing release tag."
+            exit 1
+          fi
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            IS_DRAFT="$(
+              gh release view "$TAG_NAME" \
+                --json isDraft \
+                --jq '.isDraft'
+            )"
+
+            if [[ "$IS_DRAFT" != "true" ]]; then
+              echo "ERROR: Release $TAG_NAME is already published."
+              echo "Only draft releases can be retried."
+              exit 1
+            fi
+
+            echo "Existing draft release found."
+          else
+            echo "Draft release is missing."
+            echo "Recreating draft release from the existing tag."
+
+            gh release create "$TAG_NAME" \
+              --verify-tag \
+              --draft \
+              --title "$TAG_NAME" \
+              --notes-file release-notes.md
+          fi
+
+  # ==============================================================
+  # DEBIAN
+  # ==============================================================
 
   build-deb:
-    needs: create-release
+    needs: prepare-release
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.create-release.outputs.tag_name }}
+          ref: ${{ needs.prepare-release.outputs.tag_name }}
 
       - name: Install Rust
         run: |
@@ -166,22 +472,30 @@ jobs:
       - name: Upload deb
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release upload "${{ needs.create-release.outputs.tag_name }}" target/debian/*.deb --clobber
+          gh release upload \
+            "${{ needs.prepare-release.outputs.tag_name }}" \
+            target/debian/*.deb \
+            --clobber
+
+  # ==============================================================
+  # ARCH
+  # ==============================================================
 
   build-arch:
-    needs: create-release
+    needs: prepare-release
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.create-release.outputs.tag_name }}
+          ref: ${{ needs.prepare-release.outputs.tag_name }}
 
       - name: Build Arch package
         run: |
-          RELEASE_VERSION="${{ needs.create-release.outputs.version }}"
+          RELEASE_VERSION="${{ needs.prepare-release.outputs.version }}"
 
           docker run --rm \
             -e HOST_UID="$(id -u)" \
@@ -193,6 +507,7 @@ jobs:
               set -euo pipefail
 
               pacman -Syu --noconfirm
+
               pacman -S --noconfirm \
                 base-devel \
                 git \
@@ -221,82 +536,52 @@ jobs:
 
               chown -R "$HOST_UID:$HOST_GID" /work
 
-              su builder -c "cd /work/packaging/arch && sed -i \"s/^pkgver=.*/pkgver=$RELEASE_VERSION/\" PKGBUILD && makepkg -sf --noconfirm"
+              su builder -c "
+                cd /work/packaging/arch &&
+                sed -i \"s/^pkgver=.*/pkgver=$RELEASE_VERSION/\" PKGBUILD &&
+                makepkg -sf --noconfirm
+              "
             '
 
       - name: Upload Arch package
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          PACKAGE_FILE="$(find packaging/arch -maxdepth 1 -type f \
-            -name "${PACKAGE_NAME}-*.pkg.tar.zst" \
-            ! -name "${PACKAGE_NAME}-debug-*.pkg.tar.zst" \
-            | head -n 1)"
+          PACKAGE_FILE="$(
+            find packaging/arch \
+              -maxdepth 1 \
+              -type f \
+              -name "${PACKAGE_NAME}-*.pkg.tar.zst" \
+              ! -name "${PACKAGE_NAME}-debug-*.pkg.tar.zst" \
+              | head -n 1
+          )"
 
           if [[ -z "$PACKAGE_FILE" ]]; then
-            echo "ERROR: Arch package not found"
+            echo "ERROR: Arch package not found."
             exit 1
           fi
 
-          gh release upload "${{ needs.create-release.outputs.tag_name }}" "$PACKAGE_FILE" --clobber
+          echo "Uploading: $PACKAGE_FILE"
 
-  build-macos:
-    needs: create-release
-    runs-on: ${{ matrix.runner }}
+          gh release upload \
+            "${{ needs.prepare-release.outputs.tag_name }}" \
+            "$PACKAGE_FILE" \
+            --clobber
 
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-latest
-            package_suffix: macos-arm64
-          - runner: macos-15-intel
-            package_suffix: macos-x86_64
-
-    steps:
-      - name: Checkout release tag
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.create-release.outputs.tag_name }}
-
-      - name: Install Rust
-        run: |
-          rustup update stable
-          rustup default stable
-
-      - name: Fetch fonts
-        run: bash scripts/fetch-fonts.sh
-
-      - name: Build macOS binary
-        run: cargo build --release --locked
-
-      - name: Package macOS app
-        env:
-          MACOS_PACKAGE_SUFFIX: ${{ matrix.package_suffix }}
-        run: bash scripts/package-macos.sh
-
-      - name: Upload macOS DMG
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          DMG_FILE="$(find dist/macos -maxdepth 1 -type f -name '*.dmg' | head -n 1)"
-
-          if [[ -z "$DMG_FILE" ]]; then
-            echo "ERROR: macOS DMG not found"
-            exit 1
-          fi
-
-          gh release upload "${{ needs.create-release.outputs.tag_name }}" "$DMG_FILE" --clobber
+  # ==============================================================
+  # WINDOWS
+  # ==============================================================
 
   build-windows:
-    needs: create-release
+    needs: prepare-release
     runs-on: windows-latest
 
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.create-release.outputs.tag_name }}
+          ref: ${{ needs.prepare-release.outputs.tag_name }}
 
       - name: Install Rust
         shell: pwsh
@@ -319,15 +604,26 @@ jobs:
       - name: Build Windows installer
         shell: pwsh
         run: |
-          $appVersion = "${{ needs.create-release.outputs.version }}"
+          $appVersion = "${{ needs.prepare-release.outputs.version }}"
 
-          Remove-Item -Recurse -Force "dist/windows/app" -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force "dist/windows/app"
+          Remove-Item `
+            -Recurse `
+            -Force `
+            "dist/windows/app" `
+            -ErrorAction SilentlyContinue
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            "dist/windows/app"
 
           Write-Host "Checking target/release..."
           Get-ChildItem "target/release"
 
-          $exePath = Get-ChildItem "target/release" -Filter "*.exe" | Select-Object -First 1
+          $exePath = Get-ChildItem `
+            "target/release" `
+            -Filter "*.exe" |
+            Select-Object -First 1
 
           if (-not $exePath) {
             throw "No Windows exe found in target/release"
@@ -335,11 +631,19 @@ jobs:
 
           Write-Host "Using exe: $($exePath.FullName)"
 
-          Copy-Item $exePath.FullName "dist/windows/app/dicron.exe"
+          Copy-Item `
+            $exePath.FullName `
+            "dist/windows/app/dicron.exe"
 
           if (Test-Path "assets/licenses") {
-            New-Item -ItemType Directory -Force "dist/windows/app/licenses"
-            Copy-Item "assets/licenses/*" "dist/windows/app/licenses/"
+            New-Item `
+              -ItemType Directory `
+              -Force `
+              "dist/windows/app/licenses"
+
+            Copy-Item `
+              "assets/licenses/*" `
+              "dist/windows/app/licenses/"
           }
 
           Write-Host "Checking dist/windows/app..."
@@ -353,6 +657,41 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          $appVersion = "${{ needs.create-release.outputs.version }}"
-          gh release upload "${{ needs.create-release.outputs.tag_name }}" "dist/${env:WINDOWS_INSTALLER_PREFIX}-$appVersion.exe" --clobber
+          $appVersion = "${{ needs.prepare-release.outputs.version }}"
+
+          gh release upload `
+            "${{ needs.prepare-release.outputs.tag_name }}" `
+            "dist/${env:WINDOWS_INSTALLER_PREFIX}-$appVersion.exe" `
+            --clobber
+
+  # ==============================================================
+  # PUBLISH
+  #
+  # This job is only reached when ALL package jobs succeeded.
+  # ==============================================================
+
+  publish-release:
+    needs:
+      - prepare-release
+      - build-deb
+      - build-arch
+      - build-windows
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG_NAME="${{ needs.prepare-release.outputs.tag_name }}"
+
+          echo "All release builds succeeded."
+          echo "Publishing $TAG_NAME..."
+
+          gh release edit "$TAG_NAME" --draft=false
+
+          echo "Published $TAG_NAME."
