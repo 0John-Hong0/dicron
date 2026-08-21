@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui::ThemePreference;
 
+const SETTINGS_FILE_NAME: &str = "settings.txt";
+const LEGACY_SETTINGS_FILE_NAME: &str = "dialog-dirs.txt";
+
 pub(crate) struct AppSettings {
     pub(crate) open_dicom_directory: Option<PathBuf>,
     pub(crate) open_folder_directory: Option<PathBuf>,
@@ -29,15 +32,19 @@ impl Default for AppSettings {
 
 impl AppSettings {
     pub(crate) fn load() -> Self {
-        let Some(settings_path) = settings_path() else {
+        let Some((load_path, migrate_to_canonical_path)) = settings_load_path() else {
             return Self::default();
         };
 
-        let Ok(settings_text) = std::fs::read_to_string(settings_path) else {
+        let Ok(settings_text) = std::fs::read_to_string(load_path) else {
             return Self::default();
         };
 
-        Self::from_text(&settings_text)
+        let settings = Self::from_text(&settings_text);
+        if migrate_to_canonical_path {
+            settings.save();
+        }
+        settings
     }
 
     fn from_text(settings_text: &str) -> Self {
@@ -202,6 +209,38 @@ fn push_setting_line(settings_text: &mut String, key: &str, directory: Option<&P
 }
 
 fn settings_path() -> Option<PathBuf> {
+    dirs_next::config_dir()
+        .map(|config_directory| config_directory.join("dicron").join(SETTINGS_FILE_NAME))
+}
+
+fn settings_load_path() -> Option<(PathBuf, bool)> {
+    let canonical_path = settings_path()?;
+    select_settings_load_path(canonical_path, previous_settings_path())
+}
+
+fn select_settings_load_path(
+    canonical_path: PathBuf,
+    previous_path: Option<PathBuf>,
+) -> Option<(PathBuf, bool)> {
+    if canonical_path.is_file() {
+        return Some((canonical_path, false));
+    }
+
+    let legacy_in_canonical_directory = canonical_path.with_file_name(LEGACY_SETTINGS_FILE_NAME);
+    if legacy_in_canonical_directory.is_file() {
+        return Some((legacy_in_canonical_directory, true));
+    }
+
+    if let Some(previous_path) = previous_path
+        && previous_path.is_file()
+    {
+        return Some((previous_path, true));
+    }
+
+    None
+}
+
+fn previous_settings_path() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -211,12 +250,28 @@ fn settings_path() -> Option<PathBuf> {
                 .map(PathBuf::from)
                 .map(|home_directory| home_directory.join(".config"))
         })
-        .map(|config_directory| config_directory.join("dicron").join("dialog-dirs.txt"))
+        .map(|config_directory| {
+            config_directory
+                .join("dicron")
+                .join(LEGACY_SETTINGS_FILE_NAME)
+        })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    static NEXT_TEMP_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+    fn temporary_directory(label: &str) -> PathBuf {
+        let sequence = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "dicron-settings-{label}-{}-{sequence}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn theme_preferences_round_trip_through_settings_text() {
@@ -242,5 +297,38 @@ mod tests {
 
         assert_eq!(missing_setting.theme_preference, ThemePreference::System);
         assert_eq!(unknown_setting.theme_preference, ThemePreference::System);
+    }
+
+    #[test]
+    fn canonical_settings_file_is_preferred_over_legacy_files() {
+        let directory = temporary_directory("canonical");
+        std::fs::create_dir_all(&directory).unwrap();
+        let canonical = directory.join(SETTINGS_FILE_NAME);
+        let legacy = directory.join(LEGACY_SETTINGS_FILE_NAME);
+        std::fs::write(&canonical, "theme_preference=dark\n").unwrap();
+        std::fs::write(&legacy, "theme_preference=light\n").unwrap();
+
+        assert_eq!(
+            select_settings_load_path(canonical.clone(), Some(legacy)),
+            Some((canonical, false))
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_settings_filename_is_selected_for_migration() {
+        let directory = temporary_directory("legacy");
+        std::fs::create_dir_all(&directory).unwrap();
+        let canonical = directory.join(SETTINGS_FILE_NAME);
+        let legacy = directory.join(LEGACY_SETTINGS_FILE_NAME);
+        std::fs::write(&legacy, "theme_preference=light\n").unwrap();
+
+        assert_eq!(
+            select_settings_load_path(canonical, None),
+            Some((legacy, true))
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
