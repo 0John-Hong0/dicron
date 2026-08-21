@@ -12,18 +12,21 @@ pub(in crate::dicom) fn add_dicom_object_to_index(
     patients: &mut Vec<PatientGroup>,
     file_path: &Path,
     dicom_object: &DefaultDicomObject,
-) {
+    has_pixel_data: bool,
+) -> bool {
+    if !has_pixel_data || !has_image_pixel_metadata(dicom_object) {
+        return false;
+    }
+
     let patient_id = text(dicom_object, "PatientID");
     let patient_name = text(dicom_object, "PatientName");
 
-    let study_instance_uid =
-        text(dicom_object, "StudyInstanceUID").unwrap_or_else(|| "Unknown Study".to_owned());
+    let study_instance_uid = text(dicom_object, "StudyInstanceUID");
     let study_description = text(dicom_object, "StudyDescription");
     let study_date = text(dicom_object, "StudyDate");
     let study_time = text(dicom_object, "StudyTime");
 
-    let series_instance_uid =
-        text(dicom_object, "SeriesInstanceUID").unwrap_or_else(|| "Unknown Series".to_owned());
+    let series_instance_uid = text(dicom_object, "SeriesInstanceUID");
     let series_description = text(dicom_object, "SeriesDescription");
     let series_number = first_parsed(dicom_object, "SeriesNumber");
 
@@ -33,10 +36,19 @@ pub(in crate::dicom) fn add_dicom_object_to_index(
         .unwrap_or(1)
         .max(1);
 
-    let patient_key = patient_id
+    let patient_key = patient_id.clone().unwrap_or_else(|| {
+        synthetic_patient_key(
+            file_path,
+            study_instance_uid.as_deref(),
+            series_instance_uid.as_deref(),
+        )
+    });
+    let study_key = study_instance_uid.clone().unwrap_or_else(|| {
+        synthetic_hierarchy_key("study", file_path, series_instance_uid.as_deref())
+    });
+    let series_key = series_instance_uid
         .clone()
-        .or_else(|| patient_name.clone())
-        .unwrap_or_else(|| "Unknown Patient".to_owned());
+        .unwrap_or_else(|| synthetic_hierarchy_key("series", file_path, None));
 
     let patient_display_name =
         build_patient_display_name(patient_name.as_deref(), patient_id.as_deref());
@@ -45,7 +57,7 @@ pub(in crate::dicom) fn add_dicom_object_to_index(
         study_description.as_deref(),
         study_date.as_deref(),
         study_time.as_deref(),
-        &study_instance_uid,
+        study_instance_uid.as_deref(),
     );
 
     let series_display_name =
@@ -55,7 +67,7 @@ pub(in crate::dicom) fn add_dicom_object_to_index(
 
     let study_index = get_or_insert_study(
         &mut patients[patient_index].studies,
-        study_instance_uid,
+        study_key,
         study_display_name,
         study_date,
         study_time,
@@ -63,7 +75,7 @@ pub(in crate::dicom) fn add_dicom_object_to_index(
 
     let series_index = get_or_insert_series(
         &mut patients[patient_index].studies[study_index].series_groups,
-        series_instance_uid,
+        series_key,
         series_display_name,
         series_number,
     );
@@ -81,6 +93,38 @@ pub(in crate::dicom) fn add_dicom_object_to_index(
                 instance_number,
                 sort_position,
             });
+    }
+
+    true
+}
+
+pub(in crate::dicom) fn has_image_pixel_metadata(dicom_object: &DefaultDicomObject) -> bool {
+    first_parsed::<u32>(dicom_object, "Rows").is_some_and(|value| value > 0)
+        && first_parsed::<u32>(dicom_object, "Columns").is_some_and(|value| value > 0)
+        && first_parsed::<u32>(dicom_object, "SamplesPerPixel").is_some_and(|value| value > 0)
+        && first_parsed::<u32>(dicom_object, "BitsAllocated").is_some_and(|value| value > 0)
+        && text(dicom_object, "PhotometricInterpretation").is_some()
+}
+
+fn synthetic_patient_key(
+    file_path: &Path,
+    study_instance_uid: Option<&str>,
+    series_instance_uid: Option<&str>,
+) -> String {
+    if let Some(study_instance_uid) = study_instance_uid {
+        return synthetic_hierarchy_key("patient-study", file_path, Some(study_instance_uid));
+    }
+    if let Some(series_instance_uid) = series_instance_uid {
+        return synthetic_hierarchy_key("patient-series", file_path, Some(series_instance_uid));
+    }
+
+    synthetic_hierarchy_key("patient", file_path, None)
+}
+
+fn synthetic_hierarchy_key(kind: &str, file_path: &Path, uid: Option<&str>) -> String {
+    match uid {
+        Some(uid) => format!("\u{1f}dicron-{kind}-uid:{uid}"),
+        None => format!("\u{1f}dicron-{kind}-path:{}", file_path.display()),
     }
 }
 
@@ -212,7 +256,7 @@ fn build_study_display_name(
     study_description: Option<&str>,
     study_date: Option<&str>,
     study_time: Option<&str>,
-    study_instance_uid: &str,
+    study_instance_uid: Option<&str>,
 ) -> String {
     let description = study_description.unwrap_or("Unknown Study");
 
@@ -221,13 +265,8 @@ fn build_study_display_name(
             format!("{study_date} {study_time} - {description}")
         }
         (Some(study_date), None) => format!("{study_date} - {description}"),
-        _ => {
-            if description == "Unknown Study" {
-                study_instance_uid.to_owned()
-            } else {
-                description.to_owned()
-            }
-        }
+        _ if description == "Unknown Study" => study_instance_uid.unwrap_or(description).to_owned(),
+        _ => description.to_owned(),
     }
 }
 
@@ -356,6 +395,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use dicom_core::{DataElement, PrimitiveValue, VR};
+    use dicom_dictionary_std::{tags, uids};
+    use dicom_object::{DefaultDicomObject, FileDicomObject, FileMetaTableBuilder};
+
     use super::*;
 
     const AXIAL: [f64; 6] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
@@ -377,5 +420,146 @@ mod tests {
     fn coronal_projection_follows_y() {
         // Coronal normal is (0,-1,0); ordering is monotonic in Y.
         assert_eq!(project_onto_slice_normal([99.0, 7.0, 99.0], CORONAL), -7.0);
+    }
+
+    fn image_object(transfer_syntax: &str) -> DefaultDicomObject {
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(transfer_syntax)
+            .media_storage_sop_class_uid(uids::CT_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid("2.25.100")
+            .build()
+            .unwrap();
+        let mut object = FileDicomObject::new_empty_with_meta(meta);
+        object.put_element(DataElement::new(
+            tags::ROWS,
+            VR::US,
+            PrimitiveValue::from(16_u16),
+        ));
+        object.put_element(DataElement::new(
+            tags::COLUMNS,
+            VR::US,
+            PrimitiveValue::from(16_u16),
+        ));
+        object.put_element(DataElement::new(
+            tags::SAMPLES_PER_PIXEL,
+            VR::US,
+            PrimitiveValue::from(1_u16),
+        ));
+        object.put_element(DataElement::new(
+            tags::BITS_ALLOCATED,
+            VR::US,
+            PrimitiveValue::from(16_u16),
+        ));
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            PrimitiveValue::from("MONOCHROME2"),
+        ));
+        object
+    }
+
+    fn put_text(object: &mut DefaultDicomObject, tag: dicom_core::Tag, vr: VR, value: &str) {
+        object.put_element(DataElement::new(tag, vr, PrimitiveValue::from(value)));
+    }
+
+    #[test]
+    fn non_image_objects_do_not_become_slices() {
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .media_storage_sop_class_uid(uids::RT_STRUCTURE_SET_STORAGE)
+            .media_storage_sop_instance_uid("2.25.200")
+            .build()
+            .unwrap();
+        let object = FileDicomObject::new_empty_with_meta(meta);
+        let mut patients = Vec::new();
+
+        assert!(!has_image_pixel_metadata(&object));
+        assert!(!add_dicom_object_to_index(
+            &mut patients,
+            Path::new("structure-set"),
+            &object,
+            false,
+        ));
+        assert!(patients.is_empty());
+    }
+
+    #[test]
+    fn compressed_multiframe_image_headers_become_slices_without_pixel_decoding() {
+        let mut object = image_object(uids::JPEG_BASELINE8_BIT);
+        put_text(&mut object, tags::NUMBER_OF_FRAMES, VR::IS, "3");
+        let mut patients = Vec::new();
+
+        assert!(add_dicom_object_to_index(
+            &mut patients,
+            Path::new("compressed-image"),
+            &object,
+            true,
+        ));
+        assert_eq!(patients[0].studies[0].series_groups[0].slices.len(), 3);
+    }
+
+    #[test]
+    fn objects_missing_all_hierarchy_ids_do_not_merge() {
+        let first = image_object(uids::EXPLICIT_VR_LITTLE_ENDIAN);
+        let second = image_object(uids::EXPLICIT_VR_LITTLE_ENDIAN);
+        let mut patients = Vec::new();
+
+        assert!(add_dicom_object_to_index(
+            &mut patients,
+            Path::new("first/image"),
+            &first,
+            true,
+        ));
+        assert!(add_dicom_object_to_index(
+            &mut patients,
+            Path::new("second/image"),
+            &second,
+            true,
+        ));
+
+        assert_eq!(patients.len(), 2);
+        assert!(
+            patients
+                .iter()
+                .all(|patient| patient.display_name == "Unknown Patient")
+        );
+        assert!(
+            patients
+                .iter()
+                .all(|patient| patient.studies[0].display_name == "Unknown Study")
+        );
+        assert!(patients.iter().all(|patient| {
+            patient.studies[0].series_groups[0].display_name == "Unknown Series"
+        }));
+    }
+
+    #[test]
+    fn complete_hierarchy_ids_keep_normal_grouping_behavior() {
+        let mut first = image_object(uids::EXPLICIT_VR_LITTLE_ENDIAN);
+        let mut second = image_object(uids::EXPLICIT_VR_LITTLE_ENDIAN);
+        for object in [&mut first, &mut second] {
+            put_text(object, tags::PATIENT_ID, VR::LO, "patient-1");
+            put_text(object, tags::STUDY_INSTANCE_UID, VR::UI, "2.25.301");
+            put_text(object, tags::SERIES_INSTANCE_UID, VR::UI, "2.25.302");
+        }
+        let mut patients = Vec::new();
+
+        assert!(add_dicom_object_to_index(
+            &mut patients,
+            Path::new("first-image"),
+            &first,
+            true,
+        ));
+        assert!(add_dicom_object_to_index(
+            &mut patients,
+            Path::new("second-image"),
+            &second,
+            true,
+        ));
+
+        assert_eq!(patients.len(), 1);
+        assert_eq!(patients[0].studies.len(), 1);
+        assert_eq!(patients[0].studies[0].series_groups.len(), 1);
+        assert_eq!(patients[0].studies[0].series_groups[0].slices.len(), 2);
     }
 }

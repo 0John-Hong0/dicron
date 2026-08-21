@@ -216,7 +216,8 @@ impl DicronApp {
                             self.load_first_available_slice(context);
                         }
                         Ok(_) => {
-                            self.error_message = Some("No readable DICOM files found.".to_owned());
+                            self.error_message =
+                                Some("No displayable DICOM images found.".to_owned());
                             self.dicom_index = None;
                         }
                         Err(error_message) => {

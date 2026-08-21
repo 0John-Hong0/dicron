@@ -3,7 +3,9 @@
 use eframe::egui;
 
 use crate::app::DicronApp;
-use crate::app::state::{SavedWindowLevel, SeriesKey, WindowLevel, WindowLevelState, WindowPreset};
+use crate::app::state::{
+    SavedWindowLevel, SeriesKey, SliceSelection, WindowLevel, WindowLevelState, WindowPreset,
+};
 use crate::dicom::DicomWindow;
 use crate::theme;
 
@@ -127,10 +129,13 @@ impl DicronApp {
         self.window_level.by_series.remove(&series_key);
     }
 
-    pub(in crate::app) fn current_series_window_level(&self) -> Option<SavedWindowLevel> {
+    pub(in crate::app) fn window_level_for_selection(
+        &self,
+        selection: Option<SliceSelection>,
+    ) -> Option<SavedWindowLevel> {
         self.window_level
             .by_series
-            .get(&self.current_series_key()?)
+            .get(&selection?.series_key())
             .copied()
     }
 
