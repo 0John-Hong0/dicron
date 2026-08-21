@@ -234,6 +234,27 @@ impl Default for EditWindowingDialogState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ViewportTransform {
+    pub(super) zoom: f32,
+    pub(super) pan: egui::Vec2,
+    pub(super) flip_horizontal: bool,
+    pub(super) flip_vertical: bool,
+    pub(super) rotation_quarters: u8,
+}
+
+impl Default for ViewportTransform {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            flip_horizontal: false,
+            flip_vertical: false,
+            rotation_quarters: 0,
+        }
+    }
+}
+
 pub(super) struct PanelLayout {
     pub(super) left: SidePanelLayout,
     pub(super) right: SidePanelLayout,
@@ -299,6 +320,8 @@ pub(crate) struct DicronApp {
     pub(super) selected_slice: Option<SliceSelection>,
     pub(super) scan: ScanController,
     pub(super) viewer_scroll_accumulator: f32,
+    pub(super) viewport_transform: ViewportTransform,
+    pub(super) viewport_zoom_anchor: Option<egui::Pos2>,
     pub(super) playback: PlaybackState,
     pub(super) panel_layout: PanelLayout,
     // Bumped when the preference changes so CollapsingHeaders get fresh ids.
@@ -327,6 +350,8 @@ impl Default for DicronApp {
             selected_slice: None,
             scan: ScanController::default(),
             viewer_scroll_accumulator: 0.0,
+            viewport_transform: ViewportTransform::default(),
+            viewport_zoom_anchor: None,
             playback: PlaybackState::default(),
             panel_layout: PanelLayout::default(),
             tree_view_generation: 0,

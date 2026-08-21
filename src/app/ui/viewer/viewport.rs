@@ -6,9 +6,13 @@ use eframe::egui;
 
 use super::{controls, image_texture::fit_image_to_available_space};
 use crate::app::DicronApp;
+use crate::app::state::ViewportTransform;
 use crate::dicom::{DicomOverlayMetadata, PixelProbeValue};
 use crate::theme;
 
+const MIN_VIEWER_ZOOM: f32 = 0.1;
+const MAX_VIEWER_ZOOM: f32 = 20.0;
+const VIEWER_ZOOM_DRAG_SENSITIVITY: f32 = 0.01;
 const OVERLAY_MARGIN: f32 = theme::SPACE_MD;
 const OVERLAY_FONT_SIZE: f32 = 13.0;
 const OVERLAY_BLOCK_GAP: f32 = theme::SPACE_LG;
@@ -68,6 +72,21 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui) {
         app.handle_window_level_drag(ui.ctx(), &viewer_response);
     }
 
+    if app.loaded_texture.is_some() {
+        handle_viewport_transform(
+            &mut app.viewport_transform,
+            &mut app.viewport_zoom_anchor,
+            viewer_rect,
+            &viewer_response,
+        );
+
+        if viewer_response.dragged_by(egui::PointerButton::Middle) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if viewer_response.dragged_by(egui::PointerButton::Secondary) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+    }
+
     if has_series_scrollbar
         && let (Some(selected_slice_index), Some(slice_count)) =
             (app.current_slice_index(), app.current_slice_count())
@@ -82,11 +101,13 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui) {
         let fitted_image_size = fit_image_to_available_space(texture_size, viewer_rect.size());
 
         if fitted_image_size.x > 0.0 && fitted_image_size.y > 0.0 {
-            let image_rect = egui::Rect::from_center_size(viewer_rect.center(), fitted_image_size);
-
-            ui.put(
+            let image_rect =
+                transformed_image_rect(viewer_rect, fitted_image_size, app.viewport_transform);
+            paint_transformed_image(
+                &ui.painter().with_clip_rect(viewer_rect),
+                loaded_texture.id(),
                 image_rect,
-                egui::Image::from_texture(loaded_texture).fit_to_exact_size(fitted_image_size),
+                app.viewport_transform,
             );
 
             show_viewer_overlays(app, ui, viewer_rect, image_rect, loaded_texture.size());
@@ -99,6 +120,123 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui) {
             egui::FontId::proportional(16.0),
             ui.visuals().text_color(),
         );
+    }
+}
+
+fn handle_viewport_transform(
+    transform: &mut ViewportTransform,
+    zoom_anchor: &mut Option<egui::Pos2>,
+    viewer_rect: egui::Rect,
+    response: &egui::Response,
+) {
+    if response.double_clicked_by(egui::PointerButton::Primary) {
+        *transform = ViewportTransform::default();
+        *zoom_anchor = None;
+        return;
+    }
+
+    if response.drag_started_by(egui::PointerButton::Secondary) {
+        *zoom_anchor = response.interact_pointer_pos();
+    }
+
+    if response.dragged_by(egui::PointerButton::Secondary) {
+        let anchor = zoom_anchor
+            .or_else(|| response.interact_pointer_pos())
+            .unwrap_or_else(|| viewer_rect.center());
+        zoom_viewport_around_pointer(
+            transform,
+            response.drag_delta().y,
+            viewer_rect.center(),
+            anchor,
+        );
+    } else if response.dragged_by(egui::PointerButton::Middle) {
+        *zoom_anchor = None;
+        transform.pan += response.drag_delta();
+    }
+
+    if response.drag_stopped_by(egui::PointerButton::Secondary) {
+        *zoom_anchor = None;
+    }
+}
+
+fn zoom_viewport_around_pointer(
+    transform: &mut ViewportTransform,
+    vertical_drag: f32,
+    viewer_center: egui::Pos2,
+    anchor: egui::Pos2,
+) {
+    if vertical_drag == 0.0 {
+        return;
+    }
+
+    let previous_zoom = transform.zoom;
+    let zoom_factor = (vertical_drag * VIEWER_ZOOM_DRAG_SENSITIVITY).exp();
+    let next_zoom = (previous_zoom * zoom_factor).clamp(MIN_VIEWER_ZOOM, MAX_VIEWER_ZOOM);
+    let applied_factor = next_zoom / previous_zoom;
+    let anchor_from_center = anchor - viewer_center;
+
+    transform.pan = anchor_from_center + (transform.pan - anchor_from_center) * applied_factor;
+    transform.zoom = next_zoom;
+}
+
+fn transformed_image_rect(
+    viewer_rect: egui::Rect,
+    fitted_image_size: egui::Vec2,
+    transform: ViewportTransform,
+) -> egui::Rect {
+    let displayed_size = if transform.rotation_quarters.is_multiple_of(2) {
+        fitted_image_size
+    } else {
+        egui::vec2(fitted_image_size.y, fitted_image_size.x)
+    };
+
+    egui::Rect::from_center_size(
+        viewer_rect.center() + transform.pan,
+        displayed_size * transform.zoom,
+    )
+}
+
+fn paint_transformed_image(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    image_rect: egui::Rect,
+    transform: ViewportTransform,
+) {
+    let mut mesh = egui::Mesh::with_texture(texture_id);
+    let positions = [
+        image_rect.left_top(),
+        image_rect.right_top(),
+        image_rect.left_bottom(),
+        image_rect.right_bottom(),
+    ];
+    let uvs = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+        .map(|(u, v)| transformed_image_uv(u, v, transform));
+
+    for (position, (u, v)) in positions.into_iter().zip(uvs) {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: position,
+            uv: egui::pos2(u, v),
+            color: egui::Color32::WHITE,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 2, 1, 3]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+fn transformed_image_uv(mut u: f32, mut v: f32, transform: ViewportTransform) -> (f32, f32) {
+    if transform.flip_horizontal {
+        u = 1.0 - u;
+    }
+    if transform.flip_vertical {
+        v = 1.0 - v;
+    }
+
+    match transform.rotation_quarters % 4 {
+        0 => (u, v),
+        1 => (v, 1.0 - u),
+        2 => (1.0 - u, 1.0 - v),
+        3 => (1.0 - v, u),
+        _ => unreachable!(),
     }
 }
 
@@ -337,7 +475,12 @@ fn pixel_probe_overlay_text(
     image_size: [usize; 2],
     modality: Option<&str>,
 ) -> Option<String> {
-    let (x, y) = image_pixel_coordinates(pointer_position, image_rect, image_size)?;
+    let (x, y) = image_pixel_coordinates(
+        pointer_position,
+        image_rect,
+        image_size,
+        app.viewport_transform,
+    )?;
     let (path, frame_index) = app.current_frame_key.as_ref()?;
     let entry = app.decoded_cache.peek(path, *frame_index)?;
     let value = entry.frame.pixel_probe(x, y)?;
@@ -361,14 +504,16 @@ fn image_pixel_coordinates(
     pointer_position: egui::Pos2,
     image_rect: egui::Rect,
     image_size: [usize; 2],
+    transform: ViewportTransform,
 ) -> Option<(usize, usize)> {
     if !image_rect.contains(pointer_position) || image_size[0] == 0 || image_size[1] == 0 {
         return None;
     }
 
     let relative = (pointer_position - image_rect.min) / image_rect.size();
-    let x = (relative.x * image_size[0] as f32).floor() as usize;
-    let y = (relative.y * image_size[1] as f32).floor() as usize;
+    let (source_u, source_v) = transformed_image_uv(relative.x, relative.y, transform);
+    let x = (source_u * image_size[0] as f32).floor() as usize;
+    let y = (source_v * image_size[1] as f32).floor() as usize;
 
     Some((x.min(image_size[0] - 1), y.min(image_size[1] - 1)))
 }
@@ -610,8 +755,16 @@ mod tests {
     use super::{
         dominant_patient_direction, format_dicom_date, format_dicom_time, format_probe_number,
         image_pixel_coordinates, overlay_galley_paint_passes, slice_overlay_text,
-        window_overlay_text,
+        transformed_image_rect, window_overlay_text, zoom_viewport_around_pointer,
     };
+    use crate::app::state::ViewportTransform;
+
+    fn assert_approximately_equal(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.001,
+            "expected {expected}, got {actual}"
+        );
+    }
 
     #[test]
     fn slice_overlay_uses_human_readable_numbering() {
@@ -642,13 +795,60 @@ mod tests {
         let image_rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(210.0, 120.0));
 
         assert_eq!(
-            image_pixel_coordinates(egui::pos2(110.0, 70.0), image_rect, [400, 200]),
+            image_pixel_coordinates(
+                egui::pos2(110.0, 70.0),
+                image_rect,
+                [400, 200],
+                ViewportTransform::default(),
+            ),
             Some((200, 100))
         );
         assert_eq!(
-            image_pixel_coordinates(egui::pos2(9.0, 70.0), image_rect, [400, 200]),
+            image_pixel_coordinates(
+                egui::pos2(9.0, 70.0),
+                image_rect,
+                [400, 200],
+                ViewportTransform::default(),
+            ),
             None
         );
+    }
+
+    #[test]
+    fn viewport_transform_scales_from_fit_and_applies_pan() {
+        let viewer_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 100.0));
+        let transform = ViewportTransform {
+            zoom: 2.0,
+            pan: egui::vec2(20.0, -5.0),
+            ..Default::default()
+        };
+
+        let image_rect = transformed_image_rect(viewer_rect, egui::vec2(100.0, 50.0), transform);
+
+        assert_eq!(image_rect.center(), egui::pos2(120.0, 45.0));
+        assert_eq!(image_rect.size(), egui::vec2(200.0, 100.0));
+    }
+
+    #[test]
+    fn right_drag_down_zoom_keeps_the_drag_start_point_anchored() {
+        let viewer_rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 100.0));
+        let fitted_size = egui::vec2(100.0, 50.0);
+        let anchor = egui::pos2(125.0, 50.0);
+        let mut transform = ViewportTransform::default();
+        let before = transformed_image_rect(viewer_rect, fitted_size, transform);
+        let relative_anchor = (anchor - before.min) / before.size();
+        zoom_viewport_around_pointer(
+            &mut transform,
+            std::f32::consts::LN_2 / super::VIEWER_ZOOM_DRAG_SENSITIVITY,
+            viewer_rect.center(),
+            anchor,
+        );
+        let after = transformed_image_rect(viewer_rect, fitted_size, transform);
+        let transformed_anchor = after.min + relative_anchor * after.size();
+
+        assert_approximately_equal(transform.zoom, 2.0);
+        assert_approximately_equal(transformed_anchor.x, anchor.x);
+        assert_approximately_equal(transformed_anchor.y, anchor.y);
     }
 
     #[test]

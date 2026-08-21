@@ -27,16 +27,19 @@ pub(super) fn show_control_row(
 ) -> Option<ViewerControlAction> {
     let mut action = None;
     let window_level_available = app.window_level.is_available();
+    let image_loaded = app.loaded_texture.is_some();
     let active_window_preset = app.window_level.active_preset;
     let preset_button_label = format!("Preset: {}", app.window_level.active_preset_label());
 
     theme::toolbar_row(ui, |ui| {
         if ui
-            .add_enabled(window_level_available, egui::Button::new("Reset WL"))
+            .add_enabled(image_loaded, egui::Button::new("Reset Display"))
             .clicked()
         {
-            action = Some(ViewerControlAction::ResetWindowLevel);
+            action = Some(ViewerControlAction::ResetView);
         }
+
+        ui.separator();
 
         if ui
             .add_enabled(window_level_available, egui::Button::new("Edit WL"))
@@ -52,6 +55,29 @@ pub(super) fn show_control_row(
             active_window_preset,
             &mut action,
         );
+
+        ui.separator();
+
+        if ui
+            .add_enabled(image_loaded, egui::Button::new("Flip H"))
+            .clicked()
+        {
+            action = Some(ViewerControlAction::FlipHorizontal);
+        }
+
+        if ui
+            .add_enabled(image_loaded, egui::Button::new("Flip V"))
+            .clicked()
+        {
+            action = Some(ViewerControlAction::FlipVertical);
+        }
+
+        if ui
+            .add_enabled(image_loaded, egui::Button::new("Rotate 90°"))
+            .clicked()
+        {
+            action = Some(ViewerControlAction::RotateClockwise);
+        }
 
         ui.separator();
         app.show_autoplay_controls(ui);

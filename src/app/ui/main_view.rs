@@ -123,7 +123,10 @@ impl DicronApp {
         action: viewer::ViewerControlAction,
     ) {
         match action {
-            viewer::ViewerControlAction::ResetWindowLevel => self.reset_window_level(context),
+            viewer::ViewerControlAction::ResetView => self.reset_view(context),
+            viewer::ViewerControlAction::FlipHorizontal => self.flip_viewer_horizontal(),
+            viewer::ViewerControlAction::FlipVertical => self.flip_viewer_vertical(),
+            viewer::ViewerControlAction::RotateClockwise => self.rotate_viewer_clockwise(),
             viewer::ViewerControlAction::ApplyWindowPreset(preset) => {
                 self.apply_window_preset(context, preset);
             }

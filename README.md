@@ -44,6 +44,11 @@ Viewer controls:
 - **Home / End**: jump to the first or last slice.
 - **Drag horizontally over the image**: adjust window width.
 - **Drag vertically over the image**: adjust window center.
+- **Right-drag vertically over the image**: drag down to zoom in, up to zoom out around the drag-start pointer.
+- **Middle-drag over the image**: pan the image.
+- **Double-click the image**: fit and center the image in the viewer.
+- **Flip H**, **Flip V**, and **Rotate 90°**: change the image orientation while preserving its metadata overlays.
+- **Reset Display**: restore zoom, pan, orientation, and window level.
 - **0–9**: apply the corresponding entry in the **Preset** menu. `0` restores
   the DICOM window and `1` fits the current image's full value range.
 

@@ -38,7 +38,7 @@ pub(crate) fn toolbar_row<R>(
     ui: &mut egui::Ui,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
-    ui.spacing_mut().item_spacing = egui::vec2(SPACE_SM, SPACE_XS);
+    ui.spacing_mut().item_spacing = egui::vec2(SPACE_XS, SPACE_XS);
     ui.spacing_mut().button_padding = button_padding();
     ui.horizontal_wrapped(add_contents)
 }
@@ -100,7 +100,7 @@ mod tests {
 
         let _ = context.run_ui(Default::default(), |ui| {
             toolbar_row(ui, |ui| {
-                assert_eq!(ui.spacing().item_spacing, egui::vec2(SPACE_SM, SPACE_XS));
+                assert_eq!(ui.spacing().item_spacing, egui::vec2(SPACE_XS, SPACE_XS));
                 assert_eq!(ui.spacing().button_padding, button_padding());
             });
         });
