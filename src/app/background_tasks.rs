@@ -106,6 +106,7 @@ impl DicronApp {
         let folder_path_for_thread = selected_folder_path.clone();
         let scan_cancel = Arc::new(AtomicBool::new(false));
         let scan_cancel_for_thread = Arc::clone(&scan_cancel);
+        let scan_context = context.clone();
 
         thread::spawn(move || {
             let scan_result = build_from_folder_with_progress(
@@ -117,6 +118,7 @@ impl DicronApp {
             )
             .map_err(|error| format!("{error:#}"));
             let _ = scan_sender.send(ScanMessage::Finished(scan_result));
+            scan_context.request_repaint();
         });
 
         self.clear_loaded_dicom_state();
@@ -138,11 +140,14 @@ impl DicronApp {
         context: &egui::Context,
         dropped_paths: Vec<PathBuf>,
     ) {
-        if let Some(first_file_path) = dropped_paths.iter().find(|path| path.is_file()) {
-            self.settings.remember_open_dicom_path(first_file_path);
-        }
-        if let Some(first_folder_path) = dropped_paths.iter().find(|path| path.is_dir()) {
-            self.settings.remember_open_folder_path(first_folder_path);
+        if let Some(first_path) = dropped_paths.first()
+            && let Ok(metadata) = first_path.metadata()
+        {
+            if metadata.is_file() {
+                self.settings.remember_open_dicom_path(first_path);
+            } else if metadata.is_dir() {
+                self.settings.remember_open_folder_path(first_path);
+            }
         }
 
         self.cancel_active_scan();
@@ -150,6 +155,7 @@ impl DicronApp {
         let (scan_sender, scan_receiver) = mpsc::channel();
         let scan_cancel = Arc::new(AtomicBool::new(false));
         let scan_cancel_for_thread = Arc::clone(&scan_cancel);
+        let scan_context = context.clone();
 
         thread::spawn(move || {
             let scan_result = build_for_inputs_with_progress(
@@ -161,6 +167,7 @@ impl DicronApp {
             )
             .map_err(|error| format!("{error:#}"));
             let _ = scan_sender.send(ScanMessage::Finished(scan_result));
+            scan_context.request_repaint();
         });
 
         self.clear_loaded_dicom_state();

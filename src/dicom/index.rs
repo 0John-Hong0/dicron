@@ -1,109 +1,319 @@
 //! Construction, sorting, and querying of the in-memory DICOM index.
 
 use std::cmp::Ordering;
+use std::collections::{HashMap, hash_map::Entry};
 use std::path::Path;
 use std::str::FromStr;
 
-use dicom_object::DefaultDicomObject;
+use dicom_core::{PrimitiveValue, Tag};
+use dicom_dictionary_std::tags;
 
 use super::model::{PatientGroup, SeriesGroup, SliceItem, StudyGroup};
 
-pub(in crate::dicom) fn add_dicom_object_to_index(
-    patients: &mut Vec<PatientGroup>,
-    file_path: &Path,
-    dicom_object: &DefaultDicomObject,
-    has_pixel_data: bool,
-) -> bool {
-    if !has_pixel_data || !has_image_pixel_metadata(dicom_object) {
-        return false;
-    }
-
-    let patient_id = text(dicom_object, "PatientID");
-    let patient_name = text(dicom_object, "PatientName");
-
-    let study_instance_uid = text(dicom_object, "StudyInstanceUID");
-    let study_description = text(dicom_object, "StudyDescription");
-    let study_date = text(dicom_object, "StudyDate");
-    let study_time = text(dicom_object, "StudyTime");
-
-    let series_instance_uid = text(dicom_object, "SeriesInstanceUID");
-    let series_description = text(dicom_object, "SeriesDescription");
-    let series_number = first_parsed(dicom_object, "SeriesNumber");
-
-    let instance_number = first_parsed(dicom_object, "InstanceNumber");
-    let sort_position = compute_slice_sort_position(dicom_object);
-    let number_of_frames = first_parsed::<u32>(dicom_object, "NumberOfFrames")
-        .unwrap_or(1)
-        .max(1);
-
-    let patient_key = patient_id.clone().unwrap_or_else(|| {
-        synthetic_patient_key(
-            file_path,
-            study_instance_uid.as_deref(),
-            series_instance_uid.as_deref(),
-        )
-    });
-    let study_key = study_instance_uid.clone().unwrap_or_else(|| {
-        synthetic_hierarchy_key("study", file_path, series_instance_uid.as_deref())
-    });
-    let series_key = series_instance_uid
-        .clone()
-        .unwrap_or_else(|| synthetic_hierarchy_key("series", file_path, None));
-
-    let patient_display_name =
-        build_patient_display_name(patient_name.as_deref(), patient_id.as_deref());
-
-    let study_display_name = build_study_display_name(
-        study_description.as_deref(),
-        study_date.as_deref(),
-        study_time.as_deref(),
-        study_instance_uid.as_deref(),
-    );
-
-    let series_display_name =
-        build_series_display_name(series_number, series_description.as_deref());
-
-    let patient_index = get_or_insert_patient(patients, patient_key, patient_display_name);
-
-    let study_index = get_or_insert_study(
-        &mut patients[patient_index].studies,
-        study_key,
-        study_display_name,
-        study_date,
-        study_time,
-    );
-
-    let series_index = get_or_insert_series(
-        &mut patients[patient_index].studies[study_index].series_groups,
-        series_key,
-        series_display_name,
-        series_number,
-    );
-
-    for frame_index in 0..number_of_frames {
-        let slice_display_name =
-            build_slice_display_name(file_path, instance_number, frame_index, number_of_frames);
-
-        patients[patient_index].studies[study_index].series_groups[series_index]
-            .slices
-            .push(SliceItem {
-                path: file_path.to_path_buf(),
-                display_name: slice_display_name,
-                frame_index,
-                instance_number,
-                sort_position,
-            });
-    }
-
-    true
+#[derive(Default)]
+pub(in crate::dicom) struct DicomIndexBuilder {
+    patients: Vec<PatientGroup>,
+    patient_indices: HashMap<String, usize>,
+    study_indices: HashMap<(usize, String), usize>,
+    series_indices: HashMap<(usize, usize, String), usize>,
 }
 
-pub(in crate::dicom) fn has_image_pixel_metadata(dicom_object: &DefaultDicomObject) -> bool {
-    first_parsed::<u32>(dicom_object, "Rows").is_some_and(|value| value > 0)
-        && first_parsed::<u32>(dicom_object, "Columns").is_some_and(|value| value > 0)
-        && first_parsed::<u32>(dicom_object, "SamplesPerPixel").is_some_and(|value| value > 0)
-        && first_parsed::<u32>(dicom_object, "BitsAllocated").is_some_and(|value| value > 0)
-        && text(dicom_object, "PhotometricInterpretation").is_some()
+#[derive(Default)]
+pub(in crate::dicom) struct DicomIndexMetadata {
+    patient_id: Option<String>,
+    patient_name: Option<String>,
+    study_instance_uid: Option<String>,
+    study_description: Option<String>,
+    study_date: Option<String>,
+    study_time: Option<String>,
+    series_instance_uid: Option<String>,
+    series_description: Option<String>,
+    series_number: Option<i32>,
+    instance_number: Option<i32>,
+    image_position_patient: Option<[f64; 3]>,
+    image_orientation_patient: Option<[f64; 6]>,
+    number_of_frames: Option<u32>,
+    rows: Option<u32>,
+    columns: Option<u32>,
+    samples_per_pixel: Option<u32>,
+    bits_allocated: Option<u32>,
+    photometric_interpretation: Option<String>,
+}
+
+impl DicomIndexMetadata {
+    pub(in crate::dicom) fn includes_tag(tag: Tag) -> bool {
+        matches!(
+            tag,
+            tags::PATIENT_ID
+                | tags::PATIENT_NAME
+                | tags::STUDY_INSTANCE_UID
+                | tags::STUDY_DESCRIPTION
+                | tags::STUDY_DATE
+                | tags::STUDY_TIME
+                | tags::SERIES_INSTANCE_UID
+                | tags::SERIES_DESCRIPTION
+                | tags::SERIES_NUMBER
+                | tags::INSTANCE_NUMBER
+                | tags::IMAGE_POSITION_PATIENT
+                | tags::IMAGE_ORIENTATION_PATIENT
+                | tags::NUMBER_OF_FRAMES
+                | tags::ROWS
+                | tags::COLUMNS
+                | tags::SAMPLES_PER_PIXEL
+                | tags::BITS_ALLOCATED
+                | tags::PHOTOMETRIC_INTERPRETATION
+        )
+    }
+
+    pub(in crate::dicom) fn put_primitive(&mut self, tag: Tag, value: &PrimitiveValue) {
+        match tag {
+            tags::PATIENT_ID => self.patient_id = text_value(value),
+            tags::PATIENT_NAME => self.patient_name = text_value(value),
+            tags::STUDY_INSTANCE_UID => self.study_instance_uid = text_value(value),
+            tags::STUDY_DESCRIPTION => self.study_description = text_value(value),
+            tags::STUDY_DATE => self.study_date = text_value(value),
+            tags::STUDY_TIME => self.study_time = text_value(value),
+            tags::SERIES_INSTANCE_UID => self.series_instance_uid = text_value(value),
+            tags::SERIES_DESCRIPTION => self.series_description = text_value(value),
+            tags::SERIES_NUMBER => self.series_number = first_parsed_value(value),
+            tags::INSTANCE_NUMBER => self.instance_number = first_parsed_value(value),
+            tags::IMAGE_POSITION_PATIENT => self.image_position_patient = parsed_array_value(value),
+            tags::IMAGE_ORIENTATION_PATIENT => {
+                self.image_orientation_patient = parsed_array_value(value)
+            }
+            tags::NUMBER_OF_FRAMES => self.number_of_frames = first_parsed_value(value),
+            tags::ROWS => self.rows = first_parsed_value(value),
+            tags::COLUMNS => self.columns = first_parsed_value(value),
+            tags::SAMPLES_PER_PIXEL => self.samples_per_pixel = first_parsed_value(value),
+            tags::BITS_ALLOCATED => self.bits_allocated = first_parsed_value(value),
+            tags::PHOTOMETRIC_INTERPRETATION => self.photometric_interpretation = text_value(value),
+            _ => {}
+        }
+    }
+
+    fn has_image_pixel_metadata(&self) -> bool {
+        self.rows.is_some_and(|value| value > 0)
+            && self.columns.is_some_and(|value| value > 0)
+            && self.samples_per_pixel.is_some_and(|value| value > 0)
+            && self.bits_allocated.is_some_and(|value| value > 0)
+            && self.photometric_interpretation.is_some()
+    }
+}
+
+pub(in crate::dicom) struct DicomIndexEntry {
+    patient_key: String,
+    patient_display_name: String,
+    study_key: String,
+    study_display_name: String,
+    study_date: Option<String>,
+    study_time: Option<String>,
+    series_key: String,
+    series_display_name: String,
+    series_number: Option<i32>,
+    file_path: std::path::PathBuf,
+    instance_number: Option<i32>,
+    sort_position: Option<f64>,
+    number_of_frames: u32,
+}
+
+impl DicomIndexEntry {
+    pub(in crate::dicom) fn from_metadata(
+        file_path: &Path,
+        metadata: DicomIndexMetadata,
+        has_pixel_data: bool,
+    ) -> Option<Self> {
+        if !has_pixel_data || !metadata.has_image_pixel_metadata() {
+            return None;
+        }
+
+        let DicomIndexMetadata {
+            patient_id,
+            patient_name,
+            study_instance_uid,
+            study_description,
+            study_date,
+            study_time,
+            series_instance_uid,
+            series_description,
+            series_number,
+            instance_number,
+            image_position_patient,
+            image_orientation_patient,
+            number_of_frames,
+            ..
+        } = metadata;
+        let sort_position = compute_slice_sort_position_from_values(
+            image_position_patient,
+            image_orientation_patient,
+        );
+        let number_of_frames = number_of_frames.unwrap_or(1).max(1);
+
+        let patient_key = patient_id.clone().unwrap_or_else(|| {
+            synthetic_patient_key(
+                file_path,
+                study_instance_uid.as_deref(),
+                series_instance_uid.as_deref(),
+            )
+        });
+        let study_key = study_instance_uid.clone().unwrap_or_else(|| {
+            synthetic_hierarchy_key("study", file_path, series_instance_uid.as_deref())
+        });
+        let series_key = series_instance_uid
+            .clone()
+            .unwrap_or_else(|| synthetic_hierarchy_key("series", file_path, None));
+        let patient_display_name =
+            build_patient_display_name(patient_name.as_deref(), patient_id.as_deref());
+        let study_display_name = build_study_display_name(
+            study_description.as_deref(),
+            study_date.as_deref(),
+            study_time.as_deref(),
+            study_instance_uid.as_deref(),
+        );
+        let series_display_name =
+            build_series_display_name(series_number, series_description.as_deref());
+
+        Some(Self {
+            patient_key,
+            patient_display_name,
+            study_key,
+            study_display_name,
+            study_date,
+            study_time,
+            series_key,
+            series_display_name,
+            series_number,
+            file_path: file_path.to_path_buf(),
+            instance_number,
+            sort_position,
+            number_of_frames,
+        })
+    }
+}
+
+impl DicomIndexBuilder {
+    pub(in crate::dicom) fn add_entry(&mut self, entry: DicomIndexEntry) {
+        let DicomIndexEntry {
+            patient_key,
+            patient_display_name,
+            study_key,
+            study_display_name,
+            study_date,
+            study_time,
+            series_key,
+            series_display_name,
+            series_number,
+            file_path,
+            instance_number,
+            sort_position,
+            number_of_frames,
+        } = entry;
+        let patient_index = self.get_or_insert_patient(patient_key, patient_display_name);
+        let study_index = self.get_or_insert_study(
+            patient_index,
+            study_key,
+            study_display_name,
+            study_date,
+            study_time,
+        );
+        let series_index = self.get_or_insert_series(
+            patient_index,
+            study_index,
+            series_key,
+            series_display_name,
+            series_number,
+        );
+
+        for frame_index in 0..number_of_frames {
+            let slice_display_name = build_slice_display_name(
+                &file_path,
+                instance_number,
+                frame_index,
+                number_of_frames,
+            );
+
+            self.patients[patient_index].studies[study_index].series_groups[series_index]
+                .slices
+                .push(SliceItem {
+                    path: file_path.clone(),
+                    display_name: slice_display_name,
+                    frame_index,
+                    instance_number,
+                    sort_position,
+                });
+        }
+    }
+
+    pub(in crate::dicom) fn into_patients(mut self) -> Vec<PatientGroup> {
+        sort_index(&mut self.patients);
+        self.patients
+    }
+
+    fn get_or_insert_patient(&mut self, patient_key: String, display_name: String) -> usize {
+        match self.patient_indices.entry(patient_key) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let index = self.patients.len();
+                entry.insert(index);
+                self.patients.push(PatientGroup {
+                    display_name,
+                    studies: Vec::new(),
+                });
+                index
+            }
+        }
+    }
+
+    fn get_or_insert_study(
+        &mut self,
+        patient_index: usize,
+        study_key: String,
+        display_name: String,
+        study_date: Option<String>,
+        study_time: Option<String>,
+    ) -> usize {
+        match self.study_indices.entry((patient_index, study_key)) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let index = self.patients[patient_index].studies.len();
+                entry.insert(index);
+                self.patients[patient_index].studies.push(StudyGroup {
+                    display_name,
+                    study_date,
+                    study_time,
+                    series_groups: Vec::new(),
+                });
+                index
+            }
+        }
+    }
+
+    fn get_or_insert_series(
+        &mut self,
+        patient_index: usize,
+        study_index: usize,
+        series_key: String,
+        display_name: String,
+        series_number: Option<i32>,
+    ) -> usize {
+        match self
+            .series_indices
+            .entry((patient_index, study_index, series_key))
+        {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let series_groups =
+                    &mut self.patients[patient_index].studies[study_index].series_groups;
+                let index = series_groups.len();
+                entry.insert(index);
+                series_groups.push(SeriesGroup {
+                    display_name,
+                    series_number,
+                    slices: Vec::new(),
+                });
+                index
+            }
+        }
+    }
 }
 
 fn synthetic_patient_key(
@@ -125,121 +335,6 @@ fn synthetic_hierarchy_key(kind: &str, file_path: &Path, uid: Option<&str>) -> S
     match uid {
         Some(uid) => format!("\u{1f}dicron-{kind}-uid:{uid}"),
         None => format!("\u{1f}dicron-{kind}-path:{}", file_path.display()),
-    }
-}
-
-fn get_or_insert_patient(
-    patients: &mut Vec<PatientGroup>,
-    patient_key: String,
-    display_name: String,
-) -> usize {
-    if let Some(patient_index) = patients
-        .iter()
-        .position(|patient| patient.patient_key == patient_key)
-    {
-        return patient_index;
-    }
-
-    patients.push(PatientGroup {
-        patient_key,
-        display_name,
-        studies: Vec::new(),
-    });
-
-    patients.len() - 1
-}
-
-fn get_or_insert_study(
-    studies: &mut Vec<StudyGroup>,
-    study_key: String,
-    display_name: String,
-    study_date: Option<String>,
-    study_time: Option<String>,
-) -> usize {
-    if let Some(study_index) = studies
-        .iter()
-        .position(|study| study.study_key == study_key)
-    {
-        return study_index;
-    }
-
-    studies.push(StudyGroup {
-        study_key,
-        display_name,
-        study_date,
-        study_time,
-        series_groups: Vec::new(),
-    });
-
-    studies.len() - 1
-}
-
-fn get_or_insert_series(
-    series_groups: &mut Vec<SeriesGroup>,
-    series_key: String,
-    display_name: String,
-    series_number: Option<i32>,
-) -> usize {
-    if let Some(series_index) = series_groups
-        .iter()
-        .position(|series| series.series_key == series_key)
-    {
-        return series_index;
-    }
-
-    series_groups.push(SeriesGroup {
-        series_key,
-        display_name,
-        series_number,
-        slices: Vec::new(),
-    });
-
-    series_groups.len() - 1
-}
-
-pub(in crate::dicom) fn sort_index(patients: &mut [PatientGroup]) {
-    patients.sort_by(|left, right| left.display_name.cmp(&right.display_name));
-
-    for patient in patients {
-        patient.studies.sort_by(|left, right| {
-            left.study_date
-                .cmp(&right.study_date)
-                .then_with(|| left.study_time.cmp(&right.study_time))
-                .then_with(|| left.display_name.cmp(&right.display_name))
-        });
-
-        for study in &mut patient.studies {
-            study.series_groups.sort_by(|left, right| {
-                left.series_number
-                    .unwrap_or(i32::MAX)
-                    .cmp(&right.series_number.unwrap_or(i32::MAX))
-                    .then_with(|| left.display_name.cmp(&right.display_name))
-            });
-
-            for series in &mut study.series_groups {
-                series.slices.sort_by(compare_slice_items);
-            }
-        }
-    }
-}
-
-fn compare_slice_items(left: &SliceItem, right: &SliceItem) -> Ordering {
-    compare_optional_f64(left.sort_position, right.sort_position)
-        .then_with(|| {
-            left.instance_number
-                .unwrap_or(i32::MAX)
-                .cmp(&right.instance_number.unwrap_or(i32::MAX))
-        })
-        .then_with(|| left.path.cmp(&right.path))
-        .then_with(|| left.frame_index.cmp(&right.frame_index))
-}
-
-fn compare_optional_f64(left: Option<f64>, right: Option<f64>) -> Ordering {
-    match (left, right) {
-        (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
     }
 }
 
@@ -308,16 +403,63 @@ fn build_slice_display_name(
     }
 }
 
+pub(in crate::dicom) fn sort_index(patients: &mut [PatientGroup]) {
+    patients.sort_by(|left, right| left.display_name.cmp(&right.display_name));
+
+    for patient in patients {
+        patient.studies.sort_by(|left, right| {
+            left.study_date
+                .cmp(&right.study_date)
+                .then_with(|| left.study_time.cmp(&right.study_time))
+                .then_with(|| left.display_name.cmp(&right.display_name))
+        });
+
+        for study in &mut patient.studies {
+            study.series_groups.sort_by(|left, right| {
+                left.series_number
+                    .unwrap_or(i32::MAX)
+                    .cmp(&right.series_number.unwrap_or(i32::MAX))
+                    .then_with(|| left.display_name.cmp(&right.display_name))
+            });
+
+            for series in &mut study.series_groups {
+                series.slices.sort_by(compare_slice_items);
+            }
+        }
+    }
+}
+
+fn compare_slice_items(left: &SliceItem, right: &SliceItem) -> Ordering {
+    compare_optional_f64(left.sort_position, right.sort_position)
+        .then_with(|| {
+            left.instance_number
+                .unwrap_or(i32::MAX)
+                .cmp(&right.instance_number.unwrap_or(i32::MAX))
+        })
+        .then_with(|| left.path.cmp(&right.path))
+        .then_with(|| left.frame_index.cmp(&right.frame_index))
+}
+
+fn compare_optional_f64(left: Option<f64>, right: Option<f64>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 /// Through-plane sort key for a slice. Prefers the projection of
 /// `ImagePositionPatient` (0020,0032) onto the slice normal derived from
 /// `ImageOrientationPatient` (0020,0037) — which is correct for axial,
 /// sagittal, coronal, and oblique acquisitions alike. Falls back to the raw Z
-/// component when orientation is absent, and to `None` (caller then orders by
-/// `InstanceNumber`) when position is absent too.
-fn compute_slice_sort_position(dicom_object: &DefaultDicomObject) -> Option<f64> {
-    let position = get_image_position_patient(dicom_object)?;
-
-    let Some(orientation) = get_image_orientation_patient(dicom_object) else {
+/// component when orientation is absent, and to `None` when position is absent.
+fn compute_slice_sort_position_from_values(
+    position: Option<[f64; 3]>,
+    orientation: Option<[f64; 6]>,
+) -> Option<f64> {
+    let position = position?;
+    let Some(orientation) = orientation else {
         return Some(position[2]);
     };
 
@@ -331,7 +473,6 @@ fn compute_slice_sort_position(dicom_object: &DefaultDicomObject) -> Option<f64>
 fn project_onto_slice_normal(position: [f64; 3], orientation: [f64; 6]) -> f64 {
     let row = [orientation[0], orientation[1], orientation[2]];
     let column = [orientation[3], orientation[4], orientation[5]];
-
     let normal = [
         row[1] * column[2] - row[2] * column[1],
         row[2] * column[0] - row[0] * column[2],
@@ -341,64 +482,39 @@ fn project_onto_slice_normal(position: [f64; 3], orientation: [f64; 6]) -> f64 {
     position[0] * normal[0] + position[1] * normal[1] + position[2] * normal[2]
 }
 
-fn get_image_position_patient(dicom_object: &DefaultDicomObject) -> Option<[f64; 3]> {
-    let mut values = [0.0_f64; 3];
-
-    for (index, slot) in values.iter_mut().enumerate() {
-        *slot = parsed_at(dicom_object, "ImagePositionPatient", index)?;
-    }
-
-    Some(values)
-}
-
-fn get_image_orientation_patient(dicom_object: &DefaultDicomObject) -> Option<[f64; 6]> {
-    let mut values = [0.0_f64; 6];
-
-    for (index, slot) in values.iter_mut().enumerate() {
-        *slot = parsed_at(dicom_object, "ImageOrientationPatient", index)?;
-    }
-
-    Some(values)
-}
-
-fn text(dicom_object: &DefaultDicomObject, keyword: &str) -> Option<String> {
-    let raw_value = dicom_object.element_by_name(keyword).ok()?.to_str().ok()?;
-    let value = raw_value.trim().trim_matches('\0').replace('\\', ", ");
-
+fn text_value(value: &PrimitiveValue) -> Option<String> {
+    let raw = value.to_str();
+    let value = raw.trim().trim_matches('\0').replace('\\', ", ");
     (!value.is_empty()).then_some(value)
 }
 
-fn first_parsed<T>(dicom_object: &DefaultDicomObject, keyword: &str) -> Option<T>
+fn first_parsed_value<T>(value: &PrimitiveValue) -> Option<T>
 where
     T: FromStr,
 {
-    parsed_at(dicom_object, keyword, 0)
-}
-
-fn parsed_at<T>(dicom_object: &DefaultDicomObject, keyword: &str, index: usize) -> Option<T>
-where
-    T: FromStr,
-{
-    dicom_object
-        .element_by_name(keyword)
-        .ok()?
+    value
         .to_str()
-        .ok()?
         .trim()
         .trim_matches('\0')
         .split('\\')
-        .nth(index)?
+        .next()?
         .trim()
         .parse()
         .ok()
 }
 
+fn parsed_array_value<const N: usize>(value: &PrimitiveValue) -> Option<[f64; N]> {
+    let raw = value.to_str();
+    let mut parsed_values = raw.trim().trim_matches('\0').split('\\');
+    let mut values = [0.0; N];
+    for slot in &mut values {
+        *slot = parsed_values.next()?.trim().parse().ok()?;
+    }
+    Some(values)
+}
+
 #[cfg(test)]
 mod tests {
-    use dicom_core::{DataElement, PrimitiveValue, VR};
-    use dicom_dictionary_std::{tags, uids};
-    use dicom_object::{DefaultDicomObject, FileDicomObject, FileMetaTableBuilder};
-
     use super::*;
 
     const AXIAL: [f64; 6] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
@@ -422,100 +538,77 @@ mod tests {
         assert_eq!(project_onto_slice_normal([99.0, 7.0, 99.0], CORONAL), -7.0);
     }
 
-    fn image_object(transfer_syntax: &str) -> DefaultDicomObject {
-        let meta = FileMetaTableBuilder::new()
-            .transfer_syntax(transfer_syntax)
-            .media_storage_sop_class_uid(uids::CT_IMAGE_STORAGE)
-            .media_storage_sop_instance_uid("2.25.100")
-            .build()
-            .unwrap();
-        let mut object = FileDicomObject::new_empty_with_meta(meta);
-        object.put_element(DataElement::new(
-            tags::ROWS,
-            VR::US,
-            PrimitiveValue::from(16_u16),
-        ));
-        object.put_element(DataElement::new(
-            tags::COLUMNS,
-            VR::US,
-            PrimitiveValue::from(16_u16),
-        ));
-        object.put_element(DataElement::new(
-            tags::SAMPLES_PER_PIXEL,
-            VR::US,
-            PrimitiveValue::from(1_u16),
-        ));
-        object.put_element(DataElement::new(
-            tags::BITS_ALLOCATED,
-            VR::US,
-            PrimitiveValue::from(16_u16),
-        ));
-        object.put_element(DataElement::new(
-            tags::PHOTOMETRIC_INTERPRETATION,
-            VR::CS,
-            PrimitiveValue::from("MONOCHROME2"),
-        ));
-        object
+    fn image_metadata() -> DicomIndexMetadata {
+        DicomIndexMetadata {
+            rows: Some(16),
+            columns: Some(16),
+            samples_per_pixel: Some(1),
+            bits_allocated: Some(16),
+            photometric_interpretation: Some("MONOCHROME2".to_owned()),
+            ..Default::default()
+        }
     }
 
-    fn put_text(object: &mut DefaultDicomObject, tag: dicom_core::Tag, vr: VR, value: &str) {
-        object.put_element(DataElement::new(tag, vr, PrimitiveValue::from(value)));
+    fn add_metadata(
+        index_builder: &mut DicomIndexBuilder,
+        path: &Path,
+        metadata: DicomIndexMetadata,
+        has_pixel_data: bool,
+    ) -> bool {
+        let Some(entry) = DicomIndexEntry::from_metadata(path, metadata, has_pixel_data) else {
+            return false;
+        };
+        index_builder.add_entry(entry);
+        true
     }
 
     #[test]
     fn non_image_objects_do_not_become_slices() {
-        let meta = FileMetaTableBuilder::new()
-            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
-            .media_storage_sop_class_uid(uids::RT_STRUCTURE_SET_STORAGE)
-            .media_storage_sop_instance_uid("2.25.200")
-            .build()
-            .unwrap();
-        let object = FileDicomObject::new_empty_with_meta(meta);
-        let mut patients = Vec::new();
+        let mut index_builder = DicomIndexBuilder::default();
 
-        assert!(!has_image_pixel_metadata(&object));
-        assert!(!add_dicom_object_to_index(
-            &mut patients,
+        assert!(!add_metadata(
+            &mut index_builder,
             Path::new("structure-set"),
-            &object,
+            DicomIndexMetadata::default(),
             false,
         ));
+        let patients = index_builder.into_patients();
         assert!(patients.is_empty());
     }
 
     #[test]
     fn compressed_multiframe_image_headers_become_slices_without_pixel_decoding() {
-        let mut object = image_object(uids::JPEG_BASELINE8_BIT);
-        put_text(&mut object, tags::NUMBER_OF_FRAMES, VR::IS, "3");
-        let mut patients = Vec::new();
+        let mut metadata = image_metadata();
+        metadata.number_of_frames = Some(3);
+        let mut index_builder = DicomIndexBuilder::default();
 
-        assert!(add_dicom_object_to_index(
-            &mut patients,
+        assert!(add_metadata(
+            &mut index_builder,
             Path::new("compressed-image"),
-            &object,
+            metadata,
             true,
         ));
+        let patients = index_builder.into_patients();
         assert_eq!(patients[0].studies[0].series_groups[0].slices.len(), 3);
     }
 
     #[test]
     fn objects_missing_all_hierarchy_ids_do_not_merge() {
-        let first = image_object(uids::EXPLICIT_VR_LITTLE_ENDIAN);
-        let second = image_object(uids::EXPLICIT_VR_LITTLE_ENDIAN);
-        let mut patients = Vec::new();
+        let mut index_builder = DicomIndexBuilder::default();
 
-        assert!(add_dicom_object_to_index(
-            &mut patients,
+        assert!(add_metadata(
+            &mut index_builder,
             Path::new("first/image"),
-            &first,
+            image_metadata(),
             true,
         ));
-        assert!(add_dicom_object_to_index(
-            &mut patients,
+        assert!(add_metadata(
+            &mut index_builder,
             Path::new("second/image"),
-            &second,
+            image_metadata(),
             true,
         ));
+        let patients = index_builder.into_patients();
 
         assert_eq!(patients.len(), 2);
         assert!(
@@ -535,27 +628,27 @@ mod tests {
 
     #[test]
     fn complete_hierarchy_ids_keep_normal_grouping_behavior() {
-        let mut first = image_object(uids::EXPLICIT_VR_LITTLE_ENDIAN);
-        let mut second = image_object(uids::EXPLICIT_VR_LITTLE_ENDIAN);
-        for object in [&mut first, &mut second] {
-            put_text(object, tags::PATIENT_ID, VR::LO, "patient-1");
-            put_text(object, tags::STUDY_INSTANCE_UID, VR::UI, "2.25.301");
-            put_text(object, tags::SERIES_INSTANCE_UID, VR::UI, "2.25.302");
-        }
-        let mut patients = Vec::new();
+        let mut index_builder = DicomIndexBuilder::default();
+        let metadata = || DicomIndexMetadata {
+            patient_id: Some("patient-1".to_owned()),
+            study_instance_uid: Some("2.25.301".to_owned()),
+            series_instance_uid: Some("2.25.302".to_owned()),
+            ..image_metadata()
+        };
 
-        assert!(add_dicom_object_to_index(
-            &mut patients,
+        assert!(add_metadata(
+            &mut index_builder,
             Path::new("first-image"),
-            &first,
+            metadata(),
             true,
         ));
-        assert!(add_dicom_object_to_index(
-            &mut patients,
+        assert!(add_metadata(
+            &mut index_builder,
             Path::new("second-image"),
-            &second,
+            metadata(),
             true,
         ));
+        let patients = index_builder.into_patients();
 
         assert_eq!(patients.len(), 1);
         assert_eq!(patients[0].studies.len(), 1);

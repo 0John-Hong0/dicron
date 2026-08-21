@@ -25,7 +25,7 @@ impl DicronApp {
             return;
         }
 
-        let accepted_paths = filter_accepted_dropped_paths(startup_paths);
+        let accepted_paths = filter_nonempty_paths(startup_paths);
 
         if accepted_paths.is_empty() {
             self.error_message =
@@ -35,13 +35,18 @@ impl DicronApp {
 
         if let [startup_path] = accepted_paths.as_slice() {
             let startup_path = startup_path.clone();
+            let Ok(metadata) = startup_path.metadata() else {
+                self.error_message =
+                    Some("The selected DICOM path is no longer available.".to_owned());
+                return;
+            };
 
-            if startup_path.is_dir() {
+            if metadata.is_dir() {
                 self.open_dicom_folder_path(context, startup_path);
                 return;
             }
 
-            if startup_path.is_file() {
+            if metadata.is_file() {
                 self.open_dicom_file_path(context, startup_path);
                 return;
             }
@@ -115,7 +120,7 @@ impl DicronApp {
             return;
         }
 
-        let accepted_paths = filter_accepted_dropped_paths(dropped_paths);
+        let accepted_paths = filter_nonempty_paths(dropped_paths);
 
         if accepted_paths.is_empty() {
             self.error_message = Some("Drop DICOM files or folders only.".to_owned());
@@ -124,13 +129,18 @@ impl DicronApp {
 
         if let [dropped_path] = accepted_paths.as_slice() {
             let dropped_path = dropped_path.clone();
+            let Ok(metadata) = dropped_path.metadata() else {
+                self.error_message =
+                    Some("The dropped DICOM path is no longer available.".to_owned());
+                return;
+            };
 
-            if dropped_path.is_dir() {
+            if metadata.is_dir() {
                 self.open_dicom_folder_path(context, dropped_path);
                 return;
             }
 
-            if dropped_path.is_file() {
+            if metadata.is_file() {
                 self.open_dicom_file_path(context, dropped_path);
                 return;
             }
@@ -140,10 +150,10 @@ impl DicronApp {
     }
 }
 
-fn filter_accepted_dropped_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+fn filter_nonempty_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths
         .into_iter()
-        .filter(|path| path.is_dir() || path.is_file())
+        .filter(|path| !path.as_os_str().is_empty())
         .collect()
 }
 
@@ -973,8 +983,7 @@ mod loading_tests {
         let valid_path = temporary_file_path("series-fit");
         write_single_pixel_dicom(&valid_path);
         let mut index = build_for_file(&valid_path).unwrap();
-        let mut second_series = index.patients[0].studies[0].series_groups[0].clone();
-        second_series.series_key = "second-series".to_owned();
+        let second_series = index.patients[0].studies[0].series_groups[0].clone();
         index.patients[0].studies[0]
             .series_groups
             .push(second_series);
