@@ -5,10 +5,8 @@ Releases are built from `main` by `.github/workflows/release.yml`.
 ## Checklist
 
 1. Make sure `main` is clean and up to date.
-2. Update the version in `Cargo.toml`.
-3. Update the root `dicron` package version in `Cargo.lock`.
-4. Update `CHANGELOG.md`.
-5. Run:
+2. Review the current package version and make sure `CHANGELOG.md` has entries under `Unreleased`.
+3. Run:
 
    ```sh
    cargo fmt --check
@@ -17,9 +15,11 @@ Releases are built from `main` by `.github/workflows/release.yml`.
    cargo build --release
    ```
 
-6. Commit and push the version bump.
-7. Run the GitHub Actions `Release` workflow on `main`.
+4. Commit and push all product and changelog changes.
+5. Run the GitHub Actions `Release` workflow on `main`:
+   - Choose `new` and a semantic version bump (`patch`, `minor`, or `major`) for a new release.
+   - Choose `retry` only to resume an existing unfinished release for the current package version.
 
-The workflow creates the `vX.Y.Z` tag and GitHub release, then uploads Debian, Arch, macOS Apple Silicon, macOS Intel, and Windows artifacts.
+For a new release, the workflow bumps the package version in `Cargo.toml` and `Cargo.lock`, promotes the `Unreleased` changelog entries to that version, commits the release preparation to `main`, creates the `vX.Y.Z` tag and a draft GitHub release, and uses the changelog section as the release notes. It uploads Debian, Arch, and Windows artifacts and publishes the release only after every package build succeeds.
 
-Use the workflow's `replace_existing` option only when intentionally replacing a failed or incomplete release for the same version.
+A retry requires the release tag to already exist. It resumes an existing draft release or recreates a missing draft from that tag; it cannot replace a published release.

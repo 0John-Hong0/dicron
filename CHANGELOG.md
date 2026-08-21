@@ -19,6 +19,7 @@ This project uses semantic versioning while it remains practical for a small des
 - Keep slice and frame changes transactional so failed loads preserve the currently displayed image and navigation state.
 - Exclude non-image DICOM objects from the image hierarchy and accept parseable extensionless or markerless DICOM datasets.
 - Speed up large file and folder opens with compact parallel header indexing, constant-time hierarchy grouping, and coalesced progress updates.
+- Publish automated Debian, Arch Linux, and Windows releases only after every package build succeeds; unsigned macOS packages are no longer produced.
 - Store settings in the platform configuration directory while migrating the previous settings file.
 
 ## [0.1.1] - 2026-07-13
