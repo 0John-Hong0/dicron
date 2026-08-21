@@ -13,9 +13,7 @@ use crate::app::state::{
     WindowLevel, WindowPreset,
 };
 use crate::app::ui::upload_display_pixels;
-use crate::dicom::{
-    DicomWindow, SliceItem, build_for_file, is_candidate_path, load_dicom_frame, render_frame,
-};
+use crate::dicom::{DicomWindow, SliceItem, build_for_file, load_dicom_frame, render_frame};
 
 impl DicronApp {
     pub(crate) fn open_startup_paths(
@@ -53,9 +51,7 @@ impl DicronApp {
     }
 
     pub(super) fn open_dicom_file(&mut self, context: &egui::Context) {
-        let mut file_dialog = FileDialog::new()
-            .set_title("Open DICOM")
-            .add_filter("DICOM", &["dcm", "dicom"]);
+        let mut file_dialog = FileDialog::new().set_title("Open DICOM");
 
         if let Some(open_dicom_directory) = &self.settings.open_dicom_directory {
             file_dialog = file_dialog.set_directory(open_dicom_directory);
@@ -147,7 +143,7 @@ impl DicronApp {
 fn filter_accepted_dropped_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths
         .into_iter()
-        .filter(|path| path.is_dir() || is_candidate_path(path))
+        .filter(|path| path.is_dir() || path.is_file())
         .collect()
 }
 
@@ -184,20 +180,22 @@ impl DicronApp {
         study_index: usize,
         series_index: usize,
         slice_index: usize,
-    ) {
+    ) -> bool {
         let Some(slice_item) =
             self.get_slice_by_indices(patient_index, study_index, series_index, slice_index)
         else {
-            return;
+            return false;
         };
 
-        self.selected_slice = Some(SliceSelection::new(
-            patient_index,
-            study_index,
-            series_index,
-            slice_index,
-        ));
-        self.load_dicom_path(context, slice_item.path, slice_item.frame_index);
+        let target_selection =
+            SliceSelection::new(patient_index, study_index, series_index, slice_index);
+
+        self.load_dicom_path(
+            context,
+            slice_item.path,
+            slice_item.frame_index,
+            Some(target_selection),
+        )
     }
 
     pub(super) fn get_slice_by_indices(
@@ -399,49 +397,48 @@ impl DicronApp {
             return;
         }
 
-        self.load_dicom_path(context, selected_dicom_path, next_frame_index);
+        self.load_dicom_path(context, selected_dicom_path, next_frame_index, None);
     }
 
-    pub(super) fn jump_to_slice(&mut self, context: &egui::Context, slice_index: usize) {
+    pub(super) fn jump_to_slice(&mut self, context: &egui::Context, slice_index: usize) -> bool {
         if let Some(selection) = self.selected_slice {
             let Some(series_slice_count) = self.get_selected_series_slice_count() else {
-                return;
+                return false;
             };
 
             if series_slice_count == 0 {
-                return;
+                return false;
             }
 
             let next_slice_index = slice_index.min(series_slice_count - 1);
             if selection.slice_index == next_slice_index {
-                return;
+                return true;
             }
 
-            self.load_slice_by_indices(
+            return self.load_slice_by_indices(
                 context,
                 selection.patient_index,
                 selection.study_index,
                 selection.series_index,
                 next_slice_index,
             );
-            return;
         }
 
         let Some(selected_dicom_path) = self.selected_dicom_path.clone() else {
-            return;
+            return false;
         };
 
         if self.selected_dicom_frame_count == 0 {
-            return;
+            return false;
         }
 
         let next_frame_index =
             slice_index.min((self.selected_dicom_frame_count - 1) as usize) as u32;
         if next_frame_index == self.selected_dicom_frame_index {
-            return;
+            return true;
         }
 
-        self.load_dicom_path(context, selected_dicom_path, next_frame_index);
+        self.load_dicom_path(context, selected_dicom_path, next_frame_index, None)
     }
 }
 
@@ -522,17 +519,20 @@ impl DicronApp {
             return;
         };
 
+        let mut next_direction = self.playback.direction;
         let Some(next_slice_index) = next_slice_index(
             current_slice_index,
             slice_count,
             self.playback.loop_mode,
-            &mut self.playback.direction,
+            &mut next_direction,
         ) else {
             self.stop_autoplay();
             return;
         };
 
-        self.jump_to_slice(context, next_slice_index);
+        if self.jump_to_slice(context, next_slice_index) {
+            self.playback.direction = next_direction;
+        }
     }
 
     pub(super) fn start_autoplay(&mut self) {
@@ -601,7 +601,8 @@ impl DicronApp {
         context: &egui::Context,
         dicom_path: PathBuf,
         frame_index: u32,
-    ) {
+        target_selection: Option<SliceSelection>,
+    ) -> bool {
         if self.decoded_cache.get(&dicom_path, frame_index).is_none() {
             match load_dicom_frame(&dicom_path, frame_index) {
                 Ok(loaded) => self.decoded_cache.insert(DecodedCacheEntry {
@@ -612,16 +613,16 @@ impl DicronApp {
                 }),
                 Err(error) => {
                     self.error_message = Some(format!("Failed to open DICOM: {error:#}"));
-                    return;
+                    return false;
                 }
             }
         }
 
-        let saved_window_level = self.current_series_window_level();
+        let saved_window_level = self.window_level_for_selection(target_selection);
         let prepared = {
             let Some(entry) = self.decoded_cache.get(&dicom_path, frame_index) else {
                 self.error_message = Some("Failed to retrieve decoded DICOM frame.".to_owned());
-                return;
+                return false;
             };
             let (default_center, default_width) = entry.frame.default_center_width();
             let window_customized = saved_window_level.is_some();
@@ -649,10 +650,13 @@ impl DicronApp {
             Ok(pixels) => pixels,
             Err(error) => {
                 self.error_message = Some(format!("Failed to render DICOM: {error:#}"));
-                return;
+                return false;
             }
         };
 
+        let loaded_texture = upload_display_pixels(context, texture_name(&dicom_path), pixels);
+
+        self.selected_slice = target_selection;
         self.window_level.apply_loaded_frame(
             prepared.default_window,
             prepared.current_window,
@@ -663,15 +667,12 @@ impl DicronApp {
         );
         self.selected_dicom_frame_index = frame_index;
         self.selected_dicom_frame_count = prepared.frame_count;
-        self.loaded_texture = Some(upload_display_pixels(
-            context,
-            texture_name(&dicom_path),
-            pixels,
-        ));
+        self.loaded_texture = Some(loaded_texture);
         self.metadata.replace(prepared.metadata);
         self.current_frame_key = Some((dicom_path.clone(), frame_index));
         self.selected_dicom_path = Some(dicom_path);
         self.error_message = None;
+        true
     }
 
     pub(in crate::app) fn refresh_dicom_texture(&mut self, context: &egui::Context) {
@@ -785,5 +786,148 @@ mod playback_tests {
             Some(1)
         );
         assert_eq!(direction, 1);
+    }
+}
+
+#[cfg(test)]
+mod loading_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use dicom_core::{DataElement, PrimitiveValue, VR};
+    use dicom_dictionary_std::{tags, uids};
+    use dicom_object::{FileDicomObject, FileMetaTableBuilder};
+
+    use super::*;
+
+    static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    fn temporary_file_path(label: &str) -> PathBuf {
+        let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "dicron-actions-{label}-{}-{sequence}.dcm",
+            std::process::id()
+        ))
+    }
+
+    fn write_single_pixel_dicom(path: &std::path::Path) {
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .media_storage_sop_class_uid(uids::CT_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid("2.25.600")
+            .build()
+            .unwrap();
+        let mut object = FileDicomObject::new_empty_with_meta(meta);
+
+        for (tag, value) in [
+            (tags::ROWS, 1_u16),
+            (tags::COLUMNS, 1_u16),
+            (tags::SAMPLES_PER_PIXEL, 1_u16),
+            (tags::BITS_ALLOCATED, 8_u16),
+            (tags::BITS_STORED, 8_u16),
+            (tags::HIGH_BIT, 7_u16),
+            (tags::PIXEL_REPRESENTATION, 0_u16),
+        ] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            PrimitiveValue::from("MONOCHROME2"),
+        ));
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from(vec![128_u8]),
+        ));
+        object.write_to_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_slice_load_keeps_displayed_selection_and_autoplay_direction() {
+        let valid_path = temporary_file_path("valid");
+        let missing_path = temporary_file_path("missing");
+        write_single_pixel_dicom(&valid_path);
+
+        let mut index = build_for_file(&valid_path).unwrap();
+        index.patients[0].studies[0].series_groups[0].slices.insert(
+            0,
+            SliceItem {
+                path: missing_path,
+                display_name: "missing".to_owned(),
+                frame_index: 0,
+                instance_number: None,
+                sort_position: None,
+            },
+        );
+
+        let context = egui::Context::default();
+        let mut app = DicronApp {
+            dicom_index: Some(index),
+            ..Default::default()
+        };
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 1));
+        let displayed_selection = app.selected_slice;
+        let displayed_path = app.selected_dicom_path.clone();
+        let displayed_frame_key = app.current_frame_key.clone();
+        let displayed_texture_id = app.loaded_texture.as_ref().map(egui::TextureHandle::id);
+        let displayed_metadata: Vec<_> = app
+            .metadata
+            .all_items
+            .iter()
+            .map(|item| {
+                (
+                    item.tag.clone(),
+                    item.description.clone(),
+                    item.value.clone(),
+                )
+            })
+            .collect();
+        let displayed_window = app.window_level.current;
+        let displayed_default_window = app.window_level.default;
+        let displayed_value_range = app.window_level.value_range;
+        let displayed_window_customized = app.window_level.customized;
+        let displayed_window_available = app.window_level.available;
+        let displayed_window_preset = app.window_level.active_preset;
+
+        app.playback.loop_mode = PlaybackLoopMode::PingPong;
+        app.playback.direction = 1;
+        app.advance_autoplay(&context, 2);
+
+        assert_eq!(app.selected_slice, displayed_selection);
+        assert_eq!(app.selected_dicom_path, displayed_path);
+        assert_eq!(app.current_frame_key, displayed_frame_key);
+        assert_eq!(
+            app.loaded_texture.as_ref().map(egui::TextureHandle::id),
+            displayed_texture_id
+        );
+        let current_metadata: Vec<_> = app
+            .metadata
+            .all_items
+            .iter()
+            .map(|item| {
+                (
+                    item.tag.clone(),
+                    item.description.clone(),
+                    item.value.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(current_metadata, displayed_metadata);
+        assert_eq!(app.window_level.current, displayed_window);
+        assert_eq!(app.window_level.default, displayed_default_window);
+        assert_eq!(app.window_level.value_range, displayed_value_range);
+        assert_eq!(app.window_level.customized, displayed_window_customized);
+        assert_eq!(app.window_level.available, displayed_window_available);
+        assert_eq!(app.window_level.active_preset, displayed_window_preset);
+        assert_eq!(app.selected_dicom_frame_index, 0);
+        assert_eq!(app.selected_dicom_frame_count, 1);
+        assert_eq!(app.playback.direction, 1);
+        assert!(
+            app.error_message
+                .as_deref()
+                .is_some_and(|message| { message.starts_with("Failed to open DICOM:") })
+        );
+
+        std::fs::remove_file(valid_path).unwrap();
     }
 }

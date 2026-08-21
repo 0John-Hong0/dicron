@@ -4,10 +4,11 @@ use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
-use dicom_object::{DefaultDicomObject, open_file};
+use dicom_object::DefaultDicomObject;
 use dicom_pixeldata::{ConvertOptions, DecodedPixelData, PixelDecoder, VoiLutOption, WindowLevel};
 
 use super::metadata::{DicomMetadata, extract_dicom_metadata};
+use super::scan::open_dicom_file;
 
 pub(crate) struct DisplayPixels {
     pub(crate) width: usize,
@@ -133,7 +134,7 @@ pub(crate) struct LoadedFrame {
 /// This is the expensive step (disk read + decompress); callers cache the
 /// result and use [`render_frame`] for window/level changes.
 pub(crate) fn load_dicom_frame(dicom_path: &Path, frame_index: u32) -> Result<LoadedFrame> {
-    let dicom_object = open_file(dicom_path)
+    let dicom_object = open_dicom_file(dicom_path)
         .with_context(|| format!("could not open DICOM file {}", dicom_path.display()))?;
 
     let metadata = extract_dicom_metadata(&dicom_object);

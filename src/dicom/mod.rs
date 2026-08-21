@@ -13,5 +13,4 @@ pub(crate) use pixels::{
 };
 pub(crate) use scan::{
     BuildProgress, build_for_file, build_for_inputs_with_progress, build_from_folder_with_progress,
-    is_candidate_path,
 };
