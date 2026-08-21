@@ -13,6 +13,7 @@ This project uses semantic versioning while it remains practical for a small des
 - Add a persistent System, Light, and Dark theme selector styled consistently with the toolbar.
 - Fix opening DICOM images encoded with the JPEG 2000 Lossless transfer syntax.
 - Add viewer window presets, exact window-level editing, and consistent number-key shortcuts.
+- Expand image overlays with patient, study, series, orientation, slice, pixel, and windowing information.
 
 ## [0.1.1] - 2026-07-13
 

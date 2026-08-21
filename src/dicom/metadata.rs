@@ -1,5 +1,7 @@
 //! UI-independent extraction and formatting of DICOM metadata.
 
+use std::str::FromStr;
+
 use dicom_core::header::{HasLength, Header};
 use dicom_core::value::Value;
 use dicom_core::{
@@ -40,17 +42,110 @@ impl MetadataItem {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DicomOverlayMetadata {
+    pub(crate) patient_label: Option<String>,
+    pub(crate) study_description: Option<String>,
+    pub(crate) series_description: Option<String>,
+    pub(crate) manufacturer: Option<String>,
+    pub(crate) modality: Option<String>,
+    pub(crate) study_date: Option<String>,
+    pub(crate) study_time: Option<String>,
+    pub(crate) slice_thickness: Option<f64>,
+    pub(crate) slice_location: Option<f64>,
+    pub(crate) image_orientation: Option<[f64; 6]>,
+}
+
 #[derive(Clone)]
 pub(crate) struct DicomMetadata {
     pub(crate) curated_items: Vec<MetadataItem>,
     pub(crate) all_items: Vec<MetadataItem>,
+    pub(crate) overlay: DicomOverlayMetadata,
 }
 
 pub(crate) fn extract_dicom_metadata(dicom_object: &DefaultDicomObject) -> DicomMetadata {
     DicomMetadata {
         curated_items: extract_curated_dicom_metadata(dicom_object),
         all_items: extract_all_dicom_metadata(dicom_object),
+        overlay: extract_overlay_metadata(dicom_object),
     }
+}
+
+fn extract_overlay_metadata(dicom_object: &DefaultDicomObject) -> DicomOverlayMetadata {
+    let patient_name =
+        optional_text(dicom_object, "PatientName").map(|name| name.replace('^', " "));
+    let patient_id = optional_text(dicom_object, "PatientID");
+    let patient_label = match (patient_name, patient_id) {
+        (Some(name), Some(id)) => Some(format!("{name} ({id})")),
+        (Some(name), None) => Some(name),
+        (None, Some(id)) => Some(id),
+        (None, None) => None,
+    };
+
+    let image_position = parsed_values::<3>(dicom_object, "ImagePositionPatient");
+    let slice_thickness =
+        first_parsed::<f64>(dicom_object, "SliceThickness").filter(|value| value.is_finite());
+    let slice_location = first_parsed::<f64>(dicom_object, "SliceLocation")
+        .filter(|value| value.is_finite())
+        .or_else(|| image_position.map(|position| position[2]));
+
+    DicomOverlayMetadata {
+        patient_label,
+        study_description: optional_text(dicom_object, "StudyDescription"),
+        series_description: optional_text(dicom_object, "SeriesDescription"),
+        manufacturer: optional_text(dicom_object, "Manufacturer"),
+        modality: optional_text(dicom_object, "Modality"),
+        study_date: optional_text(dicom_object, "StudyDate"),
+        study_time: optional_text(dicom_object, "StudyTime"),
+        slice_thickness,
+        slice_location,
+        image_orientation: parsed_values(dicom_object, "ImageOrientationPatient"),
+    }
+}
+
+fn optional_text(dicom_object: &DefaultDicomObject, keyword: &str) -> Option<String> {
+    let text = dicom_object
+        .element_by_name(keyword)
+        .ok()?
+        .to_str()
+        .ok()?
+        .trim()
+        .trim_matches('\0')
+        .trim()
+        .to_owned();
+
+    (!text.is_empty()).then_some(text)
+}
+
+fn first_parsed<T>(dicom_object: &DefaultDicomObject, keyword: &str) -> Option<T>
+where
+    T: FromStr,
+{
+    optional_text(dicom_object, keyword)?
+        .split('\\')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn parsed_values<const N: usize>(
+    dicom_object: &DefaultDicomObject,
+    keyword: &str,
+) -> Option<[f64; N]> {
+    let text = optional_text(dicom_object, keyword)?;
+    let values: Vec<_> = text
+        .split('\\')
+        .map(str::trim)
+        .map(str::parse::<f64>)
+        .collect::<Result<_, _>>()
+        .ok()?;
+
+    let values: [f64; N] = values.try_into().ok()?;
+    values
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(values)
 }
 
 fn extract_curated_dicom_metadata(dicom_object: &DefaultDicomObject) -> Vec<MetadataItem> {

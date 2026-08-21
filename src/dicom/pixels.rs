@@ -21,11 +21,31 @@ pub(crate) struct DicomWindow {
     pub(crate) width: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PixelProbeValue {
+    Monochrome(f64),
+    Rgb([u8; 3]),
+}
+
+enum PixelProbeData {
+    Monochrome {
+        width: usize,
+        height: usize,
+        values: Vec<f64>,
+    },
+    Rgb {
+        width: usize,
+        height: usize,
+        values: Vec<u8>,
+    },
+}
+
 /// A single decoded frame plus everything needed to (re)window it without
 /// touching the disk again. Re-applying a window/level is a cheap LUT pass over
 /// the cached `decoded` samples, not a fresh open + decompress.
 pub(crate) struct DecodedFrame {
     decoded: DecodedPixelData<'static>,
+    pixel_probe: Option<PixelProbeData>,
     pub(crate) frame_count: u32,
     /// The file's own WindowCenter/WindowWidth, when present and finite.
     pub(crate) default_window: Option<DicomWindow>,
@@ -67,6 +87,41 @@ impl DecodedFrame {
     pub(crate) fn window_level_available(&self) -> bool {
         self.window_level_available
     }
+
+    pub(crate) fn pixel_probe(&self, x: usize, y: usize) -> Option<PixelProbeValue> {
+        match self.pixel_probe.as_ref()? {
+            PixelProbeData::Monochrome {
+                width,
+                height,
+                values,
+            } => {
+                if x >= *width || y >= *height {
+                    return None;
+                }
+
+                values
+                    .get(y.checked_mul(*width)?.checked_add(x)?)
+                    .copied()
+                    .map(PixelProbeValue::Monochrome)
+            }
+            PixelProbeData::Rgb {
+                width,
+                height,
+                values,
+            } => {
+                if x >= *width || y >= *height {
+                    return None;
+                }
+
+                let offset = y.checked_mul(*width)?.checked_add(x)?.checked_mul(3)?;
+                Some(PixelProbeValue::Rgb([
+                    *values.get(offset)?,
+                    *values.get(offset + 1)?,
+                    *values.get(offset + 2)?,
+                ]))
+            }
+        }
+    }
 }
 
 pub(crate) struct LoadedFrame {
@@ -103,13 +158,36 @@ fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<D
         .max(1);
 
     let window_level_available = decoded.photometric_interpretation().is_monochrome();
+    let pixel_probe = build_pixel_probe(&decoded);
 
     Ok(DecodedFrame {
         decoded,
+        pixel_probe,
         frame_count,
         default_window: read_default_window(dicom_object),
         value_range: compute_value_range(dicom_object),
         window_level_available,
+    })
+}
+
+fn build_pixel_probe(decoded: &DecodedPixelData<'_>) -> Option<PixelProbeData> {
+    if decoded.photometric_interpretation().is_monochrome() {
+        return Some(PixelProbeData::Monochrome {
+            width: decoded.columns() as usize,
+            height: decoded.rows() as usize,
+            values: decoded.to_vec_frame::<f64>(0).ok()?,
+        });
+    }
+
+    let image = decoded
+        .to_dynamic_image_with_options(0, &ConvertOptions::new().force_8bit())
+        .ok()?
+        .to_rgb8();
+
+    Some(PixelProbeData::Rgb {
+        width: image.width() as usize,
+        height: image.height() as usize,
+        values: image.into_raw(),
     })
 }
 

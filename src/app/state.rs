@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use eframe::egui;
 
-use crate::dicom::{DicomIndex, MetadataItem};
+use crate::dicom::{DicomIndex, DicomOverlayMetadata, MetadataItem};
 use crate::release_check::UpdateCheckOutcome;
 use crate::settings::AppSettings;
 
@@ -49,6 +49,7 @@ pub(super) struct MetadataPanelState {
     pub(super) show_all: bool,
     pub(super) curated_items: Vec<MetadataItem>,
     pub(super) all_items: Vec<MetadataItem>,
+    pub(super) overlay: Option<DicomOverlayMetadata>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
