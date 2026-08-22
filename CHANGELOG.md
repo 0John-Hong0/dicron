@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-22
+
 - Add independently collapsible and resizable DICOM tree and metadata side panels.
 - Improve spacing and responsive layout throughout the viewer, including controls that wrap at narrow window widths.
 - Refine the DICOM tree with clearer hierarchy, compact slice rows, full-row selection, and tooltips for truncated labels.
