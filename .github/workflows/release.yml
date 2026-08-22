@@ -4,16 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       release_mode:
-        description: "Create a new release or retry the current unfinished release"
+        description: "Prepare, publish, or retry a release"
         required: true
-        default: new
+        default: prepare
         type: choice
         options:
-          - new
+          - prepare
+          - publish
           - retry
 
       bump_type:
-        description: "Semantic version increment (ignored when retrying)"
+        description: "Semantic version increment (used only when preparing)"
         required: true
         default: patch
         type: choice
@@ -24,6 +25,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: release
@@ -50,11 +52,11 @@ jobs:
           fetch-depth: 0
 
       # ------------------------------------------------------------
-      # NEW RELEASE
+      # PREPARE RELEASE PULL REQUEST
       # ------------------------------------------------------------
 
       - name: Bump package version
-        if: ${{ inputs.release_mode == 'new' }}
+        if: ${{ inputs.release_mode == 'prepare' }}
         env:
           BUMP_TYPE: ${{ inputs.bump_type }}
         run: |
@@ -133,7 +135,7 @@ jobs:
           PY
 
       # ------------------------------------------------------------
-      # BOTH NEW + RETRY
+      # ALL MODES
       # ------------------------------------------------------------
 
       - name: Read version from Cargo.toml
@@ -158,16 +160,17 @@ jobs:
           echo "Tag: ${TAG_NAME}"
 
       # ------------------------------------------------------------
-      # NEW RELEASE
+      # PREPARE RELEASE PULL REQUEST
       # ------------------------------------------------------------
 
-      - name: Validate new version does not already exist
-        if: ${{ inputs.release_mode == 'new' }}
+      - name: Validate release preparation
+        if: ${{ inputs.release_mode == 'prepare' }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           TAG_NAME="${{ steps.version.outputs.tag_name }}"
+          RELEASE_BRANCH="release/$TAG_NAME"
 
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
             echo "ERROR: Tag $TAG_NAME already exists."
@@ -179,8 +182,13 @@ jobs:
             exit 1
           fi
 
+          if git ls-remote --exit-code --heads origin "refs/heads/$RELEASE_BRANCH" >/dev/null 2>&1; then
+            echo "ERROR: Release preparation branch $RELEASE_BRANCH already exists."
+            exit 1
+          fi
+
       - name: Promote changelog entry
-        if: ${{ inputs.release_mode == 'new' }}
+        if: ${{ inputs.release_mode == 'prepare' }}
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -258,14 +266,14 @@ jobs:
           PY
 
       # ------------------------------------------------------------
-      # BOTH NEW + RETRY
+      # PUBLISH + RETRY
       #
       # Generates notes from the actual version section in CHANGELOG.
-      # For new releases that section was created immediately above.
-      # For retries it already exists from the original release attempt.
+      # That section was created by the merged release preparation PR.
       # ------------------------------------------------------------
 
       - name: Generate release notes
+        if: ${{ inputs.release_mode != 'prepare' }}
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -325,16 +333,23 @@ jobs:
           PY
 
       # ------------------------------------------------------------
-      # NEW RELEASE
+      # PREPARE RELEASE PULL REQUEST
       # ------------------------------------------------------------
 
-      - name: Commit release preparation
-        if: ${{ inputs.release_mode == 'new' }}
+      - name: Create release preparation pull request
+        if: ${{ inputs.release_mode == 'prepare' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
+          VERSION="${{ steps.version.outputs.version }}"
           TAG_NAME="${{ steps.version.outputs.tag_name }}"
+          RELEASE_BRANCH="release/$TAG_NAME"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git switch -c "$RELEASE_BRANCH"
 
           git add Cargo.toml Cargo.lock CHANGELOG.md
 
@@ -344,21 +359,91 @@ jobs:
           fi
 
           git commit -m "Prepare release $TAG_NAME"
-          git push origin HEAD:main
+          git push origin "$RELEASE_BRANCH"
 
-      - name: Create and push tag
-        if: ${{ inputs.release_mode == 'new' }}
+          cat > release-pr-body.md <<EOF
+          ## Summary
+
+          - Bump Dicron to $VERSION.
+          - Promote the Unreleased changelog entries to $TAG_NAME.
+
+          ## Testing
+
+          - [ ] \`cargo fmt --check\`
+          - [ ] \`cargo clippy --all-targets --all-features -- -D warnings\`
+          - [ ] \`cargo test\`
+
+          ## Notes
+
+          Generated by the Release workflow. Merge this pull request before running the workflow in publish mode. No private patient data is included.
+          EOF
+
+          PR_URL="$(
+            gh pr create \
+              --base main \
+              --head "$RELEASE_BRANCH" \
+              --title "Prepare release $TAG_NAME" \
+              --body-file release-pr-body.md
+          )"
+
+          echo "Created release preparation pull request: $PR_URL"
+
+      # ------------------------------------------------------------
+      # PUBLISH RELEASE
+      # ------------------------------------------------------------
+
+      - name: Validate publish release
+        if: ${{ inputs.release_mode == 'publish' }}
+        id: publish-state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           TAG_NAME="${{ steps.version.outputs.tag_name }}"
+          RELEASE_BRANCH="release/$TAG_NAME"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG_NAME" >/dev/null 2>&1; then
+            echo "ERROR: Tag $TAG_NAME already exists."
+            exit 1
+          fi
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "ERROR: Release $TAG_NAME already exists."
+            exit 1
+          fi
+
+          RELEASE_COMMIT="$(
+            gh pr list \
+              --state merged \
+              --head "$RELEASE_BRANCH" \
+              --limit 1 \
+              --json mergeCommit \
+              --jq '.[0].mergeCommit.oid // empty'
+          )"
+
+          if [[ -z "$RELEASE_COMMIT" ]]; then
+            echo "ERROR: No merged pull request found for $RELEASE_BRANCH."
+            echo "Run prepare mode and merge its pull request before publishing."
+            exit 1
+          fi
+
+          echo "release_commit=$RELEASE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Publishing merged release commit: $RELEASE_COMMIT"
+
+      - name: Create and push tag
+        if: ${{ inputs.release_mode == 'publish' }}
+        run: |
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
+          RELEASE_COMMIT="${{ steps.publish-state.outputs.release_commit }}"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git tag "$TAG_NAME"
+          git tag "$TAG_NAME" "$RELEASE_COMMIT"
           git push origin "$TAG_NAME"
 
       - name: Create draft GitHub release
-        if: ${{ inputs.release_mode == 'new' }}
+        if: ${{ inputs.release_mode == 'publish' }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -422,6 +507,7 @@ jobs:
 
   build-deb:
     needs: prepare-release
+    if: ${{ inputs.release_mode != 'prepare' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -485,6 +571,7 @@ jobs:
 
   build-arch:
     needs: prepare-release
+    if: ${{ inputs.release_mode != 'prepare' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -575,6 +662,7 @@ jobs:
 
   build-windows:
     needs: prepare-release
+    if: ${{ inputs.release_mode != 'prepare' }}
     runs-on: windows-latest
 
     steps:
@@ -679,6 +767,7 @@ jobs:
       - build-arch
       - build-windows
 
+    if: ${{ inputs.release_mode != 'prepare' }}
     runs-on: ubuntu-latest
 
     steps:
