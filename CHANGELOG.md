@@ -6,6 +6,9 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Fix mouse wheel slice navigation so one wheel notch advances exactly one slice without delayed,
+  swallowed, or duplicate steps.
+
 ## [0.2.0] - 2026-08-22
 
 - Add independently collapsible and resizable DICOM tree and metadata side panels.
