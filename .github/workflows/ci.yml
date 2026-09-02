@@ -45,7 +45,7 @@ jobs:
       - name: Cache CJK font
         uses: actions/cache@v4
         with:
-          path: assets/fonts/SourceHanSans.ttc
+          path: assets/fonts/SourceHanSans-Medium.otf
           key: ${{ runner.os }}-cjkfont-${{ hashFiles('scripts/fetch-fonts.sh') }}
 
       - name: Install build dependencies

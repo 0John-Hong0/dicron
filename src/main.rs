@@ -75,8 +75,8 @@ fn configure_fonts(context: &egui::Context) {
     add_cjk_fallback_font(
         &mut fonts,
         "source_han_sans_cjk",
-        include_bytes!("../assets/fonts/SourceHanSans.ttc"),
-        25,
+        include_bytes!("../assets/fonts/SourceHanSans-Medium.otf"),
+        0,
     );
 
     context.set_fonts(fonts);
