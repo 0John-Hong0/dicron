@@ -8,6 +8,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 - Fix mouse wheel slice navigation so one wheel notch advances exactly one slice without delayed,
   swallowed, or duplicate steps.
+- Reduce the installed size by embedding only the single Source Han Sans face the app uses instead
+  of the full 45-face collection. CJK coverage is unchanged.
 
 ## [0.2.0] - 2026-08-22
 

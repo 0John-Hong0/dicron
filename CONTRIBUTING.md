@@ -12,7 +12,8 @@ Thanks for helping improve Dicron. This is a small native Rust/egui app, so cont
 
 ## Local Setup
 
-Install stable Rust, then fetch the large CJK fallback font when building locally:
+Install stable Rust, then download the CJK fallback font. It is not in Git, and the
+build embeds it, so this is required on every fresh checkout:
 
 ```sh
 ./scripts/fetch-fonts.sh
