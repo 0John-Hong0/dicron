@@ -262,11 +262,14 @@ impl DicronApp {
         self.selected_slice = None;
         self.selected_dicom_frame_index = 0;
         self.selected_dicom_frame_count = 1;
-        self.viewer_scroll_accumulator = 0.0;
+        self.viewer_scroll_slice_remainder = 0.0;
     }
 }
 
-const SCROLL_SLICE_STEP: f32 = 40.0;
+// Fractional deltas that should total one slice can sum to a hair under it, which would
+// otherwise truncate to no step at all.
+const SCROLL_SLICE_EPSILON: f32 = 1.0e-3;
+const MAX_SCROLL_SLICES_PER_FRAME: isize = 8;
 const PAGE_SLICE_STEP: isize = 10;
 
 impl DicronApp {
@@ -289,22 +292,25 @@ impl DicronApp {
             (self.viewport_transform.rotation_quarters + 1) % 4;
     }
 
-    pub(super) fn handle_viewer_scroll(&mut self, context: &egui::Context, ui: &egui::Ui) {
-        let scroll_delta_y = ui.input(|input_state| input_state.smooth_scroll_delta.y);
-
-        if scroll_delta_y == 0.0 {
+    // Deliberately reads raw wheel events instead of `smooth_scroll_delta`: egui low-pass
+    // filters wheel input over roughly 0.18 s, which delays a discrete slice step by the whole
+    // filter tail and makes it depend on where the filtered sum lands against the threshold.
+    pub(super) fn handle_viewer_scroll(
+        &mut self,
+        context: &egui::Context,
+        pointer_over_viewer: bool,
+    ) {
+        if !pointer_over_viewer {
+            self.viewer_scroll_slice_remainder = 0.0;
             return;
         }
 
-        self.viewer_scroll_accumulator += scroll_delta_y;
-        let wheel_steps = (self.viewer_scroll_accumulator / SCROLL_SLICE_STEP).trunc() as isize;
+        let stepped_slices =
+            consume_wheel_slice_steps(context, &mut self.viewer_scroll_slice_remainder);
 
-        if wheel_steps == 0 {
-            return;
+        if stepped_slices != 0 {
+            self.move_selected_slice(context, stepped_slices);
         }
-
-        self.viewer_scroll_accumulator -= wheel_steps as f32 * SCROLL_SLICE_STEP;
-        self.move_selected_slice(context, -wheel_steps);
     }
 
     pub(in crate::app) fn handle_keyboard_shortcuts(&mut self, context: &egui::Context) {
@@ -358,7 +364,7 @@ impl DicronApp {
         }
 
         if jump_to_start {
-            self.viewer_scroll_accumulator = 0.0;
+            self.viewer_scroll_slice_remainder = 0.0;
             self.jump_to_slice(context, 0);
             return;
         }
@@ -367,13 +373,13 @@ impl DicronApp {
             && let Some(slice_count) = self.current_slice_count()
             && slice_count > 0
         {
-            self.viewer_scroll_accumulator = 0.0;
+            self.viewer_scroll_slice_remainder = 0.0;
             self.jump_to_slice(context, slice_count - 1);
             return;
         }
 
         if slice_delta != 0 {
-            self.viewer_scroll_accumulator = 0.0;
+            self.viewer_scroll_slice_remainder = 0.0;
             self.move_selected_slice(context, slice_delta);
         }
     }
@@ -507,6 +513,91 @@ fn consume_window_preset_key(input_state: &mut egui::InputState, preset: WindowP
     });
 
     consumed
+}
+
+/// Drain this frame's plain wheel input into whole slice steps, one notch per
+/// slice. Wheel down advances, so every surface that steps through slices
+/// spends the wheel the same way.
+fn consume_wheel_slice_steps(context: &egui::Context, remainder: &mut f32) -> isize {
+    // Read before `input_mut`: both take the same non-reentrant lock.
+    let (egui_wheel_modifiers, line_scroll_speed) = context.options(|options| {
+        (
+            options.input_options.zoom_modifier | options.input_options.horizontal_scroll_modifier,
+            options.input_options.line_scroll_speed,
+        )
+    });
+    let scrolled_slices = context.input_mut(|input_state| {
+        consume_viewer_wheel_slices(input_state, egui_wheel_modifiers, line_scroll_speed)
+    });
+
+    // Scrolling moves the content, so content moving down reveals the previous slice.
+    -take_whole_slice_steps(remainder, scrolled_slices)
+}
+
+fn consume_viewer_wheel_slices(
+    input_state: &mut egui::InputState,
+    egui_wheel_modifiers: egui::Modifiers,
+    line_scroll_speed: f32,
+) -> f32 {
+    let mut scrolled_slices = 0.0;
+
+    input_state.events.retain(|event| {
+        let egui::Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+            ..
+        } = event
+        else {
+            return true;
+        };
+
+        // Zoom and horizontal-scroll gestures belong to egui's own reading of the wheel.
+        if modifiers.matches_any(egui_wheel_modifiers) {
+            return true;
+        }
+
+        scrolled_slices += scrolled_slices_for_wheel(*unit, delta.y, line_scroll_speed);
+        false
+    });
+
+    scrolled_slices
+}
+
+fn scrolled_slices_for_wheel(
+    unit: egui::MouseWheelUnit,
+    vertical_delta: f32,
+    line_scroll_speed: f32,
+) -> f32 {
+    match unit {
+        egui::MouseWheelUnit::Line => vertical_delta,
+        egui::MouseWheelUnit::Point => vertical_delta / line_scroll_speed,
+        egui::MouseWheelUnit::Page => vertical_delta * PAGE_SLICE_STEP as f32,
+    }
+}
+
+fn take_whole_slice_steps(remainder: &mut f32, scrolled_slices: f32) -> isize {
+    let pending_slices = *remainder + scrolled_slices;
+    let whole_slices = (pending_slices + SCROLL_SLICE_EPSILON.copysign(pending_slices)).trunc();
+
+    if whole_slices == 0.0 {
+        *remainder = pending_slices;
+        return 0;
+    }
+
+    let stepped_slices = whole_slices.clamp(
+        -MAX_SCROLL_SLICES_PER_FRAME as f32,
+        MAX_SCROLL_SLICES_PER_FRAME as f32,
+    );
+
+    // Drop the backlog of a capped fling instead of replaying it over the following frames.
+    *remainder = if stepped_slices == whole_slices {
+        pending_slices - whole_slices
+    } else {
+        0.0
+    };
+
+    stepped_slices as isize
 }
 
 impl DicronApp {
@@ -781,6 +872,89 @@ mod shortcut_tests {
             WindowPreset::FullDynamic
         ));
         assert!(input_state.events.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    const LINE_SCROLL_SPEED: f32 = 40.0;
+
+    fn slices_moved_by(remainder: &mut f32, lines: f32) -> isize {
+        -take_whole_slice_steps(
+            remainder,
+            scrolled_slices_for_wheel(egui::MouseWheelUnit::Line, lines, LINE_SCROLL_SPEED),
+        )
+    }
+
+    #[test]
+    fn each_wheel_unit_converts_to_slices() {
+        let slices = |unit, delta| scrolled_slices_for_wheel(unit, delta, LINE_SCROLL_SPEED);
+
+        assert_eq!(slices(egui::MouseWheelUnit::Line, 1.0), 1.0);
+        assert_eq!(slices(egui::MouseWheelUnit::Point, LINE_SCROLL_SPEED), 1.0);
+        assert_eq!(
+            slices(egui::MouseWheelUnit::Page, 1.0),
+            PAGE_SLICE_STEP as f32
+        );
+    }
+
+    #[test]
+    fn one_wheel_notch_moves_exactly_one_slice() {
+        let mut remainder = 0.0;
+
+        assert_eq!(slices_moved_by(&mut remainder, -1.0), 1);
+        assert_eq!(remainder, 0.0);
+        assert_eq!(slices_moved_by(&mut remainder, 1.0), -1);
+        assert_eq!(remainder, 0.0);
+    }
+
+    #[test]
+    fn high_resolution_wheel_fragments_add_up_to_one_slice() {
+        let mut remainder = 0.0;
+        let moved_slices: isize = (0..15)
+            .map(|_| slices_moved_by(&mut remainder, -1.0 / 15.0))
+            .sum();
+
+        assert_eq!(moved_slices, 1);
+    }
+
+    #[test]
+    fn a_fling_is_capped_and_drops_its_backlog() {
+        let mut remainder = 0.0;
+
+        assert_eq!(
+            slices_moved_by(&mut remainder, -100.0),
+            MAX_SCROLL_SLICES_PER_FRAME
+        );
+        assert_eq!(remainder, 0.0);
+    }
+
+    #[test]
+    fn the_viewer_consumes_plain_wheel_events_but_leaves_egui_gestures() {
+        let mut input_state = egui::InputState::default();
+        input_state.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        input_state.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+
+        let scrolled_slices = consume_viewer_wheel_slices(
+            &mut input_state,
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            LINE_SCROLL_SPEED,
+        );
+
+        assert_eq!(scrolled_slices, -1.0);
+        assert_eq!(input_state.events.len(), 1);
     }
 }
 

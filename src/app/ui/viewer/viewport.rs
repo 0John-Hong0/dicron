@@ -62,11 +62,7 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui) {
         egui::Sense::click_and_drag(),
     );
 
-    if is_pointer_over_viewer {
-        app.handle_viewer_scroll(ui.ctx(), ui);
-    } else {
-        app.viewer_scroll_accumulator = 0.0;
-    }
+    app.handle_viewer_scroll(ui.ctx(), is_pointer_over_viewer);
 
     if app.loaded_texture.is_some() && viewer_response.dragged_by(egui::PointerButton::Primary) {
         app.handle_window_level_drag(ui.ctx(), &viewer_response);
