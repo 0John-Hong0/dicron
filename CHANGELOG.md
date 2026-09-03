@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-03
+
 - Fix mouse wheel slice navigation so one wheel notch advances exactly one slice without delayed,
   swallowed, or duplicate steps.
 - Reduce the installed size by embedding only the single Source Han Sans face the app uses instead
