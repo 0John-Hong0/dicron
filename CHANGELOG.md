@@ -8,6 +8,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 - Remove the second scrollbar that appeared inside the DICOM tree for very long series. Long
   series now scroll with the rest of the tree while still laying out only the visible rows.
+- Pin the Patient, Study, and Series headers of the rows in view to the top of the DICOM tree
+  while scrolling. Clicking a pinned header collapses that node.
 - Speed up initial DICOM scans by skipping unused header decoding and using larger buffered reads
   to reduce read overhead.
 
