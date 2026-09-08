@@ -8,7 +8,8 @@ Dicron is a native desktop viewer for quickly opening local DICOM files and fold
 
 - Open individual DICOM files or scan folders recursively.
 - Drag and drop DICOM files or folders onto the viewer.
-- Browse indexed studies in a Patient / Study / Series / Slice tree.
+- Browse indexed studies as compact series cards with fixed middle-slice thumbnails, or switch to
+  the full Patient / Study / Series / Slice filename tree.
 - View single-frame and multi-frame DICOM images.
 - Step through slices with the keyboard, mouse wheel, or viewer scrollbar.
 - Autoplay image stacks with adjustable FPS and loop mode.
@@ -29,6 +30,9 @@ On Linux, Dicron currently uses X11/XWayland.
 ## Usage
 
 Open Dicron and choose **Open DICOM** or **Open Folder**, or drag files and folders directly onto the window.
+
+In the **DICOM Tree**, use **Series previews** for one fixed thumbnail, description, modality, and
+slice count per series. Choose **File list** when you need the individual filenames.
 
 You can also open one or more paths when launching Dicron from a terminal:
 

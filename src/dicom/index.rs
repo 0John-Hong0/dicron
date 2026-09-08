@@ -29,6 +29,7 @@ pub(in crate::dicom) struct DicomIndexMetadata {
     series_instance_uid: Option<String>,
     series_description: Option<String>,
     series_number: Option<i32>,
+    modality: Option<String>,
     instance_number: Option<i32>,
     image_position_patient: Option<[f64; 3]>,
     image_orientation_patient: Option<[f64; 6]>,
@@ -53,6 +54,7 @@ impl DicomIndexMetadata {
                 | tags::SERIES_INSTANCE_UID
                 | tags::SERIES_DESCRIPTION
                 | tags::SERIES_NUMBER
+                | tags::MODALITY
                 | tags::INSTANCE_NUMBER
                 | tags::IMAGE_POSITION_PATIENT
                 | tags::IMAGE_ORIENTATION_PATIENT
@@ -76,6 +78,7 @@ impl DicomIndexMetadata {
             tags::SERIES_INSTANCE_UID => self.series_instance_uid = text_value(value),
             tags::SERIES_DESCRIPTION => self.series_description = text_value(value),
             tags::SERIES_NUMBER => self.series_number = first_parsed_value(value),
+            tags::MODALITY => self.modality = text_value(value),
             tags::INSTANCE_NUMBER => self.instance_number = first_parsed_value(value),
             tags::IMAGE_POSITION_PATIENT => self.image_position_patient = parsed_array_value(value),
             tags::IMAGE_ORIENTATION_PATIENT => {
@@ -109,11 +112,20 @@ pub(in crate::dicom) struct DicomIndexEntry {
     study_time: Option<String>,
     series_key: String,
     series_display_name: String,
+    series_description: Option<String>,
     series_number: Option<i32>,
+    modality: Option<String>,
     file_path: std::path::PathBuf,
     instance_number: Option<i32>,
     sort_position: Option<f64>,
     number_of_frames: u32,
+}
+
+struct SeriesDisplayMetadata {
+    display_name: String,
+    description: Option<String>,
+    number: Option<i32>,
+    modality: Option<String>,
 }
 
 impl DicomIndexEntry {
@@ -136,6 +148,7 @@ impl DicomIndexEntry {
             series_instance_uid,
             series_description,
             series_number,
+            modality,
             instance_number,
             image_position_patient,
             image_orientation_patient,
@@ -181,7 +194,9 @@ impl DicomIndexEntry {
             study_time,
             series_key,
             series_display_name,
+            series_description,
             series_number,
+            modality,
             file_path: file_path.to_path_buf(),
             instance_number,
             sort_position,
@@ -201,7 +216,9 @@ impl DicomIndexBuilder {
             study_time,
             series_key,
             series_display_name,
+            series_description,
             series_number,
+            modality,
             file_path,
             instance_number,
             sort_position,
@@ -219,8 +236,12 @@ impl DicomIndexBuilder {
             patient_index,
             study_index,
             series_key,
-            series_display_name,
-            series_number,
+            SeriesDisplayMetadata {
+                display_name: series_display_name,
+                description: series_description,
+                number: series_number,
+                modality,
+            },
         );
 
         for frame_index in 0..number_of_frames {
@@ -292,8 +313,7 @@ impl DicomIndexBuilder {
         patient_index: usize,
         study_index: usize,
         series_key: String,
-        display_name: String,
-        series_number: Option<i32>,
+        series_metadata: SeriesDisplayMetadata,
     ) -> usize {
         match self
             .series_indices
@@ -301,13 +321,21 @@ impl DicomIndexBuilder {
         {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => {
+                let SeriesDisplayMetadata {
+                    display_name,
+                    description,
+                    number,
+                    modality,
+                } = series_metadata;
                 let series_groups =
                     &mut self.patients[patient_index].studies[study_index].series_groups;
                 let index = series_groups.len();
                 entry.insert(index);
                 series_groups.push(SeriesGroup {
                     display_name,
-                    series_number,
+                    series_description: description,
+                    series_number: number,
+                    modality,
                     slices: Vec::new(),
                 });
                 index

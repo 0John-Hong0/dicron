@@ -25,7 +25,9 @@ pub(crate) struct StudyGroup {
 #[derive(Clone)]
 pub(crate) struct SeriesGroup {
     pub(crate) display_name: String,
+    pub(crate) series_description: Option<String>,
     pub(crate) series_number: Option<i32>,
+    pub(crate) modality: Option<String>,
     pub(crate) slices: Vec<SliceItem>,
 }
 

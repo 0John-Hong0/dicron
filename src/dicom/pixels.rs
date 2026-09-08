@@ -143,6 +143,41 @@ pub(crate) fn load_dicom_frame(dicom_path: &Path, frame_index: u32) -> Result<Lo
     Ok(LoadedFrame { frame, metadata })
 }
 
+pub(crate) fn load_dicom_thumbnail(
+    dicom_path: &Path,
+    frame_index: u32,
+    max_edge: u32,
+) -> Result<DisplayPixels> {
+    let dicom_object = open_dicom_file(dicom_path)
+        .with_context(|| format!("could not open DICOM file {}", dicom_path.display()))?;
+    let decoded = dicom_object
+        .decode_pixel_data_frame(frame_index)
+        .with_context(|| {
+            format!(
+                "could not decode DICOM pixel data frame {}",
+                frame_index + 1
+            )
+        })?;
+    let dynamic_image = render_decoded_frame(&decoded, None)?;
+    let (width, height) = thumbnail_dimensions(
+        dynamic_image.width(),
+        dynamic_image.height(),
+        max_edge.max(1),
+    );
+    let dynamic_image = if (width, height) == (dynamic_image.width(), dynamic_image.height()) {
+        dynamic_image
+    } else {
+        dynamic_image.resize_exact(width, height, image::imageops::FilterType::Triangle)
+    };
+    let rgba = dynamic_image.to_rgba8();
+
+    Ok(DisplayPixels {
+        width: rgba.width() as usize,
+        height: rgba.height() as usize,
+        rgba: rgba.into_raw(),
+    })
+}
+
 fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<DecodedFrame> {
     let decoded = dicom_object
         .decode_pixel_data_frame(frame_index)
@@ -200,6 +235,20 @@ pub(crate) fn render_frame(
     frame: &DecodedFrame,
     window: Option<DicomWindow>,
 ) -> Result<DisplayPixels> {
+    let dynamic_image = render_decoded_frame(&frame.decoded, window)?;
+    let rgba = dynamic_image.to_rgba8();
+
+    Ok(DisplayPixels {
+        width: rgba.width() as usize,
+        height: rgba.height() as usize,
+        rgba: rgba.into_raw(),
+    })
+}
+
+fn render_decoded_frame(
+    decoded: &DecodedPixelData<'_>,
+    window: Option<DicomWindow>,
+) -> Result<image::DynamicImage> {
     let voi_lut = match window {
         Some(window) if window.center.is_finite() && window.width.is_finite() => {
             VoiLutOption::Custom(WindowLevel {
@@ -212,18 +261,23 @@ pub(crate) fn render_frame(
 
     let convert_options = ConvertOptions::new().with_voi_lut(voi_lut).force_8bit();
 
-    let dynamic_image = frame
-        .decoded
+    decoded
         .to_dynamic_image_with_options(0, &convert_options)
-        .context("could not convert DICOM pixel data to image")?;
+        .context("could not convert DICOM pixel data to image")
+}
 
-    let rgba = dynamic_image.to_rgba8();
+fn thumbnail_dimensions(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
+    if width <= max_edge && height <= max_edge {
+        return (width, height);
+    }
 
-    Ok(DisplayPixels {
-        width: rgba.width() as usize,
-        height: rgba.height() as usize,
-        rgba: rgba.into_raw(),
-    })
+    if width >= height {
+        let scaled_height = (u64::from(height) * u64::from(max_edge) / u64::from(width)) as u32;
+        (max_edge, scaled_height.max(1))
+    } else {
+        let scaled_width = (u64::from(width) * u64::from(max_edge) / u64::from(height)) as u32;
+        (scaled_width.max(1), max_edge)
+    }
 }
 
 fn read_default_window(dicom_object: &DefaultDicomObject) -> Option<DicomWindow> {
@@ -299,8 +353,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::finite_value_range;
+    use super::{finite_value_range, thumbnail_dimensions};
     use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
+
+    #[test]
+    fn thumbnail_dimensions_fit_landscape_images_within_the_bound() {
+        assert_eq!(thumbnail_dimensions(400, 200, 192), (192, 96));
+    }
+
+    #[test]
+    fn thumbnail_dimensions_fit_portrait_images_within_the_bound() {
+        assert_eq!(thumbnail_dimensions(200, 400, 192), (96, 192));
+    }
+
+    #[test]
+    fn thumbnail_dimensions_do_not_enlarge_small_images() {
+        assert_eq!(thumbnail_dimensions(64, 48, 192), (64, 48));
+    }
 
     #[test]
     fn finite_value_range_ignores_non_finite_values() {

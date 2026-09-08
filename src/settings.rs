@@ -7,11 +7,36 @@ use eframe::egui::ThemePreference;
 const SETTINGS_FILE_NAME: &str = "settings.txt";
 const LEGACY_SETTINGS_FILE_NAME: &str = "dialog-dirs.txt";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DicomTreeViewMode {
+    SeriesPreviews,
+    FileList,
+}
+
+impl DicomTreeViewMode {
+    fn from_setting(value: &str) -> Option<Self> {
+        match value.trim() {
+            "series_previews" => Some(Self::SeriesPreviews),
+            "file_list" => Some(Self::FileList),
+            _ => None,
+        }
+    }
+
+    const fn setting_value(self) -> &'static str {
+        match self {
+            Self::SeriesPreviews => "series_previews",
+            Self::FileList => "file_list",
+        }
+    }
+}
+
 pub(crate) struct AppSettings {
     pub(crate) open_dicom_directory: Option<PathBuf>,
     pub(crate) open_folder_directory: Option<PathBuf>,
     /// Whether newly loaded Patient/Study/Series nodes start expanded.
     pub(crate) expand_tree_by_default: bool,
+    /// Which DICOM tree presentation is shown.
+    pub(crate) dicom_tree_view_mode: DicomTreeViewMode,
     /// Whether Dicron checks GitHub for a newer release when it starts.
     pub(crate) check_for_updates_on_startup: bool,
     /// Which application theme Dicron follows.
@@ -24,6 +49,7 @@ impl Default for AppSettings {
             open_dicom_directory: None,
             open_folder_directory: None,
             expand_tree_by_default: true,
+            dicom_tree_view_mode: DicomTreeViewMode::SeriesPreviews,
             check_for_updates_on_startup: true,
             theme_preference: ThemePreference::System,
         }
@@ -71,6 +97,11 @@ impl AppSettings {
                 "expand_tree_by_default" => {
                     settings.expand_tree_by_default = value.trim() != "false";
                 }
+                "dicom_tree_view_mode" => {
+                    if let Some(view_mode) = DicomTreeViewMode::from_setting(value) {
+                        settings.dicom_tree_view_mode = view_mode;
+                    }
+                }
                 "check_for_updates_on_startup" => {
                     settings.check_for_updates_on_startup = value.trim() != "false";
                 }
@@ -88,6 +119,11 @@ impl AppSettings {
 
     pub(crate) fn set_expand_tree_by_default(&mut self, expand_tree_by_default: bool) {
         self.expand_tree_by_default = expand_tree_by_default;
+        self.save();
+    }
+
+    pub(crate) fn set_dicom_tree_view_mode(&mut self, view_mode: DicomTreeViewMode) {
+        self.dicom_tree_view_mode = view_mode;
         self.save();
     }
 
@@ -151,6 +187,10 @@ impl AppSettings {
         } else {
             "false"
         });
+        settings_text.push('\n');
+
+        settings_text.push_str("dicom_tree_view_mode=");
+        settings_text.push_str(self.dicom_tree_view_mode.setting_value());
         settings_text.push('\n');
 
         settings_text.push_str("check_for_updates_on_startup=");
@@ -297,6 +337,37 @@ mod tests {
 
         assert_eq!(missing_setting.theme_preference, ThemePreference::System);
         assert_eq!(unknown_setting.theme_preference, ThemePreference::System);
+    }
+
+    #[test]
+    fn dicom_tree_view_modes_round_trip_through_settings_text() {
+        for dicom_tree_view_mode in [
+            DicomTreeViewMode::SeriesPreviews,
+            DicomTreeViewMode::FileList,
+        ] {
+            let settings = AppSettings {
+                dicom_tree_view_mode,
+                ..Default::default()
+            };
+            let loaded_settings = AppSettings::from_text(&settings.to_text());
+
+            assert_eq!(loaded_settings.dicom_tree_view_mode, dicom_tree_view_mode);
+        }
+    }
+
+    #[test]
+    fn missing_or_unknown_dicom_tree_view_mode_uses_series_previews() {
+        let missing_setting = AppSettings::from_text("expand_tree_by_default=false\n");
+        let unknown_setting = AppSettings::from_text("dicom_tree_view_mode=contact_sheet\n");
+
+        assert_eq!(
+            missing_setting.dicom_tree_view_mode,
+            DicomTreeViewMode::SeriesPreviews
+        );
+        assert_eq!(
+            unknown_setting.dicom_tree_view_mode,
+            DicomTreeViewMode::SeriesPreviews
+        );
     }
 
     #[test]

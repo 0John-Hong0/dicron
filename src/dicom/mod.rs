@@ -9,7 +9,8 @@ mod scan;
 pub(crate) use metadata::{DicomMetadata, DicomOverlayMetadata, MetadataItem};
 pub(crate) use model::{DicomIndex, PatientGroup, SliceItem, StudyGroup};
 pub(crate) use pixels::{
-    DecodedFrame, DicomWindow, DisplayPixels, PixelProbeValue, load_dicom_frame, render_frame,
+    DecodedFrame, DicomWindow, DisplayPixels, PixelProbeValue, load_dicom_frame,
+    load_dicom_thumbnail, render_frame,
 };
 pub(crate) use scan::{
     BuildProgress, build_for_file, build_for_inputs_with_progress, build_from_folder_with_progress,

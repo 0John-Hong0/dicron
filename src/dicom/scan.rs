@@ -573,6 +573,11 @@ mod tests {
                 PrimitiveValue::from("MONOCHROME2"),
             ));
             object.put_element(DataElement::new(
+                tags::MODALITY,
+                VR::CS,
+                PrimitiveValue::from("CT"),
+            ));
+            object.put_element(DataElement::new(
                 tags::PIXEL_DATA,
                 VR::OB,
                 PrimitiveValue::from(vec![0_u8]),
@@ -590,6 +595,12 @@ mod tests {
         let index = build_for_file(&path).unwrap();
 
         assert_eq!(index.total_file_count, 1);
+        assert_eq!(
+            index.patients[0].studies[0].series_groups[0]
+                .modality
+                .as_deref(),
+            Some("CT")
+        );
         assert_eq!(
             index.patients[0].studies[0].series_groups[0].slices.len(),
             1
@@ -648,6 +659,8 @@ mod tests {
         assert_eq!(patient.display_name, "Doe^Jane (patient-7)");
         assert_eq!(study.display_name, "20260820 101112 - Head");
         assert_eq!(series.display_name, "Series 7 - Axial");
+        assert_eq!(series.series_description.as_deref(), Some("Axial"));
+        assert_eq!(series.series_number, Some(7));
         assert_eq!(series.slices.len(), 2);
         assert_eq!(series.slices[0].instance_number, Some(12));
         assert_eq!(series.slices[0].sort_position, Some(5.0));

@@ -5,8 +5,10 @@ use std::hash::Hash;
 use eframe::egui;
 
 use crate::app::DicronApp;
+use crate::app::series_thumbnail_cache::SeriesThumbnailCache;
 use crate::app::state::{SeriesKey, SliceSelection};
 use crate::dicom::{PatientGroup, SliceItem, StudyGroup};
+use crate::settings::DicomTreeViewMode;
 use crate::theme;
 
 // Large subtrees start collapsed, and every series lays out only the slice rows that intersect
@@ -14,11 +16,16 @@ use crate::theme;
 // expensive.
 const SERIES_AUTO_COLLAPSE_SLICE_COUNT: usize = 200;
 const TREE_AUTO_COLLAPSE_SLICE_COUNT: usize = 1000;
+// The preview view draws one card per series regardless of how many slices those series hold, so
+// its auto-collapse threshold counts cards rather than slices.
+const TREE_AUTO_COLLAPSE_CARD_COUNT: usize = 100;
 const TREE_ROW_GAP: f32 = theme::SPACE_XXS;
 const PATIENT_ROW_HEIGHT: f32 = 26.0;
 const STUDY_ROW_HEIGHT: f32 = 24.0;
 const SERIES_ROW_HEIGHT: f32 = 24.0;
 const INSTANCE_ROW_HEIGHT: f32 = 20.0;
+const SERIES_PREVIEW_HEIGHT: f32 = 88.0;
+const SERIES_PREVIEW_INSET: f32 = theme::SPACE_SM;
 // Tallest possible stack of sticky headers: one header per level plus the gaps between them.
 const STICKY_STACK_MAX_HEIGHT: f32 =
     PATIENT_ROW_HEIGHT + STUDY_ROW_HEIGHT + SERIES_ROW_HEIGHT + 3.0 * TREE_ROW_GAP;
@@ -45,8 +52,14 @@ impl TreeNodeLevel {
 
 impl DicronApp {
     pub(in crate::app) fn show_dicom_tree(&mut self, ui: &mut egui::Ui) {
+        self.series_thumbnails.poll(ui.ctx());
+
         let expand_all = self.settings.expand_tree_by_default;
+        let view_mode = self.settings.dicom_tree_view_mode;
         let tree_generation = self.tree_view_generation;
+        let selected_indices = self.selected_indices();
+        let last_slice_by_series = &self.last_slice_by_series;
+        let series_thumbnails = &mut self.series_thumbnails;
 
         let Some(dicom_index) = &self.dicom_index else {
             if self.scan.is_active() {
@@ -61,7 +74,6 @@ impl DicronApp {
         ui.label(format!("{} DICOM files", dicom_index.total_file_count));
         ui.separator();
 
-        let selected_indices = self.selected_indices();
         let mut clicked_selection = None;
 
         let mut sticky_candidates = Vec::new();
@@ -73,12 +85,18 @@ impl DicronApp {
                 ui.push_id(tree_generation, |ui| {
                     for (patient_index, patient) in dicom_index.patients.iter().enumerate() {
                         let patient_slice_count = patient_total_slice_count(patient);
+                        let patient_series_count = patient_total_series_count(patient);
 
                         show_tree_node(
                             ui,
                             ("patient", patient_index),
                             patient.display_name.as_str(),
-                            expand_all || patient_slice_count < TREE_AUTO_COLLAPSE_SLICE_COUNT,
+                            expand_all
+                                || tree_node_default_open(
+                                    view_mode,
+                                    patient_slice_count,
+                                    patient_series_count,
+                                ),
                             TreeNodeLevel::Patient,
                             &mut sticky_candidates,
                             |ui, sticky_candidates| {
@@ -90,47 +108,73 @@ impl DicronApp {
                                         ("study", patient_index, study_index),
                                         study.display_name.as_str(),
                                         expand_all
-                                            || study_slice_count < TREE_AUTO_COLLAPSE_SLICE_COUNT,
+                                            || tree_node_default_open(
+                                                view_mode,
+                                                study_slice_count,
+                                                study.series_groups.len(),
+                                            ),
                                         TreeNodeLevel::Study,
                                         sticky_candidates,
                                         |ui, sticky_candidates| {
                                             for (series_index, series) in
                                                 study.series_groups.iter().enumerate()
                                             {
-                                                let series_label = format!(
-                                                    "{} ({} slices)",
-                                                    series.display_name,
-                                                    series.slices.len()
+                                                let series_key = (
+                                                    patient_index,
+                                                    study_index,
+                                                    series_index,
                                                 );
 
-                                                show_tree_node(
-                                                    ui,
-                                                    (
-                                                        "series",
-                                                        patient_index,
-                                                        study_index,
-                                                        series_index,
-                                                    ),
-                                                    &series_label,
-                                                    expand_all
-                                                        || series.slices.len()
-                                                            < SERIES_AUTO_COLLAPSE_SLICE_COUNT,
-                                                    TreeNodeLevel::Series,
-                                                    sticky_candidates,
-                                                    |ui, _| {
-                                                        show_series_slices(
+                                                match view_mode {
+                                                    DicomTreeViewMode::SeriesPreviews => {
+                                                        show_series_preview(
                                                             ui,
+                                                            series.series_description.as_deref(),
+                                                            series.series_number,
+                                                            series.modality.as_deref(),
                                                             &series.slices,
+                                                            series_key,
+                                                            selected_indices,
+                                                            last_slice_by_series
+                                                                .get(&series_key)
+                                                                .copied(),
+                                                            series_thumbnails,
+                                                            &mut clicked_selection,
+                                                        );
+                                                    }
+                                                    DicomTreeViewMode::FileList => {
+                                                        let series_label = format!(
+                                                            "{} ({} slices)",
+                                                            series.display_name,
+                                                            series.slices.len()
+                                                        );
+
+                                                        show_tree_node(
+                                                            ui,
                                                             (
+                                                                "series",
                                                                 patient_index,
                                                                 study_index,
                                                                 series_index,
                                                             ),
-                                                            selected_indices,
-                                                            &mut clicked_selection,
+                                                            &series_label,
+                                                            expand_all
+                                                                || series.slices.len()
+                                                                    < SERIES_AUTO_COLLAPSE_SLICE_COUNT,
+                                                            TreeNodeLevel::Series,
+                                                            sticky_candidates,
+                                                            |ui, _| {
+                                                                show_series_slices(
+                                                                    ui,
+                                                                    &series.slices,
+                                                                    series_key,
+                                                                    selected_indices,
+                                                                    &mut clicked_selection,
+                                                                );
+                                                            },
                                                         );
-                                                    },
-                                                );
+                                                    }
+                                                }
                                             }
                                         },
                                     );
@@ -174,6 +218,185 @@ impl DicronApp {
             );
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_series_preview(
+    ui: &mut egui::Ui,
+    series_description: Option<&str>,
+    series_number: Option<i32>,
+    modality: Option<&str>,
+    slices: &[SliceItem],
+    series_key: SeriesKey,
+    selected_selection: Option<SliceSelection>,
+    last_slice_index: Option<usize>,
+    thumbnails: &mut SeriesThumbnailCache,
+    clicked_selection: &mut Option<SliceSelection>,
+) {
+    if slices.is_empty() {
+        return;
+    }
+
+    let selected_slice_index = selected_selection
+        .filter(|selection| selection.series_key() == series_key)
+        .map(|selection| selection.slice_index);
+    let is_selected = selected_slice_index.is_some();
+    let open_slice_index =
+        series_open_slice_index(selected_slice_index, last_slice_index, slices.len());
+    let selection = SliceSelection::new(series_key.0, series_key.1, series_key.2, open_slice_index);
+    let series_title = series_title_text(modality, series_description);
+    let series_number = series_number_text(series_number);
+    let slice_count = slice_count_text(slices.len());
+
+    let card_size = egui::vec2(ui.available_width(), SERIES_PREVIEW_HEIGHT);
+    let (card_rect, mut response) = ui.allocate_exact_size(card_size, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            is_selected,
+            &series_title,
+        )
+    });
+
+    if ui.is_rect_visible(card_rect) {
+        thumbnails.request(ui.ctx(), series_key, slices);
+
+        let visuals = ui.visuals();
+        let card_fill = if is_selected {
+            visuals
+                .selection
+                .bg_fill
+                .lerp_to_gamma(visuals.panel_fill, 0.55)
+        } else if response.hovered() {
+            visuals.widgets.hovered.weak_bg_fill
+        } else {
+            visuals.faint_bg_color
+        };
+        ui.painter()
+            .rect_filled(card_rect, theme::SPACE_XS, card_fill);
+
+        let content_rect = card_rect.shrink(SERIES_PREVIEW_INSET);
+        let thumbnail_size = content_rect.height();
+        let thumbnail_rect =
+            egui::Rect::from_min_size(content_rect.min, egui::vec2(thumbnail_size, thumbnail_size));
+        ui.painter()
+            .rect_filled(thumbnail_rect, theme::SPACE_XXS, egui::Color32::BLACK);
+
+        if let Some(texture) = thumbnails.texture(series_key) {
+            let image_rect = fit_texture_inside(texture.size_vec2(), thumbnail_rect);
+            ui.painter().image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            let status = if thumbnails.failed(series_key) {
+                "No preview"
+            } else {
+                "Loading…"
+            };
+            ui.painter().text(
+                thumbnail_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                status,
+                egui::TextStyle::Small.resolve(ui.style()),
+                visuals.weak_text_color(),
+            );
+        }
+
+        let details_left = thumbnail_rect.right() + theme::SPACE_MD;
+        let details_right = content_rect.right();
+        let details_width = (details_right - details_left).max(0.0);
+        let title_rect = egui::Rect::from_min_size(
+            egui::pos2(details_left, content_rect.top() + theme::SPACE_XS),
+            egui::vec2(details_width, 18.0),
+        );
+        let title_was_elided = paint_truncated_text(
+            ui,
+            title_rect,
+            details_left,
+            egui::RichText::new(&series_title).strong(),
+            egui::TextStyle::Button,
+            visuals.strong_text_color(),
+        );
+
+        let number_rect = title_rect.translate(egui::vec2(0.0, 22.0));
+        paint_truncated_text(
+            ui,
+            number_rect,
+            details_left,
+            egui::RichText::new(&series_number).color(visuals.text_color()),
+            egui::TextStyle::Body,
+            visuals.text_color(),
+        );
+
+        let slice_count_rect = title_rect.translate(egui::vec2(0.0, 44.0));
+        paint_truncated_text(
+            ui,
+            slice_count_rect,
+            details_left,
+            egui::RichText::new(&slice_count).color(visuals.text_color()),
+            egui::TextStyle::Body,
+            visuals.text_color(),
+        );
+
+        if title_was_elided {
+            response = response.on_hover_text(&series_title);
+        }
+    }
+
+    response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.clicked() {
+        *clicked_selection = Some(selection);
+    }
+}
+
+fn fit_texture_inside(texture_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
+    if texture_size.x <= 0.0 || texture_size.y <= 0.0 {
+        return bounds;
+    }
+
+    let scale = (bounds.width() / texture_size.x)
+        .min(bounds.height() / texture_size.y)
+        .max(0.0);
+    egui::Rect::from_center_size(bounds.center(), texture_size * scale)
+}
+
+fn slice_count_label(slice_count: usize) -> &'static str {
+    if slice_count == 1 { "slice" } else { "slices" }
+}
+
+fn series_title_text(modality: Option<&str>, description: Option<&str>) -> String {
+    let description = description
+        .filter(|description| !description.is_empty())
+        .unwrap_or("Unknown Series");
+    match modality.filter(|modality| !modality.is_empty()) {
+        Some(modality) => format!("{modality} - {description}"),
+        None => description.to_owned(),
+    }
+}
+
+fn series_number_text(series_number: Option<i32>) -> String {
+    series_number
+        .map(|number| format!("Series {number}"))
+        .unwrap_or_else(|| "Series number unavailable".to_owned())
+}
+
+fn slice_count_text(slice_count: usize) -> String {
+    format!("{slice_count} {}", slice_count_label(slice_count))
+}
+
+fn series_open_slice_index(
+    selected_slice_index: Option<usize>,
+    last_slice_index: Option<usize>,
+    slice_count: usize,
+) -> usize {
+    selected_slice_index
+        .or(last_slice_index)
+        .filter(|slice_index| *slice_index < slice_count)
+        .unwrap_or(0)
 }
 
 fn show_tree_node(
@@ -625,6 +848,39 @@ fn study_total_slice_count(study: &StudyGroup) -> usize {
         .sum()
 }
 
+fn patient_total_series_count(patient: &PatientGroup) -> usize {
+    patient
+        .studies
+        .iter()
+        .map(|study| study.series_groups.len())
+        .sum()
+}
+
+/// Whether a node opens on its own. Auto-collapse exists to bound layout cost, so it measures what
+/// the active view actually draws: one row per slice in the file list, one card per series in the
+/// preview view.
+fn tree_node_default_open(
+    view_mode: DicomTreeViewMode,
+    slice_count: usize,
+    series_count: usize,
+) -> bool {
+    match view_mode {
+        DicomTreeViewMode::SeriesPreviews => series_count < TREE_AUTO_COLLAPSE_CARD_COUNT,
+        DicomTreeViewMode::FileList => slice_count < TREE_AUTO_COLLAPSE_SLICE_COUNT,
+    }
+}
+
+pub(super) fn auto_collapse_help_text(view_mode: DicomTreeViewMode) -> String {
+    match view_mode {
+        DicomTreeViewMode::SeriesPreviews => format!(
+            "Off: patients or studies with {TREE_AUTO_COLLAPSE_CARD_COUNT}+ series start collapsed for performance."
+        ),
+        DicomTreeViewMode::FileList => format!(
+            "Off: patients or studies with {TREE_AUTO_COLLAPSE_SLICE_COUNT}+ slices, and series with {SERIES_AUTO_COLLAPSE_SLICE_COUNT}+ slices, start collapsed for performance."
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +889,65 @@ mod tests {
 
     fn range(min: f32, max: f32) -> egui::Rangef {
         egui::Rangef::new(min, max)
+    }
+
+    #[test]
+    fn series_cards_open_at_start_then_resume_the_last_slice() {
+        assert_eq!(series_open_slice_index(None, None, 50), 0);
+        assert_eq!(series_open_slice_index(None, Some(17), 50), 17);
+        assert_eq!(series_open_slice_index(Some(23), Some(17), 50), 23);
+        assert_eq!(series_open_slice_index(None, Some(50), 50), 0);
+    }
+
+    #[test]
+    fn series_details_are_split_into_title_number_and_count() {
+        assert_eq!(
+            series_title_text(Some("CT"), Some("CTA HEAD")),
+            "CT - CTA HEAD"
+        );
+        assert_eq!(series_number_text(Some(12)), "Series 12");
+        assert_eq!(slice_count_text(80), "80 slices");
+        assert_eq!(series_title_text(None, None), "Unknown Series");
+        assert_eq!(series_number_text(None), "Series number unavailable");
+    }
+
+    #[test]
+    fn auto_collapse_counts_what_each_view_draws() {
+        // One 1200-slice study is a handful of cards in the preview view but 1200 rows in the
+        // file list, so only the file list collapses it.
+        assert!(tree_node_default_open(
+            DicomTreeViewMode::SeriesPreviews,
+            1_200,
+            3
+        ));
+        assert!(!tree_node_default_open(
+            DicomTreeViewMode::FileList,
+            1_200,
+            3
+        ));
+
+        // A study with more cards than the preview threshold collapses in the preview view even
+        // though its slices are few.
+        assert!(!tree_node_default_open(
+            DicomTreeViewMode::SeriesPreviews,
+            300,
+            TREE_AUTO_COLLAPSE_CARD_COUNT,
+        ));
+        assert!(tree_node_default_open(
+            DicomTreeViewMode::FileList,
+            300,
+            TREE_AUTO_COLLAPSE_CARD_COUNT,
+        ));
+    }
+
+    #[test]
+    fn auto_collapse_help_matches_the_active_view_thresholds() {
+        let previews = auto_collapse_help_text(DicomTreeViewMode::SeriesPreviews);
+        let file_list = auto_collapse_help_text(DicomTreeViewMode::FileList);
+
+        assert!(previews.contains("100+ series"), "{previews}");
+        assert!(file_list.contains("1000+ slices"), "{file_list}");
+        assert!(file_list.contains("200+ slices"), "{file_list}");
     }
 
     #[test]
@@ -901,6 +1216,140 @@ mod tests {
             0.0,
         ] {
             let output = show_scrolled_list(scroll_offset);
+
+            assert_eq!(
+                id_change_warning_count(&output.shapes),
+                0,
+                "scroll offset {scroll_offset}"
+            );
+        }
+    }
+
+    /// Every text drawn this frame, with the rect it occupies, outermost shapes first.
+    fn painted_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn collect(shape: &egui::Shape, texts: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    texts.push((
+                        text.galley.text().to_owned(),
+                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    ));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut texts = Vec::new();
+        for clipped in shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn show_single_card(
+        context: &egui::Context,
+        slices: &[SliceItem],
+        selected: Option<SliceSelection>,
+    ) -> Vec<(String, egui::Rect)> {
+        let mut thumbnails = SeriesThumbnailCache::default();
+        let output = run_frame(context, |ui| {
+            let mut clicked_selection = None;
+            show_series_preview(
+                ui,
+                Some("CTA HEAD"),
+                Some(4),
+                Some("CT"),
+                slices,
+                (0, 0, 0),
+                selected,
+                None,
+                &mut thumbnails,
+                &mut clicked_selection,
+            );
+        });
+
+        painted_texts(&output.shapes)
+    }
+
+    #[test]
+    fn a_series_card_names_the_series_above_its_summary() {
+        let context = egui::Context::default();
+        let slices = test_slices(394);
+
+        let texts = show_single_card(&context, &slices, None);
+        let line_of = |needle: &str| {
+            texts
+                .iter()
+                .find(|(text, _)| text.starts_with(needle))
+                .unwrap_or_else(|| panic!("no line starting with {needle:?} in {texts:?}"))
+                .1
+        };
+        let title = line_of("CT - CTA HEAD");
+        let number = line_of("Series 4");
+        let count = line_of("394 slices");
+
+        assert!(
+            texts.iter().any(|(text, _)| text == "394 slices"),
+            "{texts:?}"
+        );
+        assert!(title.bottom() <= number.top(), "{title:?} {number:?}");
+        assert!(number.bottom() <= count.top(), "{number:?} {count:?}");
+        assert!(
+            count.bottom() - title.top() <= SERIES_PREVIEW_HEIGHT,
+            "{title:?} {count:?}"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn scrolling_series_preview_cards_keeps_widget_ids_stable() {
+        let slices = test_slices(40);
+        let context = egui::Context::default();
+        // Every card allocates whether or not it is on screen, so the thumbnail requests of the
+        // visible ones are the only side effect; their files do not exist and fail immediately.
+        let mut thumbnails = SeriesThumbnailCache::default();
+        let show_scrolled_cards = |thumbnails: &mut SeriesThumbnailCache, scroll_offset: f32| {
+            run_frame(&context, |ui| {
+                ui.spacing_mut().item_spacing.y = TREE_ROW_GAP;
+                egui::ScrollArea::vertical()
+                    .vertical_scroll_offset(scroll_offset)
+                    .show(ui, |ui| {
+                        let mut clicked_selection = None;
+                        for series_index in 0..30 {
+                            show_series_preview(
+                                ui,
+                                Some("CTA HEAD"),
+                                Some(1),
+                                Some("CT"),
+                                &slices,
+                                (0, 0, series_index),
+                                None,
+                                None,
+                                thumbnails,
+                                &mut clicked_selection,
+                            );
+                        }
+                    });
+            })
+        };
+
+        show_scrolled_cards(&mut thumbnails, 0.0);
+
+        let card_stride = SERIES_PREVIEW_HEIGHT + TREE_ROW_GAP;
+        for scroll_offset in [
+            card_stride,
+            3.0 * card_stride,
+            3.0 * card_stride + 7.0,
+            9.0 * card_stride,
+            card_stride,
+            0.0,
+        ] {
+            let output = show_scrolled_cards(&mut thumbnails, scroll_offset);
 
             assert_eq!(
                 id_change_warning_count(&output.shapes),
