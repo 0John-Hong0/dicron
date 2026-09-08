@@ -12,6 +12,7 @@ use crate::settings::AppSettings;
 
 use super::background_tasks::{ReleaseCheckJob, ScanController};
 use super::frame_cache::DecodedCache;
+use super::series_thumbnail_cache::SeriesThumbnailCache;
 
 pub(super) type SeriesKey = (usize, usize, usize);
 
@@ -310,6 +311,7 @@ pub(crate) struct DicronApp {
     pub(super) selected_dicom_frame_count: u32,
     pub(super) loaded_texture: Option<egui::TextureHandle>,
     pub(super) decoded_cache: DecodedCache,
+    pub(super) series_thumbnails: SeriesThumbnailCache,
     pub(super) current_frame_key: Option<(PathBuf, u32)>,
     pub(super) window_level: WindowLevelState,
     pub(super) edit_windowing_dialog: EditWindowingDialogState,
@@ -318,6 +320,7 @@ pub(crate) struct DicronApp {
     pub(super) error_message: Option<String>,
     pub(super) dicom_index: Option<DicomIndex>,
     pub(super) selected_slice: Option<SliceSelection>,
+    pub(super) last_slice_by_series: HashMap<SeriesKey, usize>,
     pub(super) scan: ScanController,
     pub(super) viewer_scroll_slice_remainder: f32,
     pub(super) viewport_transform: ViewportTransform,
@@ -340,6 +343,7 @@ impl Default for DicronApp {
             selected_dicom_frame_count: 1,
             loaded_texture: None,
             decoded_cache: DecodedCache::default(),
+            series_thumbnails: SeriesThumbnailCache::default(),
             current_frame_key: None,
             window_level: WindowLevelState::default(),
             edit_windowing_dialog: EditWindowingDialogState::default(),
@@ -348,6 +352,7 @@ impl Default for DicronApp {
             error_message: None,
             dicom_index: None,
             selected_slice: None,
+            last_slice_by_series: HashMap::new(),
             scan: ScanController::default(),
             viewer_scroll_slice_remainder: 0.0,
             viewport_transform: ViewportTransform::default(),

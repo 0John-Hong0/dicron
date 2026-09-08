@@ -786,6 +786,10 @@ impl DicronApp {
             self.viewport_zoom_anchor = None;
         }
         self.selected_slice = target_selection;
+        if let Some(selection) = target_selection {
+            self.last_slice_by_series
+                .insert(selection.series_key(), selection.slice_index);
+        }
         self.window_level.apply_loaded_frame(
             prepared.default_window,
             prepared.current_window,
@@ -841,6 +845,7 @@ impl DicronApp {
         self.selected_dicom_path = None;
         self.loaded_texture = None;
         self.decoded_cache.clear();
+        self.series_thumbnails.clear();
         self.current_frame_key = None;
         self.window_level.clear_for_new_document();
         self.viewport_transform = Default::default();
@@ -848,6 +853,7 @@ impl DicronApp {
         self.edit_windowing_dialog.open = false;
         self.metadata.clear();
         self.dicom_index = None;
+        self.last_slice_by_series.clear();
         self.clear_selected_indices();
     }
 }
@@ -1080,6 +1086,7 @@ mod loading_tests {
             ..Default::default()
         };
         assert!(app.load_slice_by_indices(&context, 0, 0, 0, 1));
+        assert_eq!(app.last_slice_by_series.get(&(0, 0, 0)), Some(&1));
         app.viewport_transform = crate::app::state::ViewportTransform {
             zoom: 2.0,
             pan: egui::vec2(12.0, -8.0),
@@ -1142,6 +1149,7 @@ mod loading_tests {
         assert_eq!(app.viewport_transform, displayed_viewport_transform);
         assert_eq!(app.selected_dicom_frame_index, 0);
         assert_eq!(app.selected_dicom_frame_count, 1);
+        assert_eq!(app.last_slice_by_series.get(&(0, 0, 0)), Some(&1));
         assert_eq!(app.playback.direction, 1);
         assert!(
             app.error_message

@@ -6,6 +6,7 @@ use self::panel_resize::ResizeSide;
 use super::toolbar::ToolbarAction;
 use super::{metadata_panel, status_bar as status, toolbar, viewer};
 use crate::app::DicronApp;
+use crate::settings::DicomTreeViewMode;
 use crate::theme;
 
 pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -58,13 +59,29 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
                 ui.heading("DICOM Tree");
                 ui.separator();
 
+                let mut tree_view_mode = app.settings.dicom_tree_view_mode;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("View:");
+                    ui.selectable_value(
+                        &mut tree_view_mode,
+                        DicomTreeViewMode::SeriesPreviews,
+                        "Series previews",
+                    );
+                    ui.selectable_value(
+                        &mut tree_view_mode,
+                        DicomTreeViewMode::FileList,
+                        "File list",
+                    );
+                });
+                if tree_view_mode != app.settings.dicom_tree_view_mode {
+                    app.settings.set_dicom_tree_view_mode(tree_view_mode);
+                    app.tree_view_generation = app.tree_view_generation.wrapping_add(1);
+                }
+
                 let mut expand_tree = app.settings.expand_tree_by_default;
                 if ui
                     .checkbox(&mut expand_tree, "Expand all by default")
-                    .on_hover_text(
-                        "Off: very large studies (1000+ slices) start collapsed for \
-                         performance.",
-                    )
+                    .on_hover_text(super::dicom_tree::auto_collapse_help_text(tree_view_mode))
                     .changed()
                 {
                     app.settings.set_expand_tree_by_default(expand_tree);
@@ -140,7 +157,7 @@ mod panel_resize {
     use crate::theme;
     use eframe::egui;
 
-    const LEFT_MIN_WIDTH: f32 = 220.0;
+    const LEFT_MIN_WIDTH: f32 = 240.0;
     const RIGHT_MIN_WIDTH: f32 = 260.0;
     const LEFT_MAX_WIDTH: f32 = 700.0;
     const RIGHT_MAX_WIDTH: f32 = 800.0;

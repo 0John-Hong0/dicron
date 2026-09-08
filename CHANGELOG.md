@@ -6,6 +6,13 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Split series preview details into separate modality/description, series number, and slice-count
+  lines for easier scanning.
+- Add a compact DICOM tree mode with one fixed middle-slice thumbnail per series, including the
+  series description, modality, and slice count. Series reopen at their last viewed slice, while
+  the original filename list remains available as a persisted view option.
+- Improve series-preview thumbnail loading with lower memory use, bounded background decoding,
+  stale-work cancellation, and first-slice fallback when the middle slice cannot be decoded.
 - Remove the second scrollbar that appeared inside the DICOM tree for very long series. Long
   series now scroll with the rest of the tree while still laying out only the visible rows.
 - Pin the Patient, Study, and Series headers of the rows in view to the top of the DICOM tree
