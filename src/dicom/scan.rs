@@ -1,7 +1,7 @@
 //! Filesystem discovery and DICOM header scanning.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use dicom_core::Length;
 use dicom_dictionary_std::{tags, uids};
-use dicom_encoding::transfer_syntax::{Codec, TransferSyntaxIndex};
+use dicom_encoding::transfer_syntax::{Codec, TransferSyntax, TransferSyntaxIndex};
 use dicom_object::{
     DefaultDicomObject, DicomCollectorOptions, FileMetaTable, FileMetaTableBuilder,
     InMemDicomObject, OpenFileOptions, file::ReadPreamble,
 };
 use dicom_parser::DataSetReader;
-use dicom_parser::dataset::DataToken;
+use dicom_parser::dataset::lazy_read::LazyDataSetReader;
+use dicom_parser::dataset::{DataToken, LazyDataToken};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use walkdir::WalkDir;
 
@@ -27,10 +28,18 @@ use super::model::DicomIndex;
 const EXPLICIT_VR_BIG_ENDIAN_UID: &str = "1.2.840.10008.1.2.2";
 const MAX_SCAN_WORKERS: usize = 8;
 const FILES_PER_SCAN_WORKER: usize = 16;
+// Most image headers fit in one read at this size, reducing read calls without substantially
+// over-reading pixel data or increasing per-worker memory.
+const SCAN_BUFFER_CAPACITY: usize = 32 * 1024;
 const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_millis(50);
 
 struct ScannedDicomFile {
     index_entry: Option<DicomIndexEntry>,
+}
+
+struct ScannedIndexMetadata {
+    metadata: DicomIndexMetadata,
+    has_pixel_data: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -182,8 +191,13 @@ where
 fn scan_worker_count(file_count: usize) -> usize {
     let available_workers = thread::available_parallelism()
         .map(usize::from)
-        .unwrap_or(1)
-        .min(MAX_SCAN_WORKERS);
+        .unwrap_or(1);
+
+    scan_worker_count_for(file_count, available_workers)
+}
+
+fn scan_worker_count_for(file_count: usize, available_workers: usize) -> usize {
+    let available_workers = available_workers.min(MAX_SCAN_WORKERS);
     let useful_workers = file_count.div_ceil(FILES_PER_SCAN_WORKER);
 
     available_workers.min(useful_workers).max(1)
@@ -324,7 +338,7 @@ fn is_value_representation(value: &[u8]) -> bool {
 
 fn scan_dicom_file(file_path: &Path) -> Result<ScannedDicomFile> {
     let file = File::open(file_path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(SCAN_BUFFER_CAPACITY, file);
     let (preamble_length, raw_transfer_syntax_uid) = {
         let prefix = reader.fill_buf()?;
         if prefix.len() >= 132 && &prefix[128..132] == b"DICM" {
@@ -347,12 +361,92 @@ fn scan_dicom_file(file_path: &Path) -> Result<ScannedDicomFile> {
     let transfer_syntax = TransferSyntaxRegistry
         .get(&transfer_syntax_uid)
         .with_context(|| format!("unsupported DICOM transfer syntax {}", transfer_syntax_uid))?;
-    let dataset_reader: Box<dyn Read> = match transfer_syntax.codec() {
-        Codec::Dataset(Some(adapter)) => adapter.adapt_reader(Box::new(reader)),
+    let scanned_metadata = match transfer_syntax.codec() {
+        // Deflated data sets are streaming-only after decompression, so retain the eager reader
+        // for this uncommon transfer syntax.
+        Codec::Dataset(Some(adapter)) => {
+            scan_streaming_dataset(adapter.adapt_reader(Box::new(reader)), transfer_syntax)?
+        }
         Codec::Dataset(None) => anyhow::bail!("unsupported DICOM data set encoding"),
-        Codec::None | Codec::EncapsulatedPixelData(..) => Box::new(reader),
+        // Native and encapsulated pixel-data syntaxes leave the data set itself seekable. The
+        // lazy reader can skip irrelevant values without decoding or allocating them.
+        Codec::None | Codec::EncapsulatedPixelData(..) => {
+            scan_seekable_dataset(reader, transfer_syntax)?
+        }
     };
-    let mut tokens = DataSetReader::new_with_ts(dataset_reader, transfer_syntax)?;
+    let index_entry = DicomIndexEntry::from_metadata(
+        file_path,
+        scanned_metadata.metadata,
+        scanned_metadata.has_pixel_data,
+    );
+    Ok(ScannedDicomFile { index_entry })
+}
+
+fn scan_seekable_dataset<R>(
+    reader: R,
+    transfer_syntax: &TransferSyntax,
+) -> Result<ScannedIndexMetadata>
+where
+    R: Read + Seek,
+{
+    let mut tokens = LazyDataSetReader::new_with_ts(reader, transfer_syntax)?;
+    let mut metadata = DicomIndexMetadata::default();
+    let mut sequence_depth = 0_usize;
+    let mut has_pixel_data = false;
+
+    while let Some(token) = tokens.advance() {
+        match token? {
+            LazyDataToken::ElementHeader(header)
+                if sequence_depth == 0 && header.tag == tags::PIXEL_DATA =>
+            {
+                has_pixel_data = header.len != Length(0);
+                break;
+            }
+            LazyDataToken::PixelSequenceStart if sequence_depth == 0 => {
+                has_pixel_data = true;
+                break;
+            }
+            LazyDataToken::ElementHeader(header)
+                if sequence_depth == 0
+                    && (DicomIndexMetadata::includes_tag(header.tag)
+                        || header.tag == tags::SPECIFIC_CHARACTER_SET) =>
+            {
+                let value = tokens
+                    .advance()
+                    .with_context(|| format!("missing value for DICOM element {}", header.tag))??
+                    .into_value()
+                    .with_context(|| format!("could not read DICOM element {}", header.tag))?;
+                if DicomIndexMetadata::includes_tag(header.tag) {
+                    metadata.put_primitive(header.tag, &value);
+                }
+            }
+            token @ (LazyDataToken::LazyValue { .. } | LazyDataToken::LazyItemValue { .. }) => {
+                token.skip()?;
+            }
+            LazyDataToken::SequenceStart { .. } | LazyDataToken::PixelSequenceStart => {
+                sequence_depth += 1;
+            }
+            LazyDataToken::SequenceEnd => {
+                sequence_depth = sequence_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ScannedIndexMetadata {
+        metadata,
+        has_pixel_data,
+    })
+}
+
+fn scan_streaming_dataset<R>(
+    reader: R,
+    transfer_syntax: &TransferSyntax,
+) -> Result<ScannedIndexMetadata>
+where
+    R: Read,
+{
+    let mut tokens = DataSetReader::new_with_ts(reader, transfer_syntax)?;
     let mut metadata = DicomIndexMetadata::default();
     let mut sequence_depth = 0_usize;
     let mut has_pixel_data = false;
@@ -390,8 +484,10 @@ fn scan_dicom_file(file_path: &Path) -> Result<ScannedDicomFile> {
         }
     }
 
-    let index_entry = DicomIndexEntry::from_metadata(file_path, metadata, has_pixel_data);
-    Ok(ScannedDicomFile { index_entry })
+    Ok(ScannedIndexMetadata {
+        metadata,
+        has_pixel_data,
+    })
 }
 
 fn raw_dataset_transfer_syntax_from_prefix(prefix: &[u8]) -> Result<&'static str> {
@@ -422,7 +518,7 @@ mod tests {
     use dicom_dictionary_std::{tags, uids};
     use dicom_object::{FileDicomObject, FileMetaTableBuilder};
 
-    use super::{build_for_file, build_for_inputs_with_progress};
+    use super::{build_for_file, build_for_inputs_with_progress, scan_worker_count_for};
 
     static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
 
@@ -560,6 +656,30 @@ mod tests {
     }
 
     #[test]
+    fn lazy_scan_uses_the_declared_character_set_for_index_text() {
+        let path = temporary_file_path("utf8-index-metadata");
+        write_test_object(&path, true);
+        let mut object = dicom_object::open_file(&path).unwrap();
+        object.convert_to_utf8();
+        object.put_element(DataElement::new(
+            tags::PATIENT_ID,
+            VR::LO,
+            PrimitiveValue::from("patient-utf8"),
+        ));
+        object.put_element(DataElement::new(
+            tags::PATIENT_NAME,
+            VR::PN,
+            PrimitiveValue::from("홍길동"),
+        ));
+        object.write_to_file(&path).unwrap();
+
+        let index = build_for_file(&path).unwrap();
+
+        assert_eq!(index.patients[0].display_name, "홍길동 (patient-utf8)");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn encapsulated_pixel_data_is_classified_without_decoding_fragments() {
         let source_path = temporary_file_path("native-source");
         let compressed_path = temporary_file_path("encapsulated");
@@ -580,6 +700,24 @@ mod tests {
         assert_eq!(index.total_file_count, 1);
         std::fs::remove_file(source_path).unwrap();
         std::fs::remove_file(compressed_path).unwrap();
+    }
+
+    #[test]
+    fn deflated_dataset_uses_the_streaming_scan_fallback() {
+        let source_path = temporary_file_path("native-deflate-source");
+        let deflated_path = temporary_file_path("deflated");
+        write_test_object(&source_path, true);
+        let mut object = dicom_object::open_file(&source_path).unwrap();
+        object.update_meta(|meta| {
+            meta.transfer_syntax = uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN.to_owned();
+        });
+        object.write_to_file(&deflated_path).unwrap();
+
+        let index = build_for_file(&deflated_path).unwrap();
+
+        assert_eq!(index.total_file_count, 1);
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(deflated_path).unwrap();
     }
 
     #[test]
@@ -649,5 +787,13 @@ mod tests {
         for path in paths {
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn scan_worker_count_respects_workload_cpu_count_and_cap() {
+        assert_eq!(scan_worker_count_for(1, 32), 1);
+        assert_eq!(scan_worker_count_for(80, 32), 5);
+        assert_eq!(scan_worker_count_for(10_000, 4), 4);
+        assert_eq!(scan_worker_count_for(10_000, 32), 8);
     }
 }

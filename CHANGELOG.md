@@ -6,6 +6,9 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Speed up initial DICOM scans by skipping unused header decoding and using larger buffered reads
+  to reduce read overhead.
+
 ## [0.2.1] - 2026-09-03
 
 - Fix mouse wheel slice navigation so one wheel notch advances exactly one slice without delayed,
