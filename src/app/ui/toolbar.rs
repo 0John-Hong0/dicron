@@ -20,17 +20,13 @@ pub(super) fn show_actions(
 ) -> Option<ToolbarAction> {
     let mut action = None;
 
-    ui.horizontal(|ui| {
+    theme::toolbar_row(ui, |ui| {
         if ui.button("Open DICOM").clicked() {
             action = Some(ToolbarAction::OpenDicom);
         }
 
         if ui.button("Open Folder").clicked() {
             action = Some(ToolbarAction::OpenFolder);
-        }
-
-        if ui.button("About").clicked() {
-            action = Some(ToolbarAction::ShowAbout);
         }
 
         let mut selected_theme_preference = theme_preference;
@@ -62,6 +58,10 @@ pub(super) fn show_actions(
 
         if selected_theme_preference != theme_preference {
             action = Some(ToolbarAction::SetTheme(selected_theme_preference));
+        }
+
+        if ui.button("About").clicked() {
+            action = Some(ToolbarAction::ShowAbout);
         }
     });
 
