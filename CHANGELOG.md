@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-09
+
 - Split series preview details into separate modality/description, series number, and slice-count
   lines for easier scanning.
 - Add a compact DICOM tree mode with one fixed middle-slice thumbnail per series, including the
