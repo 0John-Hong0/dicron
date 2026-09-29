@@ -9,8 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use dicom_core::Length;
+use dicom_core::{Length, Tag, VR};
 use dicom_dictionary_std::{tags, uids};
+use dicom_encoding::text::SpecificCharacterSet;
 use dicom_encoding::transfer_syntax::{Codec, TransferSyntax, TransferSyntaxIndex};
 use dicom_object::{
     DefaultDicomObject, DicomCollectorOptions, FileMetaTable, FileMetaTableBuilder,
@@ -18,12 +19,14 @@ use dicom_object::{
 };
 use dicom_parser::DataSetReader;
 use dicom_parser::dataset::lazy_read::LazyDataSetReader;
+use dicom_parser::dataset::read::{DataSetReaderOptions, ValueReadStrategy};
 use dicom_parser::dataset::{DataToken, LazyDataToken};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use walkdir::WalkDir;
 
 use super::index::{DicomIndexBuilder, DicomIndexEntry, DicomIndexMetadata};
 use super::model::DicomIndex;
+use super::text_encoding::{AutoEncodingEvidence, MAX_DETECTION_TEXT_VALUE_BYTES, TextEncoding};
 
 const EXPLICIT_VR_BIG_ENDIAN_UID: &str = "1.2.840.10008.1.2.2";
 const MAX_SCAN_WORKERS: usize = 8;
@@ -49,33 +52,53 @@ pub(crate) struct BuildProgress {
     pub(crate) readable_dicom_count: usize,
 }
 
-pub(crate) fn build_from_folder_with_progress<F>(
+pub(crate) fn build_from_folder_with_progress_with_encoding<F>(
     folder_path: &Path,
     cancel: &AtomicBool,
+    text_encoding: TextEncoding,
     mut on_progress: F,
 ) -> Result<DicomIndex>
 where
     F: FnMut(BuildProgress),
 {
     let file_paths = collect_walkdir_files(folder_path, cancel)?;
-    build_for_files_with_progress(&file_paths, cancel, &mut on_progress)
+    build_for_files_with_progress(&file_paths, cancel, text_encoding, &mut on_progress)
 }
 
+#[cfg(test)]
 pub(crate) fn build_for_inputs_with_progress<F>(
     input_paths: &[PathBuf],
     cancel: &AtomicBool,
+    on_progress: F,
+) -> Result<DicomIndex>
+where
+    F: FnMut(BuildProgress),
+{
+    build_for_inputs_with_progress_with_encoding(
+        input_paths,
+        cancel,
+        TextEncoding::DicomDefault,
+        on_progress,
+    )
+}
+
+pub(crate) fn build_for_inputs_with_progress_with_encoding<F>(
+    input_paths: &[PathBuf],
+    cancel: &AtomicBool,
+    text_encoding: TextEncoding,
     mut on_progress: F,
 ) -> Result<DicomIndex>
 where
     F: FnMut(BuildProgress),
 {
     let file_paths = collect_file_paths(input_paths, cancel)?;
-    build_for_files_with_progress(&file_paths, cancel, &mut on_progress)
+    build_for_files_with_progress(&file_paths, cancel, text_encoding, &mut on_progress)
 }
 
 fn build_for_files_with_progress<F>(
     file_paths: &[PathBuf],
     cancel: &AtomicBool,
+    text_encoding: TextEncoding,
     mut on_progress: F,
 ) -> Result<DicomIndex>
 where
@@ -91,13 +114,19 @@ where
         readable_dicom_count: 0,
     });
 
-    scan_files_with_progress(file_paths, cancel, &mut on_progress, &mut |scanned_file| {
-        let Some(index_entry) = scanned_file.and_then(|file| file.index_entry) else {
-            return;
-        };
-        index_builder.add_entry(index_entry);
-        displayable_dicom_count += 1;
-    })?;
+    scan_files_with_progress(
+        file_paths,
+        cancel,
+        text_encoding,
+        &mut on_progress,
+        &mut |scanned_file| {
+            let Some(index_entry) = scanned_file.and_then(|file| file.index_entry) else {
+                return;
+            };
+            index_builder.add_entry(index_entry);
+            displayable_dicom_count += 1;
+        },
+    )?;
 
     let patients = index_builder.into_patients();
 
@@ -110,6 +139,7 @@ where
 fn scan_files_with_progress<F, S>(
     file_paths: &[PathBuf],
     cancel: &AtomicBool,
+    text_encoding: TextEncoding,
     on_progress: &mut F,
     on_scanned_file: &mut S,
 ) -> Result<()>
@@ -147,7 +177,7 @@ where
                     let Some(file_path) = file_paths.get(file_index) else {
                         break;
                     };
-                    let scanned_file = scan_dicom_file(file_path).ok();
+                    let scanned_file = scan_dicom_file(file_path, text_encoding).ok();
 
                     if result_sender.send((file_index, scanned_file)).is_err() {
                         break;
@@ -249,8 +279,16 @@ fn scan_cancelled() -> anyhow::Error {
     anyhow::anyhow!("scan cancelled")
 }
 
+#[cfg(test)]
 pub(crate) fn build_for_file(file_path: &Path) -> Result<DicomIndex> {
-    let scanned_file = scan_dicom_file(file_path)?;
+    build_for_file_with_encoding(file_path, TextEncoding::DicomDefault)
+}
+
+pub(crate) fn build_for_file_with_encoding(
+    file_path: &Path,
+    text_encoding: TextEncoding,
+) -> Result<DicomIndex> {
+    let scanned_file = scan_dicom_file(file_path, text_encoding)?;
     let mut index_builder = DicomIndexBuilder::default();
 
     let Some(index_entry) = scanned_file.index_entry else {
@@ -266,11 +304,44 @@ pub(crate) fn build_for_file(file_path: &Path) -> Result<DicomIndex> {
 }
 
 pub(crate) fn open_dicom_file(file_path: &Path) -> Result<DefaultDicomObject> {
+    open_dicom_file_with_encoding(file_path, TextEncoding::DicomDefault)
+}
+
+pub(crate) fn open_dicom_file_with_encoding(
+    file_path: &Path,
+    text_encoding: TextEncoding,
+) -> Result<DefaultDicomObject> {
+    let assumed_charset = resolve_assumed_charset(file_path, text_encoding);
+    if assumed_charset != SpecificCharacterSet::ISO_IR_6 {
+        return open_dicom_file_with_assumed_charset(file_path, assumed_charset);
+    }
+
     match OpenFileOptions::new().open_file(file_path) {
         Ok(object) => Ok(object),
         Err(part_10_error) => open_raw_dicom_dataset(file_path, true)
             .with_context(|| format!("could not parse DICOM file: {part_10_error}")),
     }
+}
+
+fn open_dicom_file_with_assumed_charset(
+    file_path: &Path,
+    assumed_charset: SpecificCharacterSet,
+) -> Result<DefaultDicomObject> {
+    let (reader, meta) = open_dataset_source(file_path)?;
+    let transfer_syntax = TransferSyntaxRegistry
+        .get(meta.transfer_syntax())
+        .with_context(|| {
+            format!(
+                "unsupported DICOM transfer syntax {}",
+                meta.transfer_syntax()
+            )
+        })?;
+    let object =
+        InMemDicomObject::read_dataset_with_ts_cs(reader, transfer_syntax, assumed_charset)?;
+    let mut file_object =
+        object.with_meta(FileMetaTableBuilder::new().transfer_syntax(meta.transfer_syntax()))?;
+    *file_object.meta_mut() = meta;
+    Ok(file_object)
 }
 
 fn open_raw_dicom_dataset(file_path: &Path, read_all: bool) -> Result<DefaultDicomObject> {
@@ -336,7 +407,189 @@ fn is_value_representation(value: &[u8]) -> bool {
     )
 }
 
-fn scan_dicom_file(file_path: &Path) -> Result<ScannedDicomFile> {
+fn resolve_assumed_charset(file_path: &Path, mode: TextEncoding) -> SpecificCharacterSet {
+    match mode {
+        TextEncoding::DicomDefault => SpecificCharacterSet::ISO_IR_6,
+        TextEncoding::KoreanEucKr | TextEncoding::Utf8 | TextEncoding::JapaneseShiftJis => {
+            mode.assumed_character_set()
+        }
+        TextEncoding::Auto => detect_missing_charset_encoding(file_path)
+            .ok()
+            .flatten()
+            .map_or(
+                SpecificCharacterSet::ISO_IR_6,
+                TextEncoding::assumed_character_set,
+            ),
+    }
+}
+
+fn detect_missing_charset_encoding(file_path: &Path) -> Result<Option<TextEncoding>> {
+    let (reader, meta) = open_dataset_source(file_path)?;
+    let transfer_syntax = TransferSyntaxRegistry
+        .get(meta.transfer_syntax())
+        .with_context(|| {
+            format!(
+                "unsupported DICOM transfer syntax {}",
+                meta.transfer_syntax()
+            )
+        })?;
+
+    match transfer_syntax.codec() {
+        Codec::Dataset(Some(adapter)) => {
+            probe_streaming_dataset(adapter.adapt_reader(Box::new(reader)), transfer_syntax)
+        }
+        Codec::Dataset(None) => Ok(None),
+        Codec::None | Codec::EncapsulatedPixelData(..) => {
+            probe_seekable_dataset(reader, transfer_syntax)
+        }
+    }
+}
+
+fn is_detection_text(tag: Tag, vr: VR) -> bool {
+    tag.0.is_multiple_of(2)
+        && matches!(
+            vr,
+            VR::PN | VR::LO | VR::SH | VR::ST | VR::LT | VR::UT | VR::UC
+        )
+}
+
+fn probe_seekable_dataset<R>(
+    reader: R,
+    transfer_syntax: &TransferSyntax,
+) -> Result<Option<TextEncoding>>
+where
+    R: Read + Seek,
+{
+    let mut tokens = LazyDataSetReader::new_with_ts(reader, transfer_syntax)?;
+    let mut evidence = AutoEncodingEvidence::default();
+    let mut sequence_depth = 0_usize;
+
+    while let Some(token) = tokens.advance() {
+        match token? {
+            // The declared charset has priority, including an empty declaration.
+            LazyDataToken::ElementHeader(header) if header.tag == tags::SPECIFIC_CHARACTER_SET => {
+                return Ok(None);
+            }
+            // DICOM's tag order places (0008,0005) before pixel data. Leave image bytes unread.
+            LazyDataToken::ElementHeader(header)
+                if sequence_depth == 0 && header.tag == tags::PIXEL_DATA =>
+            {
+                break;
+            }
+            LazyDataToken::PixelSequenceStart if sequence_depth == 0 => break,
+            LazyDataToken::ElementHeader(header)
+                if sequence_depth == 0 && is_detection_text(header.tag, header.vr) =>
+            {
+                if header.len.0 as usize > MAX_DETECTION_TEXT_VALUE_BYTES {
+                    return Ok(None);
+                }
+                let value = tokens
+                    .advance()
+                    .with_context(|| format!("missing value for DICOM element {}", header.tag))??
+                    .into_value_with_strategy(ValueReadStrategy::Raw)?;
+                evidence.observe(&value.to_bytes());
+            }
+            token @ (LazyDataToken::LazyValue { .. } | LazyDataToken::LazyItemValue { .. }) => {
+                token.skip()?;
+            }
+            LazyDataToken::SequenceStart { .. } | LazyDataToken::PixelSequenceStart => {
+                sequence_depth += 1;
+            }
+            LazyDataToken::SequenceEnd => {
+                sequence_depth = sequence_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(evidence.detect())
+}
+
+fn probe_streaming_dataset<R>(
+    reader: R,
+    transfer_syntax: &TransferSyntax,
+) -> Result<Option<TextEncoding>>
+where
+    R: Read,
+{
+    let options = DataSetReaderOptions::default().value_read(ValueReadStrategy::Raw);
+    let tokens = DataSetReader::new_with_ts_options(reader, transfer_syntax, options)?;
+    let mut evidence = AutoEncodingEvidence::default();
+    let mut sequence_depth = 0_usize;
+    let mut pending_text = false;
+
+    for token in tokens {
+        match token? {
+            DataToken::ElementHeader(header) if header.tag == tags::SPECIFIC_CHARACTER_SET => {
+                return Ok(None);
+            }
+            DataToken::ElementHeader(header)
+                if sequence_depth == 0 && header.tag == tags::PIXEL_DATA =>
+            {
+                break;
+            }
+            DataToken::PixelSequenceStart if sequence_depth == 0 => break,
+            DataToken::ElementHeader(header) => {
+                if sequence_depth == 0
+                    && is_detection_text(header.tag, header.vr)
+                    && header.len.0 as usize > MAX_DETECTION_TEXT_VALUE_BYTES
+                {
+                    return Ok(None);
+                }
+                pending_text = sequence_depth == 0 && is_detection_text(header.tag, header.vr);
+            }
+            DataToken::PrimitiveValue(value) => {
+                if pending_text {
+                    evidence.observe(&value.to_bytes());
+                    pending_text = false;
+                }
+            }
+            DataToken::SequenceStart { .. } | DataToken::PixelSequenceStart => {
+                pending_text = false;
+                sequence_depth += 1;
+            }
+            DataToken::SequenceEnd => {
+                pending_text = false;
+                sequence_depth = sequence_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(evidence.detect())
+}
+
+fn scan_dicom_file(file_path: &Path, text_encoding: TextEncoding) -> Result<ScannedDicomFile> {
+    let assumed_charset = resolve_assumed_charset(file_path, text_encoding);
+    let (reader, meta) = open_dataset_source(file_path)?;
+    let transfer_syntax_uid = meta.transfer_syntax();
+    let transfer_syntax = TransferSyntaxRegistry
+        .get(transfer_syntax_uid)
+        .with_context(|| format!("unsupported DICOM transfer syntax {transfer_syntax_uid}"))?;
+    let scanned_metadata = match transfer_syntax.codec() {
+        // Deflated data sets are streaming-only after decompression, so retain the eager reader
+        // for this uncommon transfer syntax.
+        Codec::Dataset(Some(adapter)) => scan_streaming_dataset(
+            adapter.adapt_reader(Box::new(reader)),
+            transfer_syntax,
+            assumed_charset,
+        )?,
+        Codec::Dataset(None) => anyhow::bail!("unsupported DICOM data set encoding"),
+        // Native and encapsulated pixel-data syntaxes leave the data set itself seekable. The
+        // lazy reader can skip irrelevant values without decoding or allocating them.
+        Codec::None | Codec::EncapsulatedPixelData(..) => {
+            scan_seekable_dataset(reader, transfer_syntax, assumed_charset)?
+        }
+    };
+    let index_entry = DicomIndexEntry::from_metadata(
+        file_path,
+        scanned_metadata.metadata,
+        scanned_metadata.has_pixel_data,
+    );
+    Ok(ScannedDicomFile { index_entry })
+}
+
+fn open_dataset_source(file_path: &Path) -> Result<(BufReader<File>, FileMetaTable)> {
     let file = File::open(file_path)?;
     let mut reader = BufReader::with_capacity(SCAN_BUFFER_CAPACITY, file);
     let (preamble_length, raw_transfer_syntax_uid) = {
@@ -349,47 +602,27 @@ fn scan_dicom_file(file_path: &Path) -> Result<ScannedDicomFile> {
             (0, Some(raw_dataset_transfer_syntax_from_prefix(prefix)?))
         }
     };
-    let transfer_syntax_uid = match raw_transfer_syntax_uid {
-        Some(transfer_syntax_uid) => transfer_syntax_uid.to_owned(),
+    let meta = match raw_transfer_syntax_uid {
+        Some(transfer_syntax_uid) => FileMetaTableBuilder::new()
+            .transfer_syntax(transfer_syntax_uid)
+            .build()?,
         None => {
             reader.consume(preamble_length);
             FileMetaTable::from_reader(&mut reader)?
-                .transfer_syntax()
-                .to_owned()
         }
     };
-    let transfer_syntax = TransferSyntaxRegistry
-        .get(&transfer_syntax_uid)
-        .with_context(|| format!("unsupported DICOM transfer syntax {}", transfer_syntax_uid))?;
-    let scanned_metadata = match transfer_syntax.codec() {
-        // Deflated data sets are streaming-only after decompression, so retain the eager reader
-        // for this uncommon transfer syntax.
-        Codec::Dataset(Some(adapter)) => {
-            scan_streaming_dataset(adapter.adapt_reader(Box::new(reader)), transfer_syntax)?
-        }
-        Codec::Dataset(None) => anyhow::bail!("unsupported DICOM data set encoding"),
-        // Native and encapsulated pixel-data syntaxes leave the data set itself seekable. The
-        // lazy reader can skip irrelevant values without decoding or allocating them.
-        Codec::None | Codec::EncapsulatedPixelData(..) => {
-            scan_seekable_dataset(reader, transfer_syntax)?
-        }
-    };
-    let index_entry = DicomIndexEntry::from_metadata(
-        file_path,
-        scanned_metadata.metadata,
-        scanned_metadata.has_pixel_data,
-    );
-    Ok(ScannedDicomFile { index_entry })
+    Ok((reader, meta))
 }
 
 fn scan_seekable_dataset<R>(
     reader: R,
     transfer_syntax: &TransferSyntax,
+    assumed_charset: SpecificCharacterSet,
 ) -> Result<ScannedIndexMetadata>
 where
     R: Read + Seek,
 {
-    let mut tokens = LazyDataSetReader::new_with_ts(reader, transfer_syntax)?;
+    let mut tokens = LazyDataSetReader::new_with_ts_cs(reader, transfer_syntax, assumed_charset)?;
     let mut metadata = DicomIndexMetadata::default();
     let mut sequence_depth = 0_usize;
     let mut has_pixel_data = false;
@@ -442,11 +675,12 @@ where
 fn scan_streaming_dataset<R>(
     reader: R,
     transfer_syntax: &TransferSyntax,
+    assumed_charset: SpecificCharacterSet,
 ) -> Result<ScannedIndexMetadata>
 where
     R: Read,
 {
-    let mut tokens = DataSetReader::new_with_ts(reader, transfer_syntax)?;
+    let mut tokens = DataSetReader::new_with_ts_cs(reader, transfer_syntax, assumed_charset)?;
     let mut metadata = DicomIndexMetadata::default();
     let mut sequence_depth = 0_usize;
     let mut has_pixel_data = false;
@@ -516,9 +750,14 @@ mod tests {
 
     use dicom_core::{DataElement, PrimitiveValue, VR, value::PixelFragmentSequence};
     use dicom_dictionary_std::{tags, uids};
+    use dicom_encoding::text::TextCodec;
     use dicom_object::{FileDicomObject, FileMetaTableBuilder};
 
-    use super::{build_for_file, build_for_inputs_with_progress, scan_worker_count_for};
+    use super::{
+        TextEncoding, build_for_file, build_for_file_with_encoding, build_for_inputs_with_progress,
+        build_for_inputs_with_progress_with_encoding, detect_missing_charset_encoding,
+        scan_worker_count_for,
+    };
 
     static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
 
@@ -620,9 +859,15 @@ mod tests {
 
         let index = build_for_file(&raw_path).unwrap();
         let loaded = crate::dicom::load_dicom_frame(&raw_path, 0).unwrap();
+        let korean_loaded =
+            crate::dicom::load_dicom_frame_with_encoding(&raw_path, 0, TextEncoding::KoreanEucKr)
+                .unwrap();
+        let auto_index = build_for_file_with_encoding(&raw_path, TextEncoding::Auto).unwrap();
 
         assert_eq!(index.total_file_count, 1);
+        assert_eq!(auto_index.total_file_count, 1);
         assert_eq!(loaded.frame.frame_count, 1);
+        assert_eq!(korean_loaded.frame.frame_count, 1);
         std::fs::remove_file(part_10_path).unwrap();
         std::fs::remove_file(raw_path).unwrap();
     }
@@ -686,9 +931,200 @@ mod tests {
         ));
         object.write_to_file(&path).unwrap();
 
-        let index = build_for_file(&path).unwrap();
+        assert_eq!(detect_missing_charset_encoding(&path).unwrap(), None);
+        let index = build_for_file_with_encoding(&path, TextEncoding::KoreanEucKr).unwrap();
 
         assert_eq!(index.patients[0].display_name, "홍길동 (patient-utf8)");
+        let auto_index = build_for_file_with_encoding(&path, TextEncoding::Auto).unwrap();
+        assert_eq!(auto_index.patients[0].display_name, "홍길동 (patient-utf8)");
+        let loaded =
+            crate::dicom::load_dicom_frame_with_encoding(&path, 0, TextEncoding::KoreanEucKr)
+                .unwrap();
+        assert_eq!(
+            loaded.metadata.overlay.patient_label.as_deref(),
+            Some("홍길동 (patient-utf8)")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn explicit_korean_reopen_decodes_missing_charset_without_changing_the_file() {
+        let path = temporary_file_path("missing-korean-charset");
+        write_test_object(&path, true);
+        let mut object = dicom_object::open_file(&path).unwrap();
+        object.put_element(DataElement::new(
+            tags::PATIENT_NAME,
+            VR::PN,
+            PrimitiveValue::from("ABCDEF"),
+        ));
+        object.write_to_file(&path).unwrap();
+
+        let original = std::fs::read(&path).unwrap();
+        let encoded_name = TextEncoding::KoreanEucKr
+            .assumed_character_set()
+            .encode("홍길동")
+            .unwrap();
+        assert_eq!(encoded_name.len(), 6);
+        let mut encoded_file = original;
+        let name_offset = encoded_file
+            .windows(6)
+            .position(|window| window == b"ABCDEF")
+            .unwrap();
+        encoded_file[name_offset..name_offset + 6].copy_from_slice(&encoded_name);
+        std::fs::write(&path, &encoded_file).unwrap();
+
+        assert_eq!(
+            detect_missing_charset_encoding(&path).unwrap(),
+            Some(TextEncoding::KoreanEucKr)
+        );
+        let default_index = build_for_file(&path).unwrap();
+        assert_ne!(default_index.patients[0].display_name, "홍길동");
+        let index = build_for_file_with_encoding(&path, TextEncoding::KoreanEucKr).unwrap();
+        assert_eq!(index.patients[0].display_name, "홍길동");
+        let auto_index = build_for_file_with_encoding(&path, TextEncoding::Auto).unwrap();
+        assert_eq!(auto_index.patients[0].display_name, "홍길동");
+        let scanned = build_for_inputs_with_progress_with_encoding(
+            std::slice::from_ref(&path),
+            &AtomicBool::new(false),
+            TextEncoding::Auto,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(scanned.patients[0].display_name, "홍길동");
+        let loaded =
+            crate::dicom::load_dicom_frame_with_encoding(&path, 0, TextEncoding::Auto).unwrap();
+        assert_eq!(
+            loaded.metadata.overlay.patient_label.as_deref(),
+            Some("홍길동")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), encoded_file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_decodes_undeclared_utf8_text() {
+        let path = temporary_file_path("missing-utf8-charset");
+        write_test_object(&path, true);
+        let mut object = dicom_object::open_file(&path).unwrap();
+        object.put_element(DataElement::new(
+            tags::PATIENT_NAME,
+            VR::PN,
+            PrimitiveValue::from("ABCDEFGHIJ"),
+        ));
+        object.write_to_file(&path).unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let offset = bytes
+            .windows(10)
+            .position(|window| window == b"ABCDEFGHIJ")
+            .unwrap();
+        bytes[offset..offset + 10].copy_from_slice("홍길동 ".as_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            detect_missing_charset_encoding(&path).unwrap(),
+            Some(TextEncoding::Utf8)
+        );
+        let default = build_for_file_with_encoding(&path, TextEncoding::DicomDefault).unwrap();
+        let auto = build_for_file_with_encoding(&path, TextEncoding::Auto).unwrap();
+        let manual = build_for_file_with_encoding(&path, TextEncoding::Utf8).unwrap();
+        assert_ne!(default.patients[0].display_name, "홍길동");
+        assert_eq!(auto.patients[0].display_name, "홍길동");
+        assert_eq!(manual.patients[0].display_name, "홍길동");
+        let loaded =
+            crate::dicom::load_dicom_frame_with_encoding(&path, 0, TextEncoding::Auto).unwrap();
+        assert_eq!(
+            loaded.metadata.overlay.patient_label.as_deref(),
+            Some("홍길동")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_decodes_undeclared_japanese_kana_and_manual_mode_matches() {
+        let path = temporary_file_path("missing-japanese-charset");
+        write_test_object(&path, true);
+        let mut object = dicom_object::open_file(&path).unwrap();
+        object.put_element(DataElement::new(
+            tags::PATIENT_NAME,
+            VR::PN,
+            PrimitiveValue::from("ABCDEFGHIJKL"),
+        ));
+        object.write_to_file(&path).unwrap();
+
+        let encoded_name = TextEncoding::JapaneseShiftJis
+            .assumed_character_set()
+            .encode("やまだたろう")
+            .unwrap();
+        assert_eq!(encoded_name.len(), 12);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let offset = bytes
+            .windows(12)
+            .position(|window| window == b"ABCDEFGHIJKL")
+            .unwrap();
+        bytes[offset..offset + 12].copy_from_slice(&encoded_name);
+        std::fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            detect_missing_charset_encoding(&path).unwrap(),
+            Some(TextEncoding::JapaneseShiftJis)
+        );
+        let default = build_for_file_with_encoding(&path, TextEncoding::DicomDefault).unwrap();
+        let auto = build_for_file_with_encoding(&path, TextEncoding::Auto).unwrap();
+        let manual = build_for_file_with_encoding(&path, TextEncoding::JapaneseShiftJis).unwrap();
+        assert_ne!(default.patients[0].display_name, "やまだたろう");
+        assert_eq!(auto.patients[0].display_name, "やまだたろう");
+        assert_eq!(manual.patients[0].display_name, "やまだたろう");
+        let loaded =
+            crate::dicom::load_dicom_frame_with_encoding(&path, 0, TextEncoding::Auto).unwrap();
+        assert_eq!(
+            loaded.metadata.overlay.patient_label.as_deref(),
+            Some("やまだたろう")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn manual_japanese_decodes_kanji_only_when_auto_is_ambiguous() {
+        let path = temporary_file_path("ambiguous-japanese-charset");
+        write_test_object(&path, true);
+        let mut object = dicom_object::open_file(&path).unwrap();
+        object.put_element(DataElement::new(
+            tags::PATIENT_NAME,
+            VR::PN,
+            PrimitiveValue::from("ABCDEFGH"),
+        ));
+        object.write_to_file(&path).unwrap();
+
+        let encoded_name = TextEncoding::JapaneseShiftJis
+            .assumed_character_set()
+            .encode("山田太郎")
+            .unwrap();
+        assert_eq!(encoded_name.len(), 8);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let offset = bytes
+            .windows(8)
+            .position(|window| window == b"ABCDEFGH")
+            .unwrap();
+        bytes[offset..offset + 8].copy_from_slice(&encoded_name);
+        std::fs::write(&path, bytes).unwrap();
+
+        assert_eq!(detect_missing_charset_encoding(&path).unwrap(), None);
+        let default = build_for_file_with_encoding(&path, TextEncoding::DicomDefault).unwrap();
+        let auto = build_for_file_with_encoding(&path, TextEncoding::Auto).unwrap();
+        let manual = build_for_file_with_encoding(&path, TextEncoding::JapaneseShiftJis).unwrap();
+        assert_eq!(
+            auto.patients[0].display_name,
+            default.patients[0].display_name
+        );
+        assert_eq!(manual.patients[0].display_name, "山田太郎");
+        let loaded =
+            crate::dicom::load_dicom_frame_with_encoding(&path, 0, TextEncoding::JapaneseShiftJis)
+                .unwrap();
+        assert_eq!(
+            loaded.metadata.overlay.patient_label.as_deref(),
+            Some("山田太郎")
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -727,8 +1163,13 @@ mod tests {
         object.write_to_file(&deflated_path).unwrap();
 
         let index = build_for_file(&deflated_path).unwrap();
+        let korean_index =
+            build_for_file_with_encoding(&deflated_path, TextEncoding::KoreanEucKr).unwrap();
+        let auto_index = build_for_file_with_encoding(&deflated_path, TextEncoding::Auto).unwrap();
 
         assert_eq!(index.total_file_count, 1);
+        assert_eq!(korean_index.total_file_count, 1);
+        assert_eq!(auto_index.total_file_count, 1);
         std::fs::remove_file(source_path).unwrap();
         std::fs::remove_file(deflated_path).unwrap();
     }

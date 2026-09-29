@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use eframe::egui;
 
-use crate::dicom::{DicomIndex, DicomOverlayMetadata, MetadataItem};
+use crate::dicom::{DicomIndex, DicomOverlayMetadata, MetadataItem, TextEncoding};
 use crate::release_check::UpdateCheckOutcome;
 use crate::settings::AppSettings;
 
@@ -15,6 +15,13 @@ use super::frame_cache::DecodedCache;
 use super::series_thumbnail_cache::SeriesThumbnailCache;
 
 pub(super) type SeriesKey = (usize, usize, usize);
+
+#[derive(Clone)]
+pub(super) enum OpenSource {
+    File(PathBuf),
+    Folder(PathBuf),
+    Inputs(Vec<PathBuf>),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SliceSelection {
@@ -169,6 +176,12 @@ pub(super) struct SavedWindowLevel {
     pub(super) preset: Option<WindowPreset>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ReopenViewState {
+    pub(super) viewport_transform: ViewportTransform,
+    pub(super) window_level: Option<SavedWindowLevel>,
+}
+
 pub(super) struct WindowLevelState {
     pub(super) current: WindowLevel,
     pub(super) default: WindowLevel,
@@ -306,6 +319,10 @@ impl AboutDialogState {
 }
 
 pub(crate) struct DicronApp {
+    pub(super) open_source: Option<OpenSource>,
+    pub(super) text_encoding: TextEncoding,
+    pub(super) reopen_selection: Option<(PathBuf, u32)>,
+    pub(super) reopen_view_state: Option<ReopenViewState>,
     pub(super) selected_dicom_path: Option<PathBuf>,
     pub(super) selected_dicom_frame_index: u32,
     pub(super) selected_dicom_frame_count: u32,
@@ -338,6 +355,10 @@ impl Default for DicronApp {
         let about_dialog = AboutDialogState::new(settings.check_for_updates_on_startup);
 
         Self {
+            open_source: None,
+            text_encoding: TextEncoding::Auto,
+            reopen_selection: None,
+            reopen_view_state: None,
             selected_dicom_path: None,
             selected_dicom_frame_index: 0,
             selected_dicom_frame_count: 1,

@@ -10,7 +10,8 @@ use dicom_object::DefaultDicomObject;
 use dicom_pixeldata::{ConvertOptions, DecodedPixelData, PixelDecoder, VoiLutOption, WindowLevel};
 
 use super::metadata::{DicomMetadata, extract_dicom_metadata};
-use super::scan::open_dicom_file;
+use super::scan::{open_dicom_file, open_dicom_file_with_encoding};
+use super::text_encoding::TextEncoding;
 
 pub(crate) struct DisplayPixels {
     pub(crate) width: usize,
@@ -135,8 +136,17 @@ pub(crate) struct LoadedFrame {
 /// Open a DICOM file, extract its metadata, and decode a single frame.
 /// This is the expensive step (disk read + decompress); callers cache the
 /// result and use [`render_frame`] for window/level changes.
+#[cfg(test)]
 pub(crate) fn load_dicom_frame(dicom_path: &Path, frame_index: u32) -> Result<LoadedFrame> {
-    let mut dicom_object = open_dicom_file(dicom_path)
+    load_dicom_frame_with_encoding(dicom_path, frame_index, TextEncoding::DicomDefault)
+}
+
+pub(crate) fn load_dicom_frame_with_encoding(
+    dicom_path: &Path,
+    frame_index: u32,
+    text_encoding: TextEncoding,
+) -> Result<LoadedFrame> {
+    let mut dicom_object = open_dicom_file_with_encoding(dicom_path, text_encoding)
         .with_context(|| format!("could not open DICOM file {}", dicom_path.display()))?;
 
     let metadata = extract_dicom_metadata(&dicom_object);

@@ -4,12 +4,16 @@ use std::path::Path;
 
 use eframe::egui;
 
+use crate::dicom::TextEncoding;
 use crate::theme;
+
+const AUTO_ENCODING_HELP: &str = "Uses the DICOM-declared character set when present. If SpecificCharacterSet is missing, attempts strict UTF-8, Korean, and Japanese detection. Ambiguous text uses DICOM default.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ToolbarAction {
     OpenDicom,
     OpenFolder,
+    SetEncoding(TextEncoding),
     ShowAbout,
     SetTheme(egui::ThemePreference),
 }
@@ -17,6 +21,8 @@ pub(super) enum ToolbarAction {
 pub(super) fn show_actions(
     ui: &mut egui::Ui,
     theme_preference: egui::ThemePreference,
+    can_reopen: bool,
+    text_encoding: TextEncoding,
 ) -> Option<ToolbarAction> {
     let mut action = None;
 
@@ -27,6 +33,53 @@ pub(super) fn show_actions(
 
         if ui.button("Open Folder").clicked() {
             action = Some(ToolbarAction::OpenFolder);
+        }
+
+        let button_label = encoding_button_label(text_encoding);
+        if can_reopen {
+            let mut selected_text_encoding = text_encoding;
+            let (response, _) =
+                egui::containers::menu::MenuButton::from_button(egui::Button::new(button_label))
+                    .config(
+                        egui::containers::menu::MenuConfig::new().style(theme::popup_menu_style),
+                    )
+                    .ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut selected_text_encoding,
+                            TextEncoding::Auto,
+                            "Auto",
+                        )
+                        .on_hover_text(AUTO_ENCODING_HELP);
+                        ui.selectable_value(
+                            &mut selected_text_encoding,
+                            TextEncoding::DicomDefault,
+                            "DICOM default",
+                        );
+                        ui.selectable_value(
+                            &mut selected_text_encoding,
+                            TextEncoding::Utf8,
+                            "UTF-8",
+                        );
+                        ui.selectable_value(
+                            &mut selected_text_encoding,
+                            TextEncoding::KoreanEucKr,
+                            "Korean (EUC-KR)",
+                        );
+                        ui.selectable_value(
+                            &mut selected_text_encoding,
+                            TextEncoding::JapaneseShiftJis,
+                            "Japanese (Shift-JIS)",
+                        );
+                    });
+            if text_encoding == TextEncoding::Auto {
+                response.on_hover_text(AUTO_ENCODING_HELP);
+            }
+            if selected_text_encoding != text_encoding {
+                action = Some(ToolbarAction::SetEncoding(selected_text_encoding));
+            }
+        } else {
+            ui.add_enabled(false, egui::Button::new(button_label))
+                .on_hover_text(AUTO_ENCODING_HELP);
         }
 
         let mut selected_theme_preference = theme_preference;
@@ -66,6 +119,16 @@ pub(super) fn show_actions(
     });
 
     action
+}
+
+fn encoding_button_label(text_encoding: TextEncoding) -> &'static str {
+    match text_encoding {
+        TextEncoding::Auto => "Encoding: Auto",
+        TextEncoding::DicomDefault => "Encoding: DICOM",
+        TextEncoding::KoreanEucKr => "Encoding: Korean",
+        TextEncoding::Utf8 => "Encoding: UTF-8",
+        TextEncoding::JapaneseShiftJis => "Encoding: Japanese",
+    }
 }
 
 fn theme_preference_label(theme_preference: egui::ThemePreference) -> &'static str {
