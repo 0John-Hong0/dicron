@@ -6,6 +6,9 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Add a compact Encoding menu with Auto, DICOM default, UTF-8, Korean (EUC-KR), and Japanese
+  (Shift-JIS) choices. Auto uses strict detection only when no character set is declared;
+  changing modes reopens the current source while preserving the selected image and view.
 - Fix opening DICOM images with an empty optional VOI LUT Function value.
 
 ## [0.3.0] - 2026-09-09

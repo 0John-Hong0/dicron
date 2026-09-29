@@ -23,7 +23,12 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
     egui::Panel::top("toolbar_panel")
         .frame(theme::toolbar_panel_frame(ui.style()))
         .show_inside(ui, |ui| {
-            if let Some(action) = toolbar::show_actions(ui, app.settings.theme_preference) {
+            if let Some(action) = toolbar::show_actions(
+                ui,
+                app.settings.theme_preference,
+                app.open_source.is_some() && !app.scan.is_active(),
+                app.text_encoding,
+            ) {
                 app.handle_toolbar_action(ui.ctx(), action);
             }
 
@@ -127,6 +132,9 @@ impl DicronApp {
         match action {
             ToolbarAction::OpenDicom => self.open_dicom_file(context),
             ToolbarAction::OpenFolder => self.open_dicom_folder(context),
+            ToolbarAction::SetEncoding(text_encoding) => {
+                self.reopen_with_encoding(context, text_encoding);
+            }
             ToolbarAction::ShowAbout => self.about_dialog.open(context),
             ToolbarAction::SetTheme(theme_preference) => {
                 self.set_theme_preference(context, theme_preference);

@@ -9,11 +9,16 @@ use rfd::FileDialog;
 use crate::app::DicronApp;
 use crate::app::frame_cache::DecodedCacheEntry;
 use crate::app::state::{
-    PLAYBACK_MAX_FPS, PLAYBACK_MIN_FPS, PlaybackLoopMode, SliceSelection, WINDOW_PRESETS,
-    WindowLevel, WindowPreset,
+    OpenSource, PLAYBACK_MAX_FPS, PLAYBACK_MIN_FPS, PlaybackLoopMode, ReopenViewState,
+    SliceSelection, WINDOW_PRESETS, WindowLevel, WindowPreset,
 };
 use crate::app::ui::upload_display_pixels;
-use crate::dicom::{DicomWindow, SliceItem, build_for_file, load_dicom_frame, render_frame};
+#[cfg(test)]
+use crate::dicom::build_for_file;
+use crate::dicom::{
+    DicomWindow, SliceItem, TextEncoding, build_for_file_with_encoding,
+    load_dicom_frame_with_encoding, render_frame,
+};
 
 impl DicronApp {
     pub(crate) fn open_startup_paths(
@@ -75,20 +80,59 @@ impl DicronApp {
         selected_dicom_path: PathBuf,
     ) {
         self.settings.remember_open_dicom_path(&selected_dicom_path);
+        self.open_source = Some(OpenSource::File(selected_dicom_path.clone()));
+        self.text_encoding = TextEncoding::Auto;
+        self.reopen_selection = None;
+        self.reopen_view_state = None;
+        self.open_dicom_file_path_with_encoding(context, selected_dicom_path);
+    }
 
+    fn open_dicom_file_path_with_encoding(
+        &mut self,
+        context: &egui::Context,
+        selected_dicom_path: PathBuf,
+    ) {
         self.cancel_active_scan();
         self.clear_loaded_dicom_state();
         self.clear_scan();
 
-        match build_for_file(&selected_dicom_path) {
+        match build_for_file_with_encoding(&selected_dicom_path, self.text_encoding) {
             Ok(dicom_index) => {
                 self.dicom_index = Some(dicom_index);
                 self.error_message = None;
-                self.load_first_available_slice(context);
+                let preferred = self.reopen_selection.take();
+                self.load_preferred_slice(context, preferred.as_ref());
             }
             Err(error) => {
+                self.reopen_selection = None;
+                self.reopen_view_state = None;
                 self.error_message = Some(format!("Failed to index DICOM: {error:#}"));
             }
+        }
+    }
+
+    pub(super) fn reopen_with_encoding(
+        &mut self,
+        context: &egui::Context,
+        text_encoding: TextEncoding,
+    ) {
+        let Some(source) = self.open_source.clone() else {
+            return;
+        };
+        self.reopen_selection = self
+            .selected_dicom_path
+            .clone()
+            .map(|path| (path, self.selected_dicom_frame_index));
+        self.reopen_view_state = self.reopen_selection.as_ref().map(|_| ReopenViewState {
+            viewport_transform: self.viewport_transform,
+            window_level: self.window_level_for_selection(self.selected_slice),
+        });
+        self.text_encoding = text_encoding;
+
+        match source {
+            OpenSource::File(path) => self.open_dicom_file_path_with_encoding(context, path),
+            OpenSource::Folder(path) => self.start_dicom_folder_scan(context, path),
+            OpenSource::Inputs(paths) => self.start_dicom_inputs_scan(context, paths),
         }
     }
 
@@ -158,29 +202,77 @@ fn filter_nonempty_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 impl DicronApp {
-    pub(super) fn load_first_available_slice(&mut self, context: &egui::Context) {
-        let first_available_indices = {
-            let Some(dicom_index) = &self.dicom_index else {
-                return;
-            };
-            let mut found = None;
-
-            'search: for (patient_index, patient) in dicom_index.patients.iter().enumerate() {
+    pub(in crate::app) fn load_preferred_slice(
+        &mut self,
+        context: &egui::Context,
+        preferred: Option<&(PathBuf, u32)>,
+    ) {
+        let preferred_indices = self.dicom_index.as_ref().and_then(|index| {
+            let (path, frame_index) = preferred?;
+            for (patient_index, patient) in index.patients.iter().enumerate() {
                 for (study_index, study) in patient.studies.iter().enumerate() {
                     for (series_index, series) in study.series_groups.iter().enumerate() {
-                        if !series.slices.is_empty() {
-                            found = Some((patient_index, study_index, series_index, 0));
-                            break 'search;
+                        for (slice_index, slice) in series.slices.iter().enumerate() {
+                            if &slice.path == path && slice.frame_index == *frame_index {
+                                return Some(SliceSelection::new(
+                                    patient_index,
+                                    study_index,
+                                    series_index,
+                                    slice_index,
+                                ));
+                            }
                         }
                     }
                 }
             }
-            found
-        };
+            None
+        });
 
-        if let Some((patient, study, series, slice)) = first_available_indices {
-            self.load_slice_by_indices(context, patient, study, series, slice);
+        let reopen_view_state = self
+            .reopen_view_state
+            .take()
+            .filter(|_| preferred_indices.is_some());
+        let selection = preferred_indices.or_else(|| self.first_available_slice_selection());
+        let Some(selection) = selection else {
+            return;
+        };
+        if let Some(window_level) = reopen_view_state.and_then(|state| state.window_level) {
+            self.window_level
+                .by_series
+                .insert(selection.series_key(), window_level);
         }
+        if self.load_slice_by_indices(
+            context,
+            selection.patient_index,
+            selection.study_index,
+            selection.series_index,
+            selection.slice_index,
+        ) {
+            if let Some(state) = reopen_view_state {
+                self.viewport_transform = state.viewport_transform;
+            }
+        } else {
+            self.window_level.by_series.remove(&selection.series_key());
+        }
+    }
+
+    fn first_available_slice_selection(&self) -> Option<SliceSelection> {
+        let dicom_index = self.dicom_index.as_ref()?;
+        for (patient_index, patient) in dicom_index.patients.iter().enumerate() {
+            for (study_index, study) in patient.studies.iter().enumerate() {
+                for (series_index, series) in study.series_groups.iter().enumerate() {
+                    if !series.slices.is_empty() {
+                        return Some(SliceSelection::new(
+                            patient_index,
+                            study_index,
+                            series_index,
+                            0,
+                        ));
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub(super) fn load_slice_by_indices(
@@ -729,7 +821,7 @@ impl DicronApp {
         });
 
         if self.decoded_cache.get(&dicom_path, frame_index).is_none() {
-            match load_dicom_frame(&dicom_path, frame_index) {
+            match load_dicom_frame_with_encoding(&dicom_path, frame_index, self.text_encoding) {
                 Ok(loaded) => self.decoded_cache.insert(DecodedCacheEntry {
                     path: dicom_path.clone(),
                     frame_index,
@@ -1015,6 +1107,7 @@ mod loading_tests {
 
     use dicom_core::{DataElement, PrimitiveValue, VR};
     use dicom_dictionary_std::{tags, uids};
+    use dicom_encoding::text::TextCodec;
     use dicom_object::{FileDicomObject, FileMetaTableBuilder};
 
     use super::*;
@@ -1060,6 +1153,106 @@ mod loading_tests {
             PrimitiveValue::from(vec![128_u8]),
         ));
         object.write_to_file(path).unwrap();
+    }
+
+    fn finish_scan(app: &mut DicronApp, context: &egui::Context) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.scan.is_active() {
+            assert!(Instant::now() < deadline, "source scan did not finish");
+            app.receive_scan_messages(context);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.error_message.is_none());
+    }
+
+    #[test]
+    fn reopening_with_encoding_updates_tree_and_metadata_and_keeps_the_selected_file() {
+        let path = temporary_file_path("reopen-korean");
+        write_single_pixel_dicom(&path);
+        let mut object = dicom_object::open_file(&path).unwrap();
+        object.put_element(DataElement::new(
+            tags::PATIENT_NAME,
+            VR::PN,
+            PrimitiveValue::from("ABCDEF"),
+        ));
+        object.write_to_file(&path).unwrap();
+        let mut encoded_file = std::fs::read(&path).unwrap();
+        let encoded_name = TextEncoding::KoreanEucKr
+            .assumed_character_set()
+            .encode("홍길동")
+            .unwrap();
+        let name_offset = encoded_file
+            .windows(6)
+            .position(|window| window == b"ABCDEF")
+            .unwrap();
+        encoded_file[name_offset..name_offset + 6].copy_from_slice(&encoded_name);
+        std::fs::write(&path, &encoded_file).unwrap();
+
+        let context = egui::Context::default();
+        let mut app = DicronApp {
+            dicom_index: Some(build_for_file(&path).unwrap()),
+            open_source: Some(OpenSource::File(path.clone())),
+            ..Default::default()
+        };
+        app.load_preferred_slice(&context, None);
+        assert_eq!(app.selected_dicom_path.as_deref(), Some(path.as_path()));
+        let viewport = crate::app::state::ViewportTransform {
+            zoom: 2.0,
+            pan: egui::vec2(12.0, -4.0),
+            flip_horizontal: true,
+            flip_vertical: false,
+            rotation_quarters: 1,
+        };
+        let saved_window = crate::app::state::SavedWindowLevel {
+            window: WindowLevel {
+                center: 100.0,
+                width: 200.0,
+            },
+            preset: None,
+        };
+        app.viewport_transform = viewport;
+        app.window_level.by_series.insert((0, 0, 0), saved_window);
+
+        app.reopen_with_encoding(&context, TextEncoding::Auto);
+        assert_eq!(app.text_encoding, TextEncoding::Auto);
+        assert!(app.error_message.is_none());
+        assert_eq!(
+            app.dicom_index.as_ref().unwrap().patients[0].display_name,
+            "홍길동"
+        );
+        assert_eq!(
+            app.metadata
+                .overlay
+                .as_ref()
+                .unwrap()
+                .patient_label
+                .as_deref(),
+            Some("홍길동")
+        );
+        assert_eq!(app.selected_dicom_path.as_deref(), Some(path.as_path()));
+        assert_eq!(app.viewport_transform, viewport);
+        assert_eq!(app.window_level.current, saved_window.window);
+
+        app.open_source = Some(OpenSource::Inputs(vec![path.clone()]));
+        app.reopen_with_encoding(&context, TextEncoding::DicomDefault);
+        assert!(app.scan.is_active());
+        finish_scan(&mut app, &context);
+        assert_ne!(
+            app.dicom_index.as_ref().unwrap().patients[0].display_name,
+            "홍길동"
+        );
+        app.reopen_with_encoding(&context, TextEncoding::KoreanEucKr);
+        assert_eq!(app.text_encoding, TextEncoding::KoreanEucKr);
+        finish_scan(&mut app, &context);
+        assert_eq!(
+            app.dicom_index.as_ref().unwrap().patients[0].display_name,
+            "홍길동"
+        );
+        assert_eq!(app.selected_dicom_path.as_deref(), Some(path.as_path()));
+        assert_eq!(app.viewport_transform, viewport);
+        assert_eq!(app.window_level.current, saved_window.window);
+        assert_eq!(std::fs::read(&path).unwrap(), encoded_file);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

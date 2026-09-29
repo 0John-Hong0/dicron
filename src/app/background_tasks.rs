@@ -9,8 +9,10 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use crate::app::DicronApp;
+use crate::app::state::OpenSource;
 use crate::dicom::{
-    BuildProgress, DicomIndex, build_for_inputs_with_progress, build_from_folder_with_progress,
+    BuildProgress, DicomIndex, TextEncoding, build_for_inputs_with_progress_with_encoding,
+    build_from_folder_with_progress_with_encoding,
 };
 use crate::release_check::{self, UpdateCheckOutcome};
 
@@ -100,6 +102,18 @@ impl DicronApp {
     ) {
         self.settings
             .remember_open_folder_path(&selected_folder_path);
+        self.open_source = Some(OpenSource::Folder(selected_folder_path.clone()));
+        self.text_encoding = TextEncoding::Auto;
+        self.reopen_selection = None;
+        self.reopen_view_state = None;
+        self.start_dicom_folder_scan(context, selected_folder_path);
+    }
+
+    pub(in crate::app) fn start_dicom_folder_scan(
+        &mut self,
+        context: &egui::Context,
+        selected_folder_path: PathBuf,
+    ) {
         self.cancel_active_scan();
 
         let (scan_sender, scan_receiver) = mpsc::channel();
@@ -107,11 +121,13 @@ impl DicronApp {
         let scan_cancel = Arc::new(AtomicBool::new(false));
         let scan_cancel_for_thread = Arc::clone(&scan_cancel);
         let scan_context = context.clone();
+        let text_encoding = self.text_encoding;
 
         thread::spawn(move || {
-            let scan_result = build_from_folder_with_progress(
+            let scan_result = build_from_folder_with_progress_with_encoding(
                 &folder_path_for_thread,
                 &scan_cancel_for_thread,
+                text_encoding,
                 |progress| {
                     let _ = scan_sender.send(ScanMessage::Progress(progress));
                 },
@@ -150,17 +166,31 @@ impl DicronApp {
             }
         }
 
+        self.open_source = Some(OpenSource::Inputs(dropped_paths.clone()));
+        self.text_encoding = TextEncoding::Auto;
+        self.reopen_selection = None;
+        self.reopen_view_state = None;
+        self.start_dicom_inputs_scan(context, dropped_paths);
+    }
+
+    pub(in crate::app) fn start_dicom_inputs_scan(
+        &mut self,
+        context: &egui::Context,
+        dropped_paths: Vec<PathBuf>,
+    ) {
         self.cancel_active_scan();
         let source_label = format!("{} dropped paths", dropped_paths.len());
         let (scan_sender, scan_receiver) = mpsc::channel();
         let scan_cancel = Arc::new(AtomicBool::new(false));
         let scan_cancel_for_thread = Arc::clone(&scan_cancel);
         let scan_context = context.clone();
+        let text_encoding = self.text_encoding;
 
         thread::spawn(move || {
-            let scan_result = build_for_inputs_with_progress(
+            let scan_result = build_for_inputs_with_progress_with_encoding(
                 &dropped_paths,
                 &scan_cancel_for_thread,
+                text_encoding,
                 |progress| {
                     let _ = scan_sender.send(ScanMessage::Progress(progress));
                 },
@@ -220,14 +250,19 @@ impl DicronApp {
                         Ok(dicom_index) if dicom_index.total_file_count > 0 => {
                             self.dicom_index = Some(dicom_index);
                             self.error_message = None;
-                            self.load_first_available_slice(context);
+                            let preferred = self.reopen_selection.take();
+                            self.load_preferred_slice(context, preferred.as_ref());
                         }
                         Ok(_) => {
+                            self.reopen_selection = None;
+                            self.reopen_view_state = None;
                             self.error_message =
                                 Some("No displayable DICOM images found.".to_owned());
                             self.dicom_index = None;
                         }
                         Err(error_message) => {
+                            self.reopen_selection = None;
+                            self.reopen_view_state = None;
                             self.error_message =
                                 Some(format!("Failed to scan folder: {error_message}"));
                             self.dicom_index = None;
@@ -240,6 +275,8 @@ impl DicronApp {
                     should_keep_receiver = false;
                     self.scan.state = None;
                     self.scan.cancel = None;
+                    self.reopen_selection = None;
+                    self.reopen_view_state = None;
                     self.error_message = Some("Folder scan stopped unexpectedly.".to_owned());
                     break;
                 }
