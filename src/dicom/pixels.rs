@@ -4,6 +4,8 @@ use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
+use dicom_core::header::HasLength;
+use dicom_dictionary_std::tags;
 use dicom_object::DefaultDicomObject;
 use dicom_pixeldata::{ConvertOptions, DecodedPixelData, PixelDecoder, VoiLutOption, WindowLevel};
 
@@ -134,11 +136,11 @@ pub(crate) struct LoadedFrame {
 /// This is the expensive step (disk read + decompress); callers cache the
 /// result and use [`render_frame`] for window/level changes.
 pub(crate) fn load_dicom_frame(dicom_path: &Path, frame_index: u32) -> Result<LoadedFrame> {
-    let dicom_object = open_dicom_file(dicom_path)
+    let mut dicom_object = open_dicom_file(dicom_path)
         .with_context(|| format!("could not open DICOM file {}", dicom_path.display()))?;
 
     let metadata = extract_dicom_metadata(&dicom_object);
-    let frame = decode_frame(&dicom_object, frame_index)?;
+    let frame = decode_frame(&mut dicom_object, frame_index)?;
 
     Ok(LoadedFrame { frame, metadata })
 }
@@ -148,8 +150,9 @@ pub(crate) fn load_dicom_thumbnail(
     frame_index: u32,
     max_edge: u32,
 ) -> Result<DisplayPixels> {
-    let dicom_object = open_dicom_file(dicom_path)
+    let mut dicom_object = open_dicom_file(dicom_path)
         .with_context(|| format!("could not open DICOM file {}", dicom_path.display()))?;
+    remove_empty_voi_lut_function(&mut dicom_object);
     let decoded = dicom_object
         .decode_pixel_data_frame(frame_index)
         .with_context(|| {
@@ -178,7 +181,8 @@ pub(crate) fn load_dicom_thumbnail(
     })
 }
 
-fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<DecodedFrame> {
+fn decode_frame(dicom_object: &mut DefaultDicomObject, frame_index: u32) -> Result<DecodedFrame> {
+    remove_empty_voi_lut_function(dicom_object);
     let decoded = dicom_object
         .decode_pixel_data_frame(frame_index)
         .with_context(|| {
@@ -204,6 +208,17 @@ fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<D
         value_range: compute_value_range(dicom_object),
         window_level_available,
     })
+}
+
+fn remove_empty_voi_lut_function(dicom_object: &mut DefaultDicomObject) {
+    // A zero-length optional VOI LUT Function is equivalent to an absent value.
+    // dicom-pixeldata rejects the empty element before decoding any pixels.
+    if dicom_object
+        .element(tags::VOILUT_FUNCTION)
+        .is_ok_and(|element| element.length().get() == Some(0))
+    {
+        dicom_object.remove_element(tags::VOILUT_FUNCTION);
+    }
 }
 
 fn build_pixel_probe(decoded: &DecodedPixelData<'_>) -> Option<PixelProbeData> {
@@ -353,8 +368,75 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{finite_value_range, thumbnail_dimensions};
+    use dicom_core::{DataElement, PrimitiveValue, VR};
+    use dicom_dictionary_std::{tags, uids};
+    use dicom_object::{FileDicomObject, FileMetaTableBuilder};
     use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
+
+    use super::{
+        decode_frame, finite_value_range, load_dicom_frame, load_dicom_thumbnail, render_frame,
+        thumbnail_dimensions,
+    };
+
+    #[test]
+    fn empty_voi_lut_function_does_not_block_frame_or_thumbnail() {
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .media_storage_sop_class_uid(uids::SECONDARY_CAPTURE_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid("2.25.302")
+            .build()
+            .unwrap();
+        let mut object = FileDicomObject::new_empty_with_meta(meta);
+        for (tag, value) in [
+            (tags::ROWS, 2_u16),
+            (tags::COLUMNS, 2_u16),
+            (tags::SAMPLES_PER_PIXEL, 1_u16),
+            (tags::BITS_ALLOCATED, 8_u16),
+            (tags::BITS_STORED, 8_u16),
+            (tags::HIGH_BIT, 7_u16),
+            (tags::PIXEL_REPRESENTATION, 0_u16),
+        ] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            PrimitiveValue::from("MONOCHROME2"),
+        ));
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from(vec![0_u8; 4]),
+        ));
+        object.put_element(DataElement::new(
+            tags::VOILUT_FUNCTION,
+            VR::CS,
+            PrimitiveValue::Empty,
+        ));
+
+        let frame = decode_frame(&mut object, 0).unwrap();
+        assert_eq!(
+            (render_frame(&frame, None).unwrap().width, frame.frame_count),
+            (2, 1)
+        );
+        assert!(object.element(tags::VOILUT_FUNCTION).is_err());
+
+        let path = std::env::temp_dir().join(format!(
+            "dicron-empty-voi-lut-function-{}.dcm",
+            std::process::id()
+        ));
+        object.put_element(DataElement::new(
+            tags::VOILUT_FUNCTION,
+            VR::CS,
+            PrimitiveValue::Empty,
+        ));
+        object.write_to_file(&path).unwrap();
+        let loaded = load_dicom_frame(&path, 0).unwrap();
+        assert_eq!(render_frame(&loaded.frame, None).unwrap().height, 2);
+        let thumbnail = load_dicom_thumbnail(&path, 0, 128).unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (2, 2));
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn thumbnail_dimensions_fit_landscape_images_within_the_bound() {
