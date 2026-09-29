@@ -1,40 +1,51 @@
-//! Scan progress and dismissible warning/error status rendering.
+//! Scan/image-loading progress and dismissible warning/error status rendering.
 
 use std::time::Duration;
 
 use eframe::egui;
 
 use crate::app::background_tasks::ScanProgress;
+use crate::app::frame_loading::FrameLoadPhase;
 
-pub(super) fn show_scan_status(ui: &mut egui::Ui, scan_state: Option<&ScanProgress>) {
-    let Some(scan_state) = scan_state else {
-        return;
-    };
-
-    ui.separator();
-    ui.label(format!("Scanning: {}", scan_state.source_label));
-
-    let progress = if scan_state.total_file_count == 0 {
-        0.0
-    } else {
-        scan_state.processed_file_count as f32 / scan_state.total_file_count as f32
-    };
-
-    let eta_text = estimate_scan_eta(scan_state)
-        .map(format_duration)
-        .unwrap_or_else(|| "calculating...".to_owned());
-
-    ui.add(
-        egui::ProgressBar::new(progress)
-            .show_percentage()
-            .text(format!(
+pub(super) fn show_loading_status(
+    ui: &mut egui::Ui,
+    scan_state: Option<&ScanProgress>,
+    image_phase: Option<FrameLoadPhase>,
+) -> Option<egui::Response> {
+    let (source, progress, text) = if let Some(scan_state) = scan_state {
+        let progress = if scan_state.total_file_count == 0 {
+            0.0
+        } else {
+            scan_state.processed_file_count as f32 / scan_state.total_file_count as f32
+        };
+        let eta_text = estimate_scan_eta(scan_state)
+            .map(format_duration)
+            .unwrap_or_else(|| "calculating...".to_owned());
+        (
+            format!("Scanning: {}", scan_state.source_label),
+            progress,
+            format!(
                 "Scanning {} / {} files | {} DICOM | ETA {}",
                 scan_state.processed_file_count,
                 scan_state.total_file_count,
                 scan_state.readable_dicom_count,
                 eta_text
-            )),
-    );
+            ),
+        )
+    } else if let Some(phase) = image_phase {
+        (
+            "Loading image".to_owned(),
+            phase.progress(),
+            format!("Loading image | {}…", phase.label()),
+        )
+    } else {
+        return None;
+    };
+
+    ui.separator();
+    ui.add(egui::Label::new(&source).truncate())
+        .on_hover_text(source);
+    Some(ui.add(egui::ProgressBar::new(progress).animate(false).text(text)))
 }
 
 pub(super) fn show_error_status(ui: &mut egui::Ui, error_message: Option<&str>) -> bool {

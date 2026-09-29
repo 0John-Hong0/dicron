@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Keep the window responsive while images open, and show the loading progress bar right away in
+  one steady place from folder scanning until the image appears.
 - Add a compact Encoding menu with Auto, DICOM default, UTF-8, Korean (EUC-KR), and Japanese
   (Shift-JIS) choices. Auto uses strict detection only when no character set is declared;
   changing modes reopens the current source while preserving the selected image and view.

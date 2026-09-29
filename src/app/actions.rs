@@ -10,7 +10,7 @@ use crate::app::DicronApp;
 use crate::app::frame_cache::DecodedCacheEntry;
 use crate::app::state::{
     OpenSource, PLAYBACK_MAX_FPS, PLAYBACK_MIN_FPS, PlaybackLoopMode, ReopenViewState,
-    SliceSelection, WINDOW_PRESETS, WindowLevel, WindowPreset,
+    SavedWindowLevel, SliceSelection, WINDOW_PRESETS, WindowLevel, WindowPreset,
 };
 use crate::app::ui::upload_display_pixels;
 #[cfg(test)]
@@ -236,24 +236,20 @@ impl DicronApp {
         let Some(selection) = selection else {
             return;
         };
+        let Some(slice) = self.get_slice_by_indices(
+            selection.patient_index,
+            selection.study_index,
+            selection.series_index,
+            selection.slice_index,
+        ) else {
+            return;
+        };
         if let Some(window_level) = reopen_view_state.and_then(|state| state.window_level) {
             self.window_level
                 .by_series
                 .insert(selection.series_key(), window_level);
         }
-        if self.load_slice_by_indices(
-            context,
-            selection.patient_index,
-            selection.study_index,
-            selection.series_index,
-            selection.slice_index,
-        ) {
-            if let Some(state) = reopen_view_state {
-                self.viewport_transform = state.viewport_transform;
-            }
-        } else {
-            self.window_level.by_series.remove(&selection.series_key());
-        }
+        self.start_frame_load(context, slice, selection, reopen_view_state);
     }
 
     fn first_available_slice_selection(&self) -> Option<SliceSelection> {
@@ -795,7 +791,7 @@ fn next_slice_index(
     }
 }
 
-struct PreparedFrame {
+pub(in crate::app) struct PreparedFrame {
     default_window: WindowLevel,
     current_window: WindowLevel,
     window_customized: bool,
@@ -804,7 +800,32 @@ struct PreparedFrame {
     value_range: (f64, f64),
     window_level_available: bool,
     metadata: crate::dicom::DicomMetadata,
-    pixels: anyhow::Result<crate::dicom::DisplayPixels>,
+}
+
+pub(in crate::app) fn prepare_frame(
+    entry: &DecodedCacheEntry,
+    saved_window_level: Option<SavedWindowLevel>,
+) -> anyhow::Result<(PreparedFrame, crate::dicom::DisplayPixels)> {
+    let (default_center, default_width) = entry.frame.default_center_width();
+    let window_customized = saved_window_level.is_some();
+    let center = saved_window_level.map_or(default_center, |saved| saved.window.center);
+    let width = saved_window_level.map_or(default_width, |saved| saved.window.width);
+    let effective_window = window_customized.then_some(DicomWindow { center, width });
+    let pixels = render_frame(&entry.frame, effective_window)?;
+    let prepared = PreparedFrame {
+        default_window: WindowLevel {
+            center: default_center,
+            width: default_width,
+        },
+        current_window: WindowLevel { center, width },
+        window_customized,
+        active_window_preset: saved_window_level.and_then(|saved| saved.preset),
+        frame_count: entry.frame.frame_count,
+        value_range: entry.frame.value_range,
+        window_level_available: entry.frame.window_level_available(),
+        metadata: entry.metadata.clone(),
+    };
+    Ok((prepared, pixels))
 }
 
 impl DicronApp {
@@ -815,10 +836,8 @@ impl DicronApp {
         frame_index: u32,
         target_selection: Option<SliceSelection>,
     ) -> bool {
-        let should_fit_viewport = target_selection.is_some_and(|target| {
-            self.selected_slice
-                .is_none_or(|current| current.series_key() != target.series_key())
-        });
+        // A direct slice selection replaces any pending initial/reopened image.
+        self.frame_load.clear();
 
         if self.decoded_cache.get(&dicom_path, frame_index).is_none() {
             match load_dicom_frame_with_encoding(&dicom_path, frame_index, self.text_encoding) {
@@ -841,30 +860,11 @@ impl DicronApp {
                 self.error_message = Some("Failed to retrieve decoded DICOM frame.".to_owned());
                 return false;
             };
-            let (default_center, default_width) = entry.frame.default_center_width();
-            let window_customized = saved_window_level.is_some();
-            let center = saved_window_level.map_or(default_center, |saved| saved.window.center);
-            let width = saved_window_level.map_or(default_width, |saved| saved.window.width);
-            let effective_window = window_customized.then_some(DicomWindow { center, width });
-
-            PreparedFrame {
-                default_window: WindowLevel {
-                    center: default_center,
-                    width: default_width,
-                },
-                current_window: WindowLevel { center, width },
-                window_customized,
-                active_window_preset: saved_window_level.and_then(|saved| saved.preset),
-                frame_count: entry.frame.frame_count,
-                value_range: entry.frame.value_range,
-                window_level_available: entry.frame.window_level_available(),
-                metadata: entry.metadata.clone(),
-                pixels: render_frame(&entry.frame, effective_window),
-            }
+            prepare_frame(entry, saved_window_level)
         };
 
-        let pixels = match prepared.pixels {
-            Ok(pixels) => pixels,
+        let (prepared, pixels) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
                 self.error_message = Some(format!("Failed to render DICOM: {error:#}"));
                 return false;
@@ -872,7 +872,28 @@ impl DicronApp {
         };
 
         let loaded_texture = upload_display_pixels(context, texture_name(&dicom_path), pixels);
+        self.display_prepared_frame(
+            dicom_path,
+            frame_index,
+            target_selection,
+            prepared,
+            loaded_texture,
+        );
+        true
+    }
 
+    pub(in crate::app) fn display_prepared_frame(
+        &mut self,
+        dicom_path: PathBuf,
+        frame_index: u32,
+        target_selection: Option<SliceSelection>,
+        prepared: PreparedFrame,
+        loaded_texture: egui::TextureHandle,
+    ) {
+        let should_fit_viewport = target_selection.is_some_and(|target| {
+            self.selected_slice
+                .is_none_or(|current| current.series_key() != target.series_key())
+        });
         if should_fit_viewport {
             self.viewport_transform = Default::default();
             self.viewport_zoom_anchor = None;
@@ -897,7 +918,6 @@ impl DicronApp {
         self.current_frame_key = Some((dicom_path.clone(), frame_index));
         self.selected_dicom_path = Some(dicom_path);
         self.error_message = None;
-        true
     }
 
     pub(in crate::app) fn refresh_dicom_texture(&mut self, context: &egui::Context) {
@@ -925,7 +945,7 @@ impl DicronApp {
     }
 }
 
-fn texture_name(dicom_path: &std::path::Path) -> &str {
+pub(in crate::app) fn texture_name(dicom_path: &std::path::Path) -> &str {
     dicom_path
         .file_name()
         .and_then(|file_name| file_name.to_str())
@@ -934,6 +954,7 @@ fn texture_name(dicom_path: &std::path::Path) -> &str {
 
 impl DicronApp {
     pub(in crate::app) fn clear_loaded_dicom_state(&mut self) {
+        self.frame_load.clear();
         self.selected_dicom_path = None;
         self.loaded_texture = None;
         self.decoded_cache.clear();
@@ -1155,11 +1176,12 @@ mod loading_tests {
         object.write_to_file(path).unwrap();
     }
 
-    fn finish_scan(app: &mut DicronApp, context: &egui::Context) {
+    fn finish_source_load(app: &mut DicronApp, context: &egui::Context) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while app.scan.is_active() {
-            assert!(Instant::now() < deadline, "source scan did not finish");
+        while app.scan.is_active() || app.frame_load.is_active() {
+            assert!(Instant::now() < deadline, "source load did not finish");
             app.receive_scan_messages(context);
+            app.receive_frame_load(context);
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(app.error_message.is_none());
@@ -1195,6 +1217,8 @@ mod loading_tests {
             ..Default::default()
         };
         app.load_preferred_slice(&context, None);
+        assert!(app.frame_load.is_active());
+        finish_source_load(&mut app, &context);
         assert_eq!(app.selected_dicom_path.as_deref(), Some(path.as_path()));
         let viewport = crate::app::state::ViewportTransform {
             zoom: 2.0,
@@ -1215,7 +1239,8 @@ mod loading_tests {
 
         app.reopen_with_encoding(&context, TextEncoding::Auto);
         assert_eq!(app.text_encoding, TextEncoding::Auto);
-        assert!(app.error_message.is_none());
+        assert!(app.frame_load.is_active());
+        finish_source_load(&mut app, &context);
         assert_eq!(
             app.dicom_index.as_ref().unwrap().patients[0].display_name,
             "홍길동"
@@ -1236,14 +1261,14 @@ mod loading_tests {
         app.open_source = Some(OpenSource::Inputs(vec![path.clone()]));
         app.reopen_with_encoding(&context, TextEncoding::DicomDefault);
         assert!(app.scan.is_active());
-        finish_scan(&mut app, &context);
+        finish_source_load(&mut app, &context);
         assert_ne!(
             app.dicom_index.as_ref().unwrap().patients[0].display_name,
             "홍길동"
         );
         app.reopen_with_encoding(&context, TextEncoding::KoreanEucKr);
         assert_eq!(app.text_encoding, TextEncoding::KoreanEucKr);
-        finish_scan(&mut app, &context);
+        finish_source_load(&mut app, &context);
         assert_eq!(
             app.dicom_index.as_ref().unwrap().patients[0].display_name,
             "홍길동"
