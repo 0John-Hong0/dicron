@@ -3,6 +3,7 @@
 mod actions;
 mod background_tasks;
 mod frame_cache;
+mod frame_loading;
 mod series_thumbnail_cache;
 mod state;
 mod ui;

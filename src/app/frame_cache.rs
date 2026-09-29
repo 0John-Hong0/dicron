@@ -1,4 +1,4 @@
-//! Most-recently-used cache of synchronously decoded DICOM frames and metadata.
+//! Most-recently-used cache of decoded DICOM frames and metadata.
 
 use std::path::{Path, PathBuf};
 

@@ -12,6 +12,7 @@ use crate::settings::AppSettings;
 
 use super::background_tasks::{ReleaseCheckJob, ScanController};
 use super::frame_cache::DecodedCache;
+use super::frame_loading::FrameLoadController;
 use super::series_thumbnail_cache::SeriesThumbnailCache;
 
 pub(super) type SeriesKey = (usize, usize, usize);
@@ -339,6 +340,7 @@ pub(crate) struct DicronApp {
     pub(super) selected_slice: Option<SliceSelection>,
     pub(super) last_slice_by_series: HashMap<SeriesKey, usize>,
     pub(super) scan: ScanController,
+    pub(super) frame_load: FrameLoadController,
     pub(super) viewer_scroll_slice_remainder: f32,
     pub(super) viewport_transform: ViewportTransform,
     pub(super) viewport_zoom_anchor: Option<egui::Pos2>,
@@ -375,6 +377,7 @@ impl Default for DicronApp {
             selected_slice: None,
             last_slice_by_series: HashMap::new(),
             scan: ScanController::default(),
+            frame_load: FrameLoadController::default(),
             viewer_scroll_slice_remainder: 0.0,
             viewport_transform: ViewportTransform::default(),
             viewport_zoom_anchor: None,

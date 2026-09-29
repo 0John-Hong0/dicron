@@ -15,6 +15,7 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
         .poll(ui.ctx(), check_for_updates_on_startup);
 
     app.receive_scan_messages(ui.ctx());
+    app.receive_frame_load(ui.ctx());
     app.handle_dropped_paths(ui.ctx());
     app.handle_keyboard_shortcuts(ui.ctx());
     app.handle_autoplay(ui.ctx());
@@ -26,7 +27,7 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
             if let Some(action) = toolbar::show_actions(
                 ui,
                 app.settings.theme_preference,
-                app.open_source.is_some() && !app.scan.is_active(),
+                app.open_source.is_some() && !app.scan.is_active() && !app.frame_load.is_active(),
                 app.text_encoding,
             ) {
                 app.handle_toolbar_action(ui.ctx(), action);
@@ -42,11 +43,15 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
                 }
             }
 
-            status::show_scan_status(ui, app.scan.progress());
+            let _ = status::show_loading_status(ui, app.scan.progress(), app.frame_load.progress());
 
             if status::show_error_status(ui, app.error_message.as_deref()) {
                 app.error_message = None;
             }
+
+            // The panel initially clips to its height from the previous frame. When loading
+            // adds status rows, rerun layout so those rows are visible in the grown panel.
+            request_toolbar_relayout_if_clipped(ui);
         });
 
     if app.panel_layout.is_collapsed(ResizeSide::Left) {
@@ -125,6 +130,97 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
 
     app.about_dialog.show_notification(ui.ctx());
     app.show_edit_windowing_dialog(ui.ctx());
+}
+
+fn request_toolbar_relayout_if_clipped(ui: &egui::Ui) {
+    if ui.min_rect().bottom() > ui.clip_rect().bottom() + 1.0 {
+        ui.ctx()
+            .request_discard("toolbar content grew beyond panel clip");
+    }
+}
+
+#[cfg(test)]
+mod toolbar_tests {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::app::background_tasks::ScanProgress;
+    use crate::app::frame_loading::FrameLoadPhase;
+
+    #[test]
+    fn loading_status_stays_visible_and_in_place_through_scan_to_image_handoff() {
+        let context = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1_200.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let show_toolbar =
+            |scan_state: Option<&ScanProgress>,
+             image_phase: Option<FrameLoadPhase>,
+             layouts: &mut Vec<(egui::Rect, Option<egui::Rect>, bool)>| {
+                context.run_ui(input(), |ui| {
+                    let panel = egui::Panel::top("test_toolbar")
+                        .frame(theme::toolbar_panel_frame(ui.style()))
+                        .show_inside(ui, |ui| {
+                            let _ = ui.button("Open Folder");
+                            let bar = status::show_loading_status(ui, scan_state, image_phase);
+                            let visible = ui.min_rect().bottom() <= ui.clip_rect().bottom() + 1.0;
+                            request_toolbar_relayout_if_clipped(ui);
+                            (bar.map(|bar| bar.rect), visible)
+                        });
+                    layouts.push((panel.response.rect, panel.inner.0, panel.inner.1));
+                })
+            };
+
+        let mut layouts = Vec::new();
+        show_toolbar(None, None, &mut layouts);
+        let idle_rect = layouts.last().unwrap().0;
+        assert!(layouts.last().unwrap().1.is_none());
+        let scan_state = ScanProgress {
+            source_label: "sample folder/".repeat(30),
+            started_at: Instant::now(),
+            processed_file_count: 0,
+            total_file_count: 4,
+            readable_dicom_count: 0,
+        };
+        layouts.clear();
+        let output = show_toolbar(Some(&scan_state), None, &mut layouts);
+
+        assert_eq!(
+            layouts.iter().map(|layout| layout.2).collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert_eq!(output.platform_output.num_completed_passes, 2);
+        let scan_layout = *layouts.last().unwrap();
+        assert!(scan_layout.1.is_some());
+
+        for phase in [
+            FrameLoadPhase::Decoding,
+            FrameLoadPhase::Rendering,
+            FrameLoadPhase::PreparingDisplay,
+        ] {
+            layouts.clear();
+            let output = show_toolbar(None, Some(phase), &mut layouts);
+            assert_eq!(output.platform_output.num_completed_passes, 1);
+            assert_eq!(layouts, [scan_layout]);
+        }
+
+        layouts.clear();
+        show_toolbar(None, None, &mut layouts);
+        assert_eq!(layouts.last().unwrap().0, idle_rect);
+        assert!(layouts.last().unwrap().1.is_none());
+
+        layouts.clear();
+        let output = show_toolbar(None, Some(FrameLoadPhase::Decoding), &mut layouts);
+        assert_eq!(
+            layouts.iter().map(|layout| layout.2).collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert_eq!(output.platform_output.num_completed_passes, 2);
+    }
 }
 
 impl DicronApp {
