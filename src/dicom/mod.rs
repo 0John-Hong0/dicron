@@ -3,6 +3,7 @@
 mod index;
 mod metadata;
 mod model;
+mod overlay_planes;
 mod pixels;
 mod scan;
 mod text_encoding;

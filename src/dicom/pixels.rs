@@ -10,6 +10,7 @@ use dicom_object::DefaultDicomObject;
 use dicom_pixeldata::{ConvertOptions, DecodedPixelData, PixelDecoder, VoiLutOption, WindowLevel};
 
 use super::metadata::{DicomMetadata, extract_dicom_metadata};
+use super::overlay_planes::{OverlayBitmap, paint_overlay_bitmaps, read_overlay_bitmaps};
 use super::scan::{open_dicom_file, open_dicom_file_with_encoding};
 use super::text_encoding::TextEncoding;
 
@@ -49,6 +50,7 @@ enum PixelProbeData {
 /// the cached `decoded` samples, not a fresh open + decompress.
 pub(crate) struct DecodedFrame {
     decoded: DecodedPixelData<'static>,
+    overlay_bitmaps: Vec<OverlayBitmap>,
     pixel_probe: Option<PixelProbeData>,
     pub(crate) frame_count: u32,
     /// The file's own WindowCenter/WindowWidth, when present and finite.
@@ -171,18 +173,14 @@ pub(crate) fn load_dicom_thumbnail(
                 frame_index + 1
             )
         })?;
-    let dynamic_image = render_decoded_frame(&decoded, None)?;
-    let (width, height) = thumbnail_dimensions(
-        dynamic_image.width(),
-        dynamic_image.height(),
-        max_edge.max(1),
-    );
-    let dynamic_image = if (width, height) == (dynamic_image.width(), dynamic_image.height()) {
-        dynamic_image
+    let overlay_bitmaps = read_overlay_bitmaps(&dicom_object, frame_index);
+    let rgba = render_decoded_frame(&decoded, None, &overlay_bitmaps)?;
+    let (width, height) = thumbnail_dimensions(rgba.width(), rgba.height(), max_edge.max(1));
+    let rgba = if (width, height) == (rgba.width(), rgba.height()) {
+        rgba
     } else {
-        dynamic_image.resize_exact(width, height, image::imageops::FilterType::Triangle)
+        image::imageops::resize(&rgba, width, height, image::imageops::FilterType::Triangle)
     };
-    let rgba = dynamic_image.to_rgba8();
 
     Ok(DisplayPixels {
         width: rgba.width() as usize,
@@ -212,6 +210,7 @@ fn decode_frame(dicom_object: &mut DefaultDicomObject, frame_index: u32) -> Resu
 
     Ok(DecodedFrame {
         decoded,
+        overlay_bitmaps: read_overlay_bitmaps(dicom_object, frame_index),
         pixel_probe,
         frame_count,
         default_window: read_default_window(dicom_object),
@@ -260,8 +259,7 @@ pub(crate) fn render_frame(
     frame: &DecodedFrame,
     window: Option<DicomWindow>,
 ) -> Result<DisplayPixels> {
-    let dynamic_image = render_decoded_frame(&frame.decoded, window)?;
-    let rgba = dynamic_image.to_rgba8();
+    let rgba = render_decoded_frame(&frame.decoded, window, &frame.overlay_bitmaps)?;
 
     Ok(DisplayPixels {
         width: rgba.width() as usize,
@@ -273,7 +271,8 @@ pub(crate) fn render_frame(
 fn render_decoded_frame(
     decoded: &DecodedPixelData<'_>,
     window: Option<DicomWindow>,
-) -> Result<image::DynamicImage> {
+    overlay_bitmaps: &[OverlayBitmap],
+) -> Result<image::RgbaImage> {
     let voi_lut = match window {
         Some(window) if window.center.is_finite() && window.width.is_finite() => {
             VoiLutOption::Custom(WindowLevel {
@@ -286,9 +285,13 @@ fn render_decoded_frame(
 
     let convert_options = ConvertOptions::new().with_voi_lut(voi_lut).force_8bit();
 
-    decoded
+    let mut rgba = decoded
         .to_dynamic_image_with_options(0, &convert_options)
-        .context("could not convert DICOM pixel data to image")
+        .context("could not convert DICOM pixel data to image")?
+        .into_rgba8();
+    paint_overlay_bitmaps(overlay_bitmaps, &mut rgba);
+
+    Ok(rgba)
 }
 
 fn thumbnail_dimensions(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
@@ -378,15 +381,82 @@ where
 
 #[cfg(test)]
 mod tests {
-    use dicom_core::{DataElement, PrimitiveValue, VR};
+    use dicom_core::{DataElement, PrimitiveValue, Tag, VR};
     use dicom_dictionary_std::{tags, uids};
-    use dicom_object::{FileDicomObject, FileMetaTableBuilder};
+    use dicom_object::{DefaultDicomObject, FileDicomObject, FileMetaTableBuilder};
     use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
 
     use super::{
         decode_frame, finite_value_range, load_dicom_frame, load_dicom_thumbnail, render_frame,
         thumbnail_dimensions,
     };
+
+    fn black_two_by_two_image_with_overlay_pixel() -> DefaultDicomObject {
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .media_storage_sop_class_uid(uids::SECONDARY_CAPTURE_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid("2.25.303")
+            .build()
+            .unwrap();
+        let mut object = FileDicomObject::new_empty_with_meta(meta);
+
+        for (tag, value) in [
+            (tags::ROWS, 2_u16),
+            (tags::COLUMNS, 2_u16),
+            (tags::SAMPLES_PER_PIXEL, 1_u16),
+            (tags::BITS_ALLOCATED, 8_u16),
+            (tags::BITS_STORED, 8_u16),
+            (tags::HIGH_BIT, 7_u16),
+            (tags::PIXEL_REPRESENTATION, 0_u16),
+            (Tag(0x6000, 0x0010), 2_u16),
+            (Tag(0x6000, 0x0011), 2_u16),
+        ] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            PrimitiveValue::from("MONOCHROME2"),
+        ));
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from(vec![0_u8; 4]),
+        ));
+        object.put_element(DataElement::new(
+            Tag(0x6000, 0x3000),
+            VR::OB,
+            PrimitiveValue::from(vec![0b0000_1000_u8]),
+        ));
+
+        object
+    }
+
+    #[test]
+    fn overlay_plane_appears_in_full_image_and_thumbnail_without_changing_the_probe() {
+        let mut object = black_two_by_two_image_with_overlay_pixel();
+        let frame = decode_frame(&mut object, 0).unwrap();
+        let pixels = render_frame(&frame, None).unwrap();
+
+        assert_eq!((pixels.width, pixels.height), (2, 2));
+        assert_eq!(
+            &pixels.rgba[..12],
+            &[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]
+        );
+        assert_eq!(&pixels.rgba[12..], &[255, 255, 255, 255]);
+        assert_eq!(
+            frame.pixel_probe(1, 1),
+            Some(super::PixelProbeValue::Monochrome(0.0))
+        );
+
+        let path =
+            std::env::temp_dir().join(format!("dicron-overlay-plane-{}.dcm", std::process::id()));
+        object.write_to_file(&path).unwrap();
+        let thumbnail = load_dicom_thumbnail(&path, 0, 2).unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (2, 2));
+        assert_eq!(thumbnail.rgba, pixels.rgba);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn empty_voi_lut_function_does_not_block_frame_or_thumbnail() {
