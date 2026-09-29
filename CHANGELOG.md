@@ -6,6 +6,9 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Render DICOM overlay planes (groups 6000-601E) on top of the image and its thumbnail. Files
+  that keep their visible content only in an overlay, such as Siemens dose report pages, no
+  longer appear black.
 - Keep the window responsive while images open, and show the loading progress bar right away in
   one steady place from folder scanning until the image appears.
 - Add a compact Encoding menu with Auto, DICOM default, UTF-8, Korean (EUC-KR), and Japanese
