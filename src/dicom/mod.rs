@@ -1,6 +1,7 @@
 //! DICOM file scanning, indexing, metadata, geometry, and pixel processing.
 
 mod index;
+mod jpeg_extended;
 mod metadata;
 mod model;
 mod overlay_planes;

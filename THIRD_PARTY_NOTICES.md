@@ -14,6 +14,12 @@ licenses. All fonts listed below are compiled into the released binary.
   2.005R tag, used unmodified; the full 45-face collection is not distributed.
   Its license is stored at `assets/licenses/LICENSE-SourceHanSans.txt`.
 
+## Native Library
+
+- libjpeg-turbo 3.1.0 is built from source through `turbojpeg-sys` and linked into the binary
+  to decode JPEG Extended DICOM images. Its IJG and Modified BSD license terms are stored at
+  `assets/licenses/LICENSE-libjpeg-turbo.txt`.
+
 ## Rust Dependencies
 
 Rust dependencies are resolved through Cargo and recorded in `Cargo.lock`.

@@ -31,6 +31,7 @@ image = "0.25.6"
 rfd = "0.17.2"
 semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
+turbojpeg-sys = { version = "1.2.0", default-features = false, features = ["cmake"] }
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
 walkdir = "2.5.0"
 winit = { version = "0.30.13", default-features = false, features = ["x11"] }
@@ -51,4 +52,5 @@ assets = [
     ["target/release/dicron", "usr/bin/dicron", "755"],
     ["packaging/linux/dicron.desktop", "usr/share/applications/dicron.desktop", "644"],
     ["assets/icon.png", "usr/share/icons/hicolor/256x256/apps/dicron.png", "644"],
+    ["assets/licenses/*", "usr/share/doc/dicron/licenses/", "644"],
 ]
