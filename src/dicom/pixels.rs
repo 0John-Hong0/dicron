@@ -9,6 +9,7 @@ use dicom_dictionary_std::tags;
 use dicom_object::DefaultDicomObject;
 use dicom_pixeldata::{ConvertOptions, DecodedPixelData, PixelDecoder, VoiLutOption, WindowLevel};
 
+use super::jpeg_extended;
 use super::metadata::{DicomMetadata, extract_dicom_metadata};
 use super::overlay_planes::{OverlayBitmap, paint_overlay_bitmaps, read_overlay_bitmaps};
 use super::scan::{open_dicom_file, open_dicom_file_with_encoding};
@@ -165,14 +166,7 @@ pub(crate) fn load_dicom_thumbnail(
     let mut dicom_object = open_dicom_file(dicom_path)
         .with_context(|| format!("could not open DICOM file {}", dicom_path.display()))?;
     remove_empty_voi_lut_function(&mut dicom_object);
-    let decoded = dicom_object
-        .decode_pixel_data_frame(frame_index)
-        .with_context(|| {
-            format!(
-                "could not decode DICOM pixel data frame {}",
-                frame_index + 1
-            )
-        })?;
+    let decoded = decode_pixel_frame(&dicom_object, frame_index)?;
     let overlay_bitmaps = read_overlay_bitmaps(&dicom_object, frame_index);
     let rgba = render_decoded_frame(&decoded, None, &overlay_bitmaps)?;
     let (width, height) = thumbnail_dimensions(rgba.width(), rgba.height(), max_edge.max(1));
@@ -191,15 +185,7 @@ pub(crate) fn load_dicom_thumbnail(
 
 fn decode_frame(dicom_object: &mut DefaultDicomObject, frame_index: u32) -> Result<DecodedFrame> {
     remove_empty_voi_lut_function(dicom_object);
-    let decoded = dicom_object
-        .decode_pixel_data_frame(frame_index)
-        .with_context(|| {
-            format!(
-                "could not decode DICOM pixel data frame {}",
-                frame_index + 1
-            )
-        })?
-        .to_owned();
+    let decoded = decode_pixel_frame(dicom_object, frame_index)?.to_owned();
 
     let frame_count = first_parsed::<u32>(dicom_object, "NumberOfFrames")
         .unwrap_or(1)
@@ -217,6 +203,17 @@ fn decode_frame(dicom_object: &mut DefaultDicomObject, frame_index: u32) -> Resu
         value_range: compute_value_range(dicom_object),
         window_level_available,
     })
+}
+
+fn decode_pixel_frame(object: &DefaultDicomObject, frame: u32) -> Result<DecodedPixelData<'_>> {
+    let result = if object.meta().transfer_syntax.trim_end_matches(['\0', ' '])
+        == jpeg_extended::TRANSFER_SYNTAX
+    {
+        jpeg_extended::decode_frame(object, frame)
+    } else {
+        object.decode_pixel_data_frame(frame).map_err(Into::into)
+    };
+    result.with_context(|| format!("could not decode DICOM pixel data frame {}", frame + 1))
 }
 
 fn remove_empty_voi_lut_function(dicom_object: &mut DefaultDicomObject) {

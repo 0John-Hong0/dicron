@@ -1044,6 +1044,7 @@ dependencies = [
  "rfd",
  "semver",
  "serde",
+ "turbojpeg-sys",
  "ureq",
  "walkdir",
  "winit",
@@ -4356,6 +4357,17 @@ name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+
+[[package]]
+name = "turbojpeg-sys"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49b5a974bc59382d35927e3a07eef2ba9a24fe7227cefe52ec44b508e1b90f86"
+dependencies = [
+ "anyhow",
+ "cmake",
+ "libc",
+]
 
 [[package]]
 name = "type-map"
