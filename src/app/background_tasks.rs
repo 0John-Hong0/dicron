@@ -129,7 +129,9 @@ impl DicronApp {
                 &scan_cancel_for_thread,
                 text_encoding,
                 |progress| {
-                    let _ = scan_sender.send(ScanMessage::Progress(progress));
+                    if scan_sender.send(ScanMessage::Progress(progress)).is_ok() {
+                        scan_context.request_repaint();
+                    }
                 },
             )
             .map_err(|error| format!("{error:#}"));
@@ -192,7 +194,9 @@ impl DicronApp {
                 &scan_cancel_for_thread,
                 text_encoding,
                 |progress| {
-                    let _ = scan_sender.send(ScanMessage::Progress(progress));
+                    if scan_sender.send(ScanMessage::Progress(progress)).is_ok() {
+                        scan_context.request_repaint();
+                    }
                 },
             )
             .map_err(|error| format!("{error:#}"));
