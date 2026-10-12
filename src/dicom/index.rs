@@ -458,12 +458,10 @@ pub(in crate::dicom) fn sort_index(patients: &mut [PatientGroup]) {
 }
 
 fn compare_slice_items(left: &SliceItem, right: &SliceItem) -> Ordering {
-    compare_optional_f64(left.sort_position, right.sort_position)
-        .then_with(|| {
-            left.instance_number
-                .unwrap_or(i32::MAX)
-                .cmp(&right.instance_number.unwrap_or(i32::MAX))
-        })
+    left.instance_number
+        .unwrap_or(i32::MAX)
+        .cmp(&right.instance_number.unwrap_or(i32::MAX))
+        .then_with(|| compare_optional_f64(left.sort_position, right.sort_position))
         .then_with(|| left.path.cmp(&right.path))
         .then_with(|| left.frame_index.cmp(&right.frame_index))
 }
@@ -682,5 +680,34 @@ mod tests {
         assert_eq!(patients[0].studies.len(), 1);
         assert_eq!(patients[0].studies[0].series_groups.len(), 1);
         assert_eq!(patients[0].studies[0].series_groups[0].slices.len(), 2);
+    }
+
+    #[test]
+    fn series_without_instance_numbers_keeps_physical_slice_order() {
+        let mut index_builder = DicomIndexBuilder::default();
+        for (path, position) in [("a", 30.0), ("b", 10.0), ("c", 20.0)] {
+            assert!(add_metadata(
+                &mut index_builder,
+                Path::new(path),
+                DicomIndexMetadata {
+                    patient_id: Some("patient-1".to_owned()),
+                    study_instance_uid: Some("2.25.301".to_owned()),
+                    series_instance_uid: Some("2.25.302".to_owned()),
+                    image_position_patient: Some([0.0, 0.0, position]),
+                    image_orientation_patient: Some(AXIAL),
+                    ..image_metadata()
+                },
+                true,
+            ));
+        }
+        let patients = index_builder.into_patients();
+        let slices = &patients[0].studies[0].series_groups[0].slices;
+        assert_eq!(
+            slices
+                .iter()
+                .map(|slice| slice.path.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new("b"), Path::new("c"), Path::new("a")]
+        );
     }
 }

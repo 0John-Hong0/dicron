@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Fix series image ordering to prioritize numeric InstanceNumber over physical slice position.
+
 ## [0.4.0] - 2026-09-30
 
 - Add JPEG Extended (Process 2 & 4) decoding for 12-bit DICOM images and their thumbnails,
