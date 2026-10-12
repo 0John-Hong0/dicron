@@ -634,6 +634,7 @@ jobs:
                 mesa \
                 wayland \
                 libxkbcommon \
+                charls \
                 zstd
 
               groupadd -g "$HOST_GID" builder
