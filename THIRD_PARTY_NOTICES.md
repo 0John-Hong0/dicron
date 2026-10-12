@@ -14,11 +14,21 @@ licenses. All fonts listed below are compiled into the released binary.
   2.005R tag, used unmodified; the full 45-face collection is not distributed.
   Its license is stored at `assets/licenses/LICENSE-SourceHanSans.txt`.
 
-## Native Library
+## Native Libraries
 
-- libjpeg-turbo 3.1.0 is built from source through `turbojpeg-sys` and linked into the binary
-  to decode JPEG Extended DICOM images. Its IJG and Modified BSD license terms are stored at
-  `assets/licenses/LICENSE-libjpeg-turbo.txt`.
+These C and C++ libraries are built from source by their Rust `-sys` crates and linked into the
+released binary to decode compressed DICOM images.
+
+- libjpeg-turbo 3.1.0, through `turbojpeg-sys`, decodes 12-bit JPEG Extended images.
+  It is covered by the IJG License and the Modified (3-clause) BSD License.
+  This software is based in part on the work of the Independent JPEG Group.
+  Its licenses are stored at `assets/licenses/LICENSE-libjpeg-turbo.txt`.
+- OpenJPEG 2.5.3, through `openjpeg-sys`, decodes JPEG 2000 images.
+  It is covered by the 2-clause BSD License.
+  Its license is stored at `assets/licenses/LICENSE-OpenJPEG.txt`.
+- CharLS 2.4.2, through `charls-sys`, decodes JPEG-LS images.
+  It is covered by the 3-clause BSD License.
+  Its license is stored at `assets/licenses/LICENSE-CharLS.txt`.
 
 ## Rust Dependencies
 
