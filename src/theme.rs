@@ -59,12 +59,7 @@ pub(crate) fn content_panel_frame(style: &egui::Style) -> egui::Frame {
 pub(crate) fn viewer_frame(style: &egui::Style) -> egui::Frame {
     egui::Frame::central_panel(style)
         .fill(egui::Color32::BLACK)
-        .inner_margin(egui::Margin {
-            left: SPACE_SM_I8,
-            right: 0,
-            top: SPACE_SM_I8,
-            bottom: SPACE_SM_I8,
-        })
+        .inner_margin(egui::Margin::same(SPACE_SM_I8))
 }
 
 #[cfg(test)]
@@ -120,12 +115,7 @@ mod tests {
         );
         assert_eq!(
             viewer_frame(&style).inner_margin,
-            egui::Margin {
-                left: SPACE_SM_I8,
-                right: 0,
-                top: SPACE_SM_I8,
-                bottom: SPACE_SM_I8,
-            }
+            egui::Margin::same(SPACE_SM_I8)
         );
         assert_eq!(viewer_frame(&style).fill, egui::Color32::BLACK);
     }
