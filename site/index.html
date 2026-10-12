@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dicron — DICOM Viewer</title>
+  <meta name="description" content="Dicron is a native desktop DICOM viewer for Linux and Windows. Open local files and folders, browse series, inspect tags, and adjust window/level.">
+  <meta name="color-scheme" content="dark light">
+  <meta property="og:title" content="Dicron — DICOM Viewer">
+  <meta property="og:description" content="A native desktop DICOM viewer for Linux and Windows, built with Rust and egui.">
+  <meta property="og:type" content="website">
+  <link rel="icon" type="image/png" href="assets/icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="nav">
+    <div class="wrap nav-inner">
+      <a class="brand" href="#top">
+        <img src="assets/icon.png" alt="" width="28" height="28">
+        <span>Dicron</span>
+      </a>
+      <nav aria-label="Sections">
+        <a href="#features">Features</a>
+        <a href="#controls">Controls</a>
+        <a href="#download">Download</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="wrap">
+        <p class="eyebrow mono">DICOM viewer · Linux · Windows</p>
+        <h1>Open a folder of DICOM files and look at them.</h1>
+        <p class="lede">
+          Dicron is a native desktop viewer for local DICOM files. It scans folders, groups
+          images by patient, study, and series, shows every tag, and lets you set window/level
+          with a mouse drag.
+        </p>
+        <div class="actions">
+          <a class="button primary" href="#download">Download</a>
+          <a class="button" href="https://github.com/0John-Hong0/dicron">Source on GitHub</a>
+        </div>
+        <p class="note">Not a diagnostic medical device. Do not use it for clinical decisions.</p>
+      </div>
+
+      <div class="wrap wide">
+        <figure class="shot hero-shot">
+          <picture>
+            <source media="(prefers-color-scheme: light)"
+                    srcset="assets/screens/viewer-light-half.webp 1080w, assets/screens/viewer-light.webp 2160w"
+                    sizes="(max-width: 1240px) 100vw, 1200px">
+            <img src="assets/screens/viewer-dark.webp"
+                 srcset="assets/screens/viewer-dark-half.webp 1080w, assets/screens/viewer-dark.webp 2160w"
+                 sizes="(max-width: 1240px) 100vw, 1200px"
+                 width="2160" height="1350"
+                 alt="Dicron showing a head and neck CT angiography slice, with the DICOM tree of series thumbnails on the left and the DICOM tag table on the right.">
+          </picture>
+        </figure>
+      </div>
+    </section>
+
+    <section class="section" id="features" data-nav="features">
+      <div class="wrap">
+        <div class="feature">
+          <div class="feature-text">
+            <p class="eyebrow mono">Slice navigation</p>
+            <h2>Scroll through a stack</h2>
+            <p>
+              One wheel notch moves one slice. Arrow keys step, Page Up and Page Down jump ten,
+              Home and End go to either end. Autoplay runs at an adjustable frame rate with
+              stop, loop, or ping-pong at the ends.
+            </p>
+            <p class="caption mono">Clip: slices 170–283 of a 394-slice head and neck CTA.</p>
+          </div>
+          <figure class="shot">
+            <video autoplay muted loop playsinline preload="metadata"
+                   poster="assets/video/scroll-poster.webp" width="1600" height="1350"
+                   aria-label="Scrolling through slices of a CT angiography series in Dicron.">
+              <source src="assets/video/scroll.webm" type="video/webm">
+              <source src="assets/video/scroll.mp4" type="video/mp4">
+            </video>
+          </figure>
+        </div>
+
+        <div class="feature">
+          <div class="feature-text">
+            <p class="eyebrow mono">Window / level</p>
+            <h2>Presets, drags, or exact numbers</h2>
+            <p>
+              Drag horizontally for width and vertically for center. The Preset menu has lung,
+              abdomen, bone, skull, and other common CT windows on keys 0–9. Edit WL takes exact
+              values.
+            </p>
+          </div>
+          <a class="shot" href="assets/screens/bone-preset.webp">
+            <img src="assets/screens/bone-preset.webp"
+                 srcset="assets/screens/bone-preset-half.webp 800w, assets/screens/bone-preset.webp 1600w"
+                 sizes="(max-width: 900px) 100vw, 700px" width="1600" height="1350" loading="lazy"
+                 alt="A neck CT slice shown with the Bone window preset, WL 300 and WW 2500, next to the DICOM tree.">
+          </a>
+        </div>
+
+        <div class="feature">
+          <div class="feature-text">
+            <p class="eyebrow mono">DICOM tree</p>
+            <h2>Series cards or the full file list</h2>
+            <p>
+              Series previews show one thumbnail per series with its description, modality,
+              and slice count. Each series reopens at the slice you last viewed. Switch to the
+              file list when you need the individual filenames under Patient, Study, and Series.
+            </p>
+          </div>
+          <a class="shot" href="assets/screens/file-list.webp">
+            <img src="assets/screens/file-list.webp"
+                 srcset="assets/screens/file-list-half.webp 800w, assets/screens/file-list.webp 1600w"
+                 sizes="(max-width: 900px) 100vw, 700px" width="1600" height="1350" loading="lazy"
+                 alt="The DICOM tree in file list mode, listing each slice filename of a 394-slice series.">
+          </a>
+        </div>
+
+        <div class="feature">
+          <div class="feature-text">
+            <p class="eyebrow mono">Metadata</p>
+            <h2>Search every tag</h2>
+            <p>
+              The tag panel starts with a curated set of fields. Turn on Show all tags and
+              search by tag ID, name, or value. Known codes get readable labels while the raw
+              value stays visible, and right-click copies a cell.
+            </p>
+          </div>
+          <a class="shot" href="assets/screens/tag-search.webp">
+            <img src="assets/screens/tag-search.webp"
+                 srcset="assets/screens/tag-search-half.webp 710w, assets/screens/tag-search.webp 1420w"
+                 sizes="(max-width: 900px) 100vw, 700px" width="1420" height="1228" loading="lazy"
+                 alt="The DICOM tag panel filtered by tag group 0028, listing the image pixel tags of a brain MRI.">
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <section class="section compare-section" data-nav="features">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="eyebrow mono">Themes</p>
+          <h2>Light, dark, or follow the system</h2>
+          <p>Drag the handle to compare. The image canvas stays black in both.</p>
+        </div>
+      </div>
+      <div class="wrap wide">
+        <div class="compare" style="--pos: 50%">
+          <img src="assets/screens/viewer-light.webp" width="2160" height="1350" loading="lazy"
+               alt="Dicron in the light theme.">
+          <img class="compare-top" src="assets/screens/viewer-dark.webp" width="2160" height="1350" loading="lazy"
+               alt="Dicron in the dark theme.">
+          <div class="compare-handle" aria-hidden="true"></div>
+          <input type="range" min="0" max="100" value="50" aria-label="Compare dark and light themes">
+        </div>
+      </div>
+    </section>
+
+    <section class="section" data-nav="features">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="eyebrow mono">Also included</p>
+          <h2>The rest of it</h2>
+        </div>
+        <ul class="grid">
+          <li>
+            <h3>Drag and drop</h3>
+            <p>Drop files or folders on the window. Folders are scanned recursively, including extensionless files.</p>
+          </li>
+          <li>
+            <h3>Multi-frame images</h3>
+            <p>Single-frame and multi-frame objects both open and step the same way.</p>
+          </li>
+          <li>
+            <h3>Compressed pixel data</h3>
+            <p>JPEG Baseline, JPEG Extended (12-bit), JPEG-LS, JPEG 2000 Lossless, and RLE Lossless.</p>
+          </li>
+          <li>
+            <h3>Overlay planes</h3>
+            <p>Overlay groups 6000–601E are drawn over the image, so overlay-only pages like dose reports are not blank.</p>
+          </li>
+          <li>
+            <h3>Character sets</h3>
+            <p>An Encoding menu with Auto, DICOM default, UTF-8, Korean (EUC-KR), and Japanese (Shift-JIS).</p>
+          </li>
+          <li>
+            <h3>Zoom, pan, orient</h3>
+            <p>Right-drag zooms, middle-drag pans, double-click fits. Flip and rotate keep the metadata overlays readable.</p>
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section" id="controls" data-nav="controls">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="eyebrow mono">Controls</p>
+          <h2>Keyboard and mouse</h2>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <tbody>
+              <tr><th scope="row"><kbd>↑</kbd> <kbd>↓</kbd> or mouse wheel</th><td>Previous / next slice</td></tr>
+              <tr><th scope="row"><kbd>Page Up</kbd> <kbd>Page Down</kbd></th><td>Move ten slices</td></tr>
+              <tr><th scope="row"><kbd>Home</kbd> <kbd>End</kbd></th><td>First / last slice</td></tr>
+              <tr><th scope="row"><kbd>0</kbd>–<kbd>9</kbd></th><td>Window presets. <kbd>0</kbd> restores the DICOM window, <kbd>1</kbd> fits the full value range</td></tr>
+              <tr><th scope="row">Drag horizontally</th><td>Window width</td></tr>
+              <tr><th scope="row">Drag vertically</th><td>Window center</td></tr>
+              <tr><th scope="row">Right-drag vertically</th><td>Zoom around the drag start point</td></tr>
+              <tr><th scope="row">Middle-drag</th><td>Pan</td></tr>
+              <tr><th scope="row">Double-click</th><td>Fit and center the image</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="download" data-nav="download">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="eyebrow mono">Download<span data-release-version></span></p>
+          <h2>Get Dicron</h2>
+          <p>Builds are published on GitHub Releases.</p>
+        </div>
+        <div class="downloads">
+          <a class="download" data-asset="exe" href="https://github.com/0John-Hong0/dicron/releases/latest">
+            <span class="download-os">Windows</span>
+            <span class="download-file mono">Installer (.exe)</span>
+          </a>
+          <a class="download" data-asset="deb" href="https://github.com/0John-Hong0/dicron/releases/latest">
+            <span class="download-os">Debian / Ubuntu</span>
+            <span class="download-file mono">.deb package</span>
+          </a>
+          <a class="download" data-asset="arch" href="https://github.com/0John-Hong0/dicron/releases/latest">
+            <span class="download-os">Arch Linux</span>
+            <span class="download-file mono">.pkg.tar.zst package</span>
+          </a>
+        </div>
+        <p class="after-downloads">
+          On Linux, Dicron runs through X11/XWayland. You can also pass files or folders on the command line:
+        </p>
+        <pre class="mono"><code>dicron /path/to/dicom-or-folder</code></pre>
+        <p class="after-downloads">
+          <a href="https://github.com/0John-Hong0/dicron/releases">All releases</a> ·
+          <a href="https://github.com/0John-Hong0/dicron/blob/main/CHANGELOG.md">Changelog</a>
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <p>
+        Dicron is free software under the
+        <a href="https://github.com/0John-Hong0/dicron/blob/main/LICENSE">GPL-3.0-or-later</a>.
+        It is not a diagnostic medical device.
+      </p>
+      <p>
+        <a href="https://github.com/0John-Hong0/dicron/issues">Issues</a> ·
+        <a href="https://github.com/0John-Hong0/dicron">Source</a>
+      </p>
+      <p class="muted">Screenshots use de-identified sample data.</p>
+    </div>
+  </footer>
+
+  <script>
+    // Autoplay the clip, but show player controls when reduced motion is requested
+    // or the browser blocks autoplay, so it never sits there looking like a still.
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    document.querySelectorAll("video[autoplay]").forEach((video) => {
+      if (reduceMotion) {
+        video.removeAttribute("autoplay");
+        video.pause();
+        video.controls = true;
+        return;
+      }
+      const attempt = video.play();
+      if (attempt) attempt.catch(() => { video.controls = true; });
+    });
+
+    // Highlight the nav link for the section under the top bar.
+    const nav = document.querySelector(".nav");
+    const navLinks = new Map(
+      [...nav.querySelectorAll('nav a[href^="#"]')].map((link) => [link.hash.slice(1), link])
+    );
+    const navSections = [...document.querySelectorAll("section[data-nav]")];
+    let navFrame = 0;
+    const updateActiveNav = () => {
+      navFrame = 0;
+      const line = nav.offsetHeight + window.innerHeight * 0.25;
+      const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+      let current = null;
+      for (const section of navSections) {
+        if (section.getBoundingClientRect().top <= line) current = section.dataset.nav;
+      }
+      if (atBottom && navSections.length) current = navSections[navSections.length - 1].dataset.nav;
+      navLinks.forEach((link, key) => {
+        const active = key === current;
+        link.classList.toggle("is-active", active);
+        if (active) link.setAttribute("aria-current", "location");
+        else link.removeAttribute("aria-current");
+      });
+    };
+    const scheduleActiveNav = () => {
+      if (!navFrame) navFrame = requestAnimationFrame(updateActiveNav);
+    };
+    window.addEventListener("scroll", scheduleActiveNav, { passive: true });
+    window.addEventListener("resize", scheduleActiveNav);
+    updateActiveNav();
+
+    // Theme comparison slider.
+    document.querySelectorAll(".compare").forEach((compare) => {
+      const input = compare.querySelector("input");
+      const update = () => compare.style.setProperty("--pos", input.value + "%");
+      input.addEventListener("input", update);
+      update();
+    });
+
+    // Point the download cards at the latest release assets when GitHub answers.
+    // Without a response they keep linking to the releases page.
+    const assetPatterns = {
+      exe: (name) => name.endsWith(".exe"),
+      deb: (name) => name.endsWith(".deb"),
+      arch: (name) => name.endsWith(".pkg.tar.zst") && !name.includes("-debug-"),
+    };
+    fetch("https://api.github.com/repos/0John-Hong0/dicron/releases/latest")
+      .then((response) => (response.ok ? response.json() : null))
+      .then((release) => {
+        if (!release) return;
+        document.querySelectorAll("[data-release-version]").forEach((element) => {
+          element.textContent = " · " + release.tag_name;
+        });
+        document.querySelectorAll("[data-asset]").forEach((link) => {
+          const matches = assetPatterns[link.dataset.asset];
+          const asset = (release.assets || []).find((candidate) => matches(candidate.name));
+          if (asset) link.href = asset.browser_download_url;
+        });
+      })
+      .catch(() => {});
+  </script>
+</body>
+</html>
