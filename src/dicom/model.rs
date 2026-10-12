@@ -37,8 +37,8 @@ pub(crate) struct SliceItem {
     pub(crate) display_name: String,
     pub(crate) frame_index: u32,
     pub(crate) instance_number: Option<i32>,
-    /// Signed through-plane position used to order slices: the projection of
-    /// `ImagePositionPatient` onto the slice normal when orientation is known
-    /// (correct for sagittal/coronal/oblique stacks), otherwise the raw Z.
+    /// Signed through-plane position used to break ties in `InstanceNumber`:
+    /// the projection of `ImagePositionPatient` onto the slice normal when
+    /// orientation is known, otherwise the raw Z position.
     pub(crate) sort_position: Option<f64>,
 }

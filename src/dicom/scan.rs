@@ -914,6 +914,47 @@ mod tests {
     }
 
     #[test]
+    fn series_uses_numeric_instance_order_when_slice_positions_disagree() {
+        let paths =
+            ["instance-order-a", "instance-order-b", "instance-order-c"].map(temporary_file_path);
+        for (path, instance_number, position) in [
+            (&paths[0], "12", "0\\0\\-33"),
+            (&paths[1], "1", "0\\0\\0"),
+            (&paths[2], "2", "0\\0\\1"),
+        ] {
+            write_test_object(path, true);
+            let mut object = dicom_object::open_file(path).unwrap();
+            for (tag, vr, value) in [
+                (tags::PATIENT_ID, VR::LO, "instance-order-patient"),
+                (tags::STUDY_INSTANCE_UID, VR::UI, "2.25.711"),
+                (tags::SERIES_INSTANCE_UID, VR::UI, "2.25.712"),
+                (tags::INSTANCE_NUMBER, VR::IS, instance_number),
+                (tags::IMAGE_POSITION_PATIENT, VR::DS, position),
+                (tags::IMAGE_ORIENTATION_PATIENT, VR::DS, "1\\0\\0\\0\\1\\0"),
+            ] {
+                object.put_element(DataElement::new(tag, vr, PrimitiveValue::from(value)));
+            }
+            object.write_to_file(path).unwrap();
+        }
+
+        let index =
+            build_for_inputs_with_progress(&paths, &AtomicBool::new(false), |_| {}).unwrap();
+        for path in &paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_eq!(index.total_file_count, 3);
+        let slices = &index.patients[0].studies[0].series_groups[0].slices;
+        assert_eq!(
+            slices
+                .iter()
+                .map(|slice| slice.instance_number)
+                .collect::<Vec<_>>(),
+            [Some(1), Some(2), Some(12)]
+        );
+        assert_eq!(slices[0].path, paths[1]);
+    }
+
+    #[test]
     fn lazy_scan_uses_the_declared_character_set_for_index_text() {
         let path = temporary_file_path("utf8-index-metadata");
         write_test_object(&path, true);
