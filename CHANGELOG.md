@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-13
+
 - Fix series image ordering to prioritize numeric InstanceNumber over physical slice position.
 - Refresh folder and dropped-input scan progress as updates arrive.
 - Use equal spacing on all sides of the image viewer.
