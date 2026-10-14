@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-14
+
 - Update DICOM dependencies to resolve the JPEG XL security advisories in Cargo.lock.
 - Keep zero-filled overlay reports readable after the DICOM dependency update.
 
