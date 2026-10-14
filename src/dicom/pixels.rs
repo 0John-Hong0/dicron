@@ -7,7 +7,10 @@ use anyhow::{Context, Result};
 use dicom_core::header::HasLength;
 use dicom_dictionary_std::tags;
 use dicom_object::DefaultDicomObject;
-use dicom_pixeldata::{ConvertOptions, DecodedPixelData, PixelDecoder, VoiLutOption, WindowLevel};
+use dicom_pixeldata::{
+    ConvertOptions, DecodedPixelData, PhotometricInterpretation, PixelDecoder, VoiLutOption,
+    WindowLevel,
+};
 
 use super::jpeg_extended;
 use super::metadata::{DicomMetadata, extract_dicom_metadata};
@@ -280,12 +283,32 @@ fn render_decoded_frame(
         _ => VoiLutOption::Default,
     };
 
-    let convert_options = ConvertOptions::new().with_voi_lut(voi_lut).force_8bit();
+    // Overlay-only reports have no intensity range to normalize. Keep their zero-filled
+    // MONOCHROME2 background black so white overlay content remains visible.
+    let black_overlay_background = matches!(&voi_lut, VoiLutOption::Default)
+        && !overlay_bitmaps.is_empty()
+        && matches!(
+            decoded.photometric_interpretation(),
+            PhotometricInterpretation::Monochrome2
+        )
+        && decoded.window()?.is_none()
+        && decoded.voi_lut_sequence()?.is_none()
+        && !decoded.data().is_empty()
+        && decoded.data().iter().all(|&byte| byte == 0);
 
-    let mut rgba = decoded
-        .to_dynamic_image_with_options(0, &convert_options)
-        .context("could not convert DICOM pixel data to image")?
-        .into_rgba8();
+    let mut rgba = if black_overlay_background {
+        image::RgbaImage::from_pixel(
+            decoded.columns(),
+            decoded.rows(),
+            image::Rgba([0, 0, 0, 255]),
+        )
+    } else {
+        let convert_options = ConvertOptions::new().with_voi_lut(voi_lut).force_8bit();
+        decoded
+            .to_dynamic_image_with_options(0, &convert_options)
+            .context("could not convert DICOM pixel data to image")?
+            .into_rgba8()
+    };
     paint_overlay_bitmaps(overlay_bitmaps, &mut rgba);
 
     Ok(rgba)
@@ -453,6 +476,98 @@ mod tests {
         assert_eq!((thumbnail.width, thumbnail.height), (2, 2));
         assert_eq!(thumbnail.rgba, pixels.rgba);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn zero_overlay_background_respects_custom_and_file_windows() {
+        let mut object = black_two_by_two_image_with_overlay_pixel();
+        let frame = decode_frame(&mut object, 0).unwrap();
+        let pixels = render_frame(
+            &frame,
+            Some(super::DicomWindow {
+                center: 0.0,
+                width: 1.0,
+            }),
+        )
+        .unwrap();
+        assert_eq!(pixels.rgba, vec![255; 16]);
+
+        object.put_element(DataElement::new(tags::WINDOW_CENTER, VR::DS, "0"));
+        object.put_element(DataElement::new(tags::WINDOW_WIDTH, VR::DS, "1"));
+        let frame = decode_frame(&mut object, 0).unwrap();
+        assert_eq!(render_frame(&frame, None).unwrap().rgba, vec![255; 16]);
+    }
+
+    #[test]
+    fn zero_overlay_background_respects_declared_voi_lut() {
+        let mut object = black_two_by_two_image_with_overlay_pixel();
+        let lut = dicom_object::InMemDicomObject::from_element_iter([
+            DataElement::new(
+                tags::LUT_DESCRIPTOR,
+                VR::US,
+                PrimitiveValue::U16(vec![1_u16, 0, 8].into()),
+            ),
+            DataElement::new(
+                tags::LUT_DATA,
+                VR::OW,
+                PrimitiveValue::U16(vec![255_u16].into()),
+            ),
+        ]);
+        object.put_element(DataElement::new(
+            tags::VOILUT_SEQUENCE,
+            VR::SQ,
+            dicom_core::value::Value::new_sequence(vec![lut], dicom_core::Length::UNDEFINED),
+        ));
+        let frame = decode_frame(&mut object, 0).unwrap();
+        assert_eq!(render_frame(&frame, None).unwrap().rgba, vec![255; 16]);
+    }
+
+    #[test]
+    fn zero_frame_without_overlay_keeps_library_rendering() {
+        let mut object = black_two_by_two_image_with_overlay_pixel();
+        object.remove_element(Tag(0x6000, 0x3000));
+        let frame = decode_frame(&mut object, 0).unwrap();
+        assert_eq!(render_frame(&frame, None).unwrap().rgba, vec![255; 16]);
+    }
+
+    #[test]
+    fn nonzero_overlay_frame_keeps_normal_rendering() {
+        let mut object = black_two_by_two_image_with_overlay_pixel();
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from(vec![0_u8, 64, 128, 255]),
+        ));
+        let frame = decode_frame(&mut object, 0).unwrap();
+        let pixels = render_frame(&frame, None).unwrap();
+        assert_eq!(&pixels.rgba[..4], &[0, 0, 0, 255]);
+        assert!(pixels.rgba[4] > 0 && pixels.rgba[4] < pixels.rgba[8]);
+        assert!(pixels.rgba[8] < 255);
+        assert_eq!(&pixels.rgba[12..], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn sixteen_bit_zero_overlay_frame_keeps_black_background() {
+        let mut object = black_two_by_two_image_with_overlay_pixel();
+        for (tag, value) in [
+            (tags::BITS_ALLOCATED, 16_u16),
+            (tags::BITS_STORED, 16),
+            (tags::HIGH_BIT, 15),
+        ] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OW,
+            PrimitiveValue::U16(vec![0_u16; 4].into()),
+        ));
+        let frame = decode_frame(&mut object, 0).unwrap();
+        let pixels = render_frame(&frame, None).unwrap();
+        assert_eq!(
+            &pixels.rgba[..12],
+            &[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]
+        );
+        assert_eq!(&pixels.rgba[12..], &[255, 255, 255, 255]);
     }
 
     #[test]
