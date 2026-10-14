@@ -6,6 +6,9 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Update DICOM dependencies to resolve the JPEG XL security advisories in Cargo.lock.
+- Keep zero-filled overlay reports readable after the DICOM dependency update.
+
 ## [0.4.1] - 2026-10-13
 
 - Fix series image ordering to prioritize numeric InstanceNumber over physical slice position.
