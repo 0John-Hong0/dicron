@@ -1,6 +1,6 @@
 //! Persistent in-memory state for the running application.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -58,6 +58,7 @@ pub(super) struct MetadataPanelState {
     pub(super) show_all: bool,
     pub(super) curated_items: Vec<MetadataItem>,
     pub(super) all_items: Vec<MetadataItem>,
+    pub(super) expanded_paths: HashSet<String>,
     pub(super) overlay: Option<DicomOverlayMetadata>,
 }
 
