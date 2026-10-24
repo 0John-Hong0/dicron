@@ -87,13 +87,10 @@ mod overlay {
             (None, None) => None,
         };
 
-        let image_position = parsed_values::<3>(dicom_object, "ImagePositionPatient");
-
         let slice_thickness =
             first_parsed::<f64>(dicom_object, "SliceThickness").filter(|value| value.is_finite());
-        let slice_location = first_parsed::<f64>(dicom_object, "SliceLocation")
-            .filter(|value| value.is_finite())
-            .or_else(|| image_position.map(|position| position[2]));
+        let slice_location =
+            first_parsed::<f64>(dicom_object, "SliceLocation").filter(|value| value.is_finite());
 
         DicomOverlayMetadata {
             patient_label,
@@ -193,6 +190,10 @@ mod format {
         I: HasLength,
     {
         let value_length = element.length();
+
+        if value_length.get() == Some(0) {
+            return "-".to_owned();
+        }
 
         if element.tag() == tags::PIXEL_DATA {
             return summarize_large_value("Pixel Data", value_length);
@@ -338,14 +339,30 @@ mod format {
                 "2"
             );
         }
+
+        #[test]
+        fn zero_length_values_stay_empty_including_sequences_and_pixel_data() {
+            use dicom_core::{DataElement, VR};
+            use dicom_object::InMemDicomObject;
+
+            for (tag, vr) in [
+                (tags::PIXEL_DATA, VR::OW),
+                (tags::REFERENCED_IMAGE_SEQUENCE, VR::SQ),
+                (tags::ROWS, VR::US),
+                (tags::PATIENT_NAME, VR::PN),
+            ] {
+                let element: DataElement<InMemDicomObject> = DataElement::empty(tag, vr);
+                assert_eq!(super::get_dicom_element_text_value(&element), "-");
+            }
+        }
     }
 }
 
 mod curated {
     use dicom_dictionary_std::tags;
-    use dicom_object::DefaultDicomObject;
+    use dicom_object::{DefaultDicomObject, InMemDicomObject};
 
-    use super::format::{format_dicom_text_value, get_dicom_text_value};
+    use super::format::{get_dicom_element_text_value, get_dicom_text_value};
     use super::model::MetadataItem;
 
     struct CuratedTag {
@@ -514,6 +531,7 @@ mod curated {
 
     pub(super) fn extract_curated_dicom_metadata(
         dicom_object: &DefaultDicomObject,
+        original_meta: Option<&InMemDicomObject>,
     ) -> Vec<MetadataItem> {
         let mut metadata_items = Vec::with_capacity(4 + CURATED_TAGS.len());
 
@@ -522,30 +540,26 @@ mod curated {
             "File Type".to_owned(),
             "DICOM".to_owned(),
         ));
-        metadata_items.push(MetadataItem::new(
-            "(0002,0010)".to_owned(),
-            "Transfer Syntax UID".to_owned(),
-            format_dicom_text_value(
-                tags::TRANSFER_SYNTAX_UID,
-                dicom_object.meta().transfer_syntax(),
-            ),
-        ));
-        metadata_items.push(MetadataItem::new(
-            "(0002,0002)".to_owned(),
-            "Media Storage SOP Class UID".to_owned(),
-            format_dicom_text_value(
+        for (tag, description) in [
+            (tags::TRANSFER_SYNTAX_UID, "Transfer Syntax UID"),
+            (
                 tags::MEDIA_STORAGE_SOP_CLASS_UID,
-                dicom_object.meta().media_storage_sop_class_uid(),
+                "Media Storage SOP Class UID",
             ),
-        ));
-        metadata_items.push(MetadataItem::new(
-            "(0002,0003)".to_owned(),
-            "Media Storage SOP Instance UID".to_owned(),
-            dicom_object
-                .meta()
-                .media_storage_sop_instance_uid()
-                .to_owned(),
-        ));
+            (
+                tags::MEDIA_STORAGE_SOP_INSTANCE_UID,
+                "Media Storage SOP Instance UID",
+            ),
+        ] {
+            let value = original_meta
+                .and_then(|meta| meta.get(tag))
+                .map_or_else(|| "-".to_owned(), get_dicom_element_text_value);
+            metadata_items.push(MetadataItem::new(
+                tag.to_string(),
+                description.to_owned(),
+                value,
+            ));
+        }
 
         metadata_items.extend(CURATED_TAGS.iter().map(|curated_tag| {
             MetadataItem::new(
@@ -561,25 +575,31 @@ mod curated {
 
 mod extract {
     use dicom_core::header::Header;
-    use dicom_object::DefaultDicomObject;
+    use dicom_object::{DefaultDicomObject, InMemDicomObject};
 
     use super::curated::extract_curated_dicom_metadata;
     use super::format::{build_dicom_tag_description, get_dicom_element_text_value};
     use super::model::{DicomMetadata, MetadataItem};
     use super::overlay::extract_overlay_metadata;
 
-    pub(crate) fn extract_dicom_metadata(dicom_object: &DefaultDicomObject) -> DicomMetadata {
+    pub(crate) fn extract_dicom_metadata(
+        dicom_object: &DefaultDicomObject,
+        original_meta: Option<&InMemDicomObject>,
+    ) -> DicomMetadata {
         DicomMetadata {
-            curated_items: extract_curated_dicom_metadata(dicom_object),
-            all_items: extract_all_dicom_metadata(dicom_object),
+            curated_items: extract_curated_dicom_metadata(dicom_object, original_meta),
+            all_items: extract_all_dicom_metadata(dicom_object, original_meta),
             overlay: extract_overlay_metadata(dicom_object),
         }
     }
 
-    fn extract_all_dicom_metadata(dicom_object: &DefaultDicomObject) -> Vec<MetadataItem> {
-        let mut metadata_items: Vec<MetadataItem> = dicom_object
-            .meta()
-            .to_element_iter()
+    fn extract_all_dicom_metadata(
+        dicom_object: &DefaultDicomObject,
+        original_meta: Option<&InMemDicomObject>,
+    ) -> Vec<MetadataItem> {
+        let mut metadata_items: Vec<MetadataItem> = original_meta
+            .into_iter()
+            .flat_map(InMemDicomObject::iter)
             .map(|element| {
                 MetadataItem::new(
                     element.tag().to_string(),
@@ -587,7 +607,7 @@ mod extract {
                         element.tag(),
                         &format!("File Meta ({})", element.vr()),
                     ),
-                    get_dicom_element_text_value(&element),
+                    get_dicom_element_text_value(element),
                 )
             })
             .chain(dicom_object.iter().map(|element| {
@@ -606,9 +626,12 @@ mod extract {
 
     #[cfg(test)]
     mod tests {
+        use dicom_core::header::Header;
         use dicom_core::{DataElement, VR, dicom_value};
         use dicom_dictionary_std::{tags, uids};
-        use dicom_object::{DefaultDicomObject, FileDicomObject, FileMetaTableBuilder};
+        use dicom_object::{
+            DefaultDicomObject, FileDicomObject, FileMetaTableBuilder, InMemDicomObject,
+        };
 
         use super::extract_dicom_metadata;
 
@@ -673,9 +696,21 @@ mod extract {
             object
         }
 
+        fn metadata_test_file_meta(object: &DefaultDicomObject) -> InMemDicomObject {
+            InMemDicomObject::from_element_iter(object.meta().to_element_iter().map(|element| {
+                DataElement::new(
+                    element.tag(),
+                    element.vr(),
+                    element.into_value().into_primitive().unwrap(),
+                )
+            }))
+        }
+
         #[test]
         fn curated_metadata_preserves_order_labels_and_placeholders() {
-            let metadata = extract_dicom_metadata(&metadata_test_object());
+            let object = metadata_test_object();
+            let original_meta = metadata_test_file_meta(&object);
+            let metadata = extract_dicom_metadata(&object, Some(&original_meta));
             let row_identity: Vec<_> = metadata
                 .curated_items
                 .iter()
@@ -730,7 +765,9 @@ mod extract {
 
         #[test]
         fn all_metadata_combines_file_meta_and_dataset_in_tag_order() {
-            let metadata = extract_dicom_metadata(&metadata_test_object());
+            let object = metadata_test_object();
+            let original_meta = metadata_test_file_meta(&object);
+            let metadata = extract_dicom_metadata(&object, Some(&original_meta));
 
             assert!(
                 metadata

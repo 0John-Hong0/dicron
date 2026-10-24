@@ -6,6 +6,9 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Preserve missing and empty file-header tags when showing DICOM metadata, including unsupported
+  header tags and the original group length. Keep absent Slice Location empty in image overlays.
+
 ## [0.4.2] - 2026-10-14
 
 - Update DICOM dependencies to resolve the JPEG XL security advisories in Cargo.lock.

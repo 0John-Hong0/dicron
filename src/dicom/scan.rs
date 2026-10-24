@@ -1,14 +1,14 @@
 //! Filesystem discovery and DICOM header scanning.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use dicom_core::{Length, Tag, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_encoding::text::SpecificCharacterSet;
@@ -43,6 +43,19 @@ struct ScannedDicomFile {
 struct ScannedIndexMetadata {
     metadata: DicomIndexMetadata,
     has_pixel_data: bool,
+}
+
+pub(crate) struct OpenedDicomFile {
+    pub(crate) object: DefaultDicomObject,
+    // Read actual header elements separately: FileMetaTable fills missing fields and drops
+    // unsupported tags. Its normalized values belong to decoding, not source metadata.
+    pub(crate) original_meta: Option<InMemDicomObject>,
+}
+
+struct DatasetSource {
+    reader: BufReader<File>,
+    transfer_syntax_uid: String,
+    file_meta: Option<FileMetaTable>,
 }
 
 #[derive(Clone, Debug)]
@@ -304,21 +317,28 @@ pub(crate) fn build_for_file_with_encoding(
 }
 
 pub(crate) fn open_dicom_file(file_path: &Path) -> Result<DefaultDicomObject> {
-    open_dicom_file_with_encoding(file_path, TextEncoding::DicomDefault)
+    open_dicom_file_with_encoding(file_path, TextEncoding::DicomDefault).map(|opened| opened.object)
 }
 
 pub(crate) fn open_dicom_file_with_encoding(
     file_path: &Path,
     text_encoding: TextEncoding,
-) -> Result<DefaultDicomObject> {
+) -> Result<OpenedDicomFile> {
     let assumed_charset = resolve_assumed_charset(file_path, text_encoding);
     if assumed_charset != SpecificCharacterSet::ISO_IR_6 {
         return open_dicom_file_with_assumed_charset(file_path, assumed_charset);
     }
 
     match OpenFileOptions::new().open_file(file_path) {
-        Ok(object) => Ok(object),
+        Ok(object) => Ok(OpenedDicomFile {
+            original_meta: read_original_file_meta(file_path)?,
+            object,
+        }),
         Err(part_10_error) => open_raw_dicom_dataset(file_path, true)
+            .map(|object| OpenedDicomFile {
+                object,
+                original_meta: None,
+            })
             .with_context(|| format!("could not parse DICOM file: {part_10_error}")),
     }
 }
@@ -326,22 +346,69 @@ pub(crate) fn open_dicom_file_with_encoding(
 fn open_dicom_file_with_assumed_charset(
     file_path: &Path,
     assumed_charset: SpecificCharacterSet,
-) -> Result<DefaultDicomObject> {
-    let (reader, meta) = open_dataset_source(file_path)?;
+) -> Result<OpenedDicomFile> {
+    let DatasetSource {
+        reader,
+        transfer_syntax_uid,
+        file_meta,
+    } = open_dataset_source(file_path)?;
     let transfer_syntax = TransferSyntaxRegistry
-        .get(meta.transfer_syntax())
-        .with_context(|| {
-            format!(
-                "unsupported DICOM transfer syntax {}",
-                meta.transfer_syntax()
-            )
-        })?;
+        .get(&transfer_syntax_uid)
+        .with_context(|| format!("unsupported DICOM transfer syntax {transfer_syntax_uid}"))?;
     let object =
         InMemDicomObject::read_dataset_with_ts_cs(reader, transfer_syntax, assumed_charset)?;
-    let mut file_object =
-        object.with_meta(FileMetaTableBuilder::new().transfer_syntax(meta.transfer_syntax()))?;
-    *file_object.meta_mut() = meta;
-    Ok(file_object)
+    let object = match file_meta {
+        Some(meta) => object.with_exact_meta(meta),
+        None => {
+            object.with_meta(FileMetaTableBuilder::new().transfer_syntax(transfer_syntax_uid))?
+        }
+    };
+    Ok(OpenedDicomFile {
+        object,
+        original_meta: read_original_file_meta(file_path)?,
+    })
+}
+
+fn read_original_file_meta(file_path: &Path) -> Result<Option<InMemDicomObject>> {
+    let mut reader = BufReader::new(File::open(file_path)?);
+    let meta_offset = {
+        let prefix = reader.fill_buf()?;
+        file_meta_offset(prefix)
+    };
+    let Some(meta_offset) = meta_offset else {
+        return Ok(None);
+    };
+    reader.consume(meta_offset);
+    let meta_start = reader.stream_position()?;
+    let mut group_length_element = [0_u8; 12];
+    reader.read_exact(&mut group_length_element)?;
+    ensure!(
+        &group_length_element[..8] == b"\x02\x00\x00\x00UL\x04\x00",
+        "invalid DICOM file meta group length element"
+    );
+    let group_length = u32::from_le_bytes(group_length_element[8..12].try_into()?);
+    reader.seek(SeekFrom::Start(meta_start))?;
+    let mut meta_reader = reader.take(u64::from(group_length) + 12);
+    let transfer_syntax = TransferSyntaxRegistry
+        .get(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+        .context("missing file meta transfer syntax decoder")?;
+    let original_meta = InMemDicomObject::read_dataset_with_ts(&mut meta_reader, transfer_syntax)?;
+    ensure!(meta_reader.limit() == 0, "truncated DICOM file metadata");
+    ensure!(
+        original_meta.tags().all(|tag| tag.0 == 0x0002),
+        "DICOM file meta group length includes dataset elements"
+    );
+    Ok(Some(original_meta))
+}
+
+fn file_meta_offset(prefix: &[u8]) -> Option<usize> {
+    if prefix.len() >= 132 && &prefix[128..132] == b"DICM" {
+        Some(132)
+    } else if prefix.starts_with(b"DICM") {
+        Some(4)
+    } else {
+        None
+    }
 }
 
 fn open_raw_dicom_dataset(file_path: &Path, read_all: bool) -> Result<DefaultDicomObject> {
@@ -424,15 +491,14 @@ fn resolve_assumed_charset(file_path: &Path, mode: TextEncoding) -> SpecificChar
 }
 
 fn detect_missing_charset_encoding(file_path: &Path) -> Result<Option<TextEncoding>> {
-    let (reader, meta) = open_dataset_source(file_path)?;
+    let DatasetSource {
+        reader,
+        transfer_syntax_uid,
+        ..
+    } = open_dataset_source(file_path)?;
     let transfer_syntax = TransferSyntaxRegistry
-        .get(meta.transfer_syntax())
-        .with_context(|| {
-            format!(
-                "unsupported DICOM transfer syntax {}",
-                meta.transfer_syntax()
-            )
-        })?;
+        .get(&transfer_syntax_uid)
+        .with_context(|| format!("unsupported DICOM transfer syntax {transfer_syntax_uid}"))?;
 
     match transfer_syntax.codec() {
         Codec::Dataset(Some(adapter)) => {
@@ -561,10 +627,13 @@ where
 
 fn scan_dicom_file(file_path: &Path, text_encoding: TextEncoding) -> Result<ScannedDicomFile> {
     let assumed_charset = resolve_assumed_charset(file_path, text_encoding);
-    let (reader, meta) = open_dataset_source(file_path)?;
-    let transfer_syntax_uid = meta.transfer_syntax();
+    let DatasetSource {
+        reader,
+        transfer_syntax_uid,
+        ..
+    } = open_dataset_source(file_path)?;
     let transfer_syntax = TransferSyntaxRegistry
-        .get(transfer_syntax_uid)
+        .get(&transfer_syntax_uid)
         .with_context(|| format!("unsupported DICOM transfer syntax {transfer_syntax_uid}"))?;
     let scanned_metadata = match transfer_syntax.codec() {
         // Deflated data sets are streaming-only after decompression, so retain the eager reader
@@ -589,29 +658,34 @@ fn scan_dicom_file(file_path: &Path, text_encoding: TextEncoding) -> Result<Scan
     Ok(ScannedDicomFile { index_entry })
 }
 
-fn open_dataset_source(file_path: &Path) -> Result<(BufReader<File>, FileMetaTable)> {
+fn open_dataset_source(file_path: &Path) -> Result<DatasetSource> {
     let file = File::open(file_path)?;
     let mut reader = BufReader::with_capacity(SCAN_BUFFER_CAPACITY, file);
     let (preamble_length, raw_transfer_syntax_uid) = {
         let prefix = reader.fill_buf()?;
-        if prefix.len() >= 132 && &prefix[128..132] == b"DICM" {
-            (128, None)
-        } else if prefix.len() >= 4 && &prefix[..4] == b"DICM" {
-            (0, None)
-        } else {
-            (0, Some(raw_dataset_transfer_syntax_from_prefix(prefix)?))
+        match file_meta_offset(prefix) {
+            Some(offset) => (offset - 4, None),
+            None => (0, Some(raw_dataset_transfer_syntax_from_prefix(prefix)?)),
         }
     };
-    let meta = match raw_transfer_syntax_uid {
-        Some(transfer_syntax_uid) => FileMetaTableBuilder::new()
-            .transfer_syntax(transfer_syntax_uid)
-            .build()?,
+    let file_meta = match raw_transfer_syntax_uid {
+        Some(_) => None,
         None => {
             reader.consume(preamble_length);
-            FileMetaTable::from_reader(&mut reader)?
+            Some(FileMetaTable::from_reader(&mut reader)?)
         }
     };
-    Ok((reader, meta))
+    let transfer_syntax_uid = file_meta
+        .as_ref()
+        .map(FileMetaTable::transfer_syntax)
+        .or(raw_transfer_syntax_uid)
+        .context("DICOM source has no decoding transfer syntax")?
+        .to_owned();
+    Ok(DatasetSource {
+        reader,
+        transfer_syntax_uid,
+        file_meta,
+    })
 }
 
 fn scan_seekable_dataset<R>(
@@ -748,10 +822,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use dicom_core::{DataElement, PrimitiveValue, VR, value::PixelFragmentSequence};
+    use dicom_core::{DataElement, PrimitiveValue, Tag, VR, value::PixelFragmentSequence};
     use dicom_dictionary_std::{tags, uids};
     use dicom_encoding::text::TextCodec;
-    use dicom_object::{FileDicomObject, FileMetaTableBuilder};
+    use dicom_object::{FileDicomObject, FileMetaTableBuilder, InMemDicomObject};
+    use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
 
     use super::{
         TextEncoding, build_for_file, build_for_file_with_encoding, build_for_inputs_with_progress,
@@ -853,23 +928,276 @@ mod tests {
         let raw_path = temporary_file_path("raw-dataset");
         write_test_object(&part_10_path, true);
         let object = dicom_object::open_file(&part_10_path).unwrap();
-        object
-            .write_dataset(File::create(&raw_path).unwrap())
-            .unwrap();
 
-        let index = build_for_file(&raw_path).unwrap();
-        let loaded = crate::dicom::load_dicom_frame(&raw_path, 0).unwrap();
-        let korean_loaded =
-            crate::dicom::load_dicom_frame_with_encoding(&raw_path, 0, TextEncoding::KoreanEucKr)
+        for transfer_syntax_uid in [
+            uids::EXPLICIT_VR_LITTLE_ENDIAN,
+            uids::IMPLICIT_VR_LITTLE_ENDIAN,
+            super::EXPLICIT_VR_BIG_ENDIAN_UID,
+        ] {
+            let transfer_syntax = TransferSyntaxRegistry.get(transfer_syntax_uid).unwrap();
+            object
+                .write_dataset_with_ts(File::create(&raw_path).unwrap(), transfer_syntax)
                 .unwrap();
-        let auto_index = build_for_file_with_encoding(&raw_path, TextEncoding::Auto).unwrap();
+            let original_bytes = std::fs::read(&raw_path).unwrap();
 
-        assert_eq!(index.total_file_count, 1);
-        assert_eq!(auto_index.total_file_count, 1);
-        assert_eq!(loaded.frame.frame_count, 1);
-        assert_eq!(korean_loaded.frame.frame_count, 1);
+            for encoding in [
+                TextEncoding::DicomDefault,
+                TextEncoding::Auto,
+                TextEncoding::KoreanEucKr,
+                TextEncoding::Utf8,
+                TextEncoding::JapaneseShiftJis,
+            ] {
+                let index = build_for_file_with_encoding(&raw_path, encoding).unwrap();
+                let loaded = if encoding == TextEncoding::DicomDefault {
+                    crate::dicom::load_dicom_frame(&raw_path, 0).unwrap()
+                } else {
+                    crate::dicom::load_dicom_frame_with_encoding(&raw_path, 0, encoding).unwrap()
+                };
+
+                assert_eq!(index.total_file_count, 1);
+                assert_eq!(loaded.frame.frame_count, 1);
+                assert_eq!(
+                    loaded.frame.pixel_probe(0, 0),
+                    Some(crate::dicom::PixelProbeValue::Monochrome(0.0))
+                );
+                assert!(
+                    loaded
+                        .metadata
+                        .all_items
+                        .iter()
+                        .all(|item| !item.tag.starts_with("(0002,")),
+                    "generated file metadata leaked for {transfer_syntax_uid}, {encoding:?}"
+                );
+                for tag in ["(0002,0010)", "(0002,0002)", "(0002,0003)"] {
+                    let item = loaded
+                        .metadata
+                        .curated_items
+                        .iter()
+                        .find(|item| item.tag == tag)
+                        .unwrap();
+                    assert_eq!(
+                        item.value, "-",
+                        "{tag}, {transfer_syntax_uid}, {encoding:?}"
+                    );
+                }
+                assert!(
+                    loaded
+                        .metadata
+                        .all_items
+                        .iter()
+                        .any(|item| item.tag == "(0008,0016)")
+                );
+            }
+            crate::dicom::load_dicom_thumbnail(&raw_path, 0, 64).unwrap();
+            assert_eq!(std::fs::read(&raw_path).unwrap(), original_bytes);
+        }
         std::fs::remove_file(part_10_path).unwrap();
         std::fs::remove_file(raw_path).unwrap();
+    }
+
+    #[test]
+    fn loading_keeps_original_file_metadata_and_source_bytes() {
+        let path = temporary_file_path("original-file-metadata");
+        write_test_object(&path, true);
+        let original_bytes = std::fs::read(&path).unwrap();
+
+        for encoding in [
+            TextEncoding::DicomDefault,
+            TextEncoding::Auto,
+            TextEncoding::KoreanEucKr,
+            TextEncoding::Utf8,
+            TextEncoding::JapaneseShiftJis,
+        ] {
+            let loaded = crate::dicom::load_dicom_frame_with_encoding(&path, 0, encoding).unwrap();
+            for items in [&loaded.metadata.curated_items, &loaded.metadata.all_items] {
+                for (tag, value) in [
+                    (
+                        "(0002,0010)",
+                        "Explicit VR Little Endian (1.2.840.10008.1.2.1)",
+                    ),
+                    (
+                        "(0002,0002)",
+                        "CT Image Storage (1.2.840.10008.5.1.4.1.1.2)",
+                    ),
+                    ("(0002,0003)", "2.25.500"),
+                ] {
+                    let item = items.iter().find(|item| item.tag == tag).unwrap();
+                    assert_eq!(item.value, value, "{tag}, {encoding:?}");
+                }
+            }
+        }
+
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn incomplete_file_headers_keep_only_their_original_elements_and_values() {
+        let path = temporary_file_path("incomplete-file-header");
+        write_test_object(&path, true);
+        let mut object = dicom_object::open_file(&path).unwrap();
+        for (tag, vr) in [
+            (tags::PATIENT_NAME, VR::PN),
+            (tags::SPECIFIC_CHARACTER_SET, VR::CS),
+            (tags::NUMBER_OF_FRAMES, VR::IS),
+            (tags::SLICE_LOCATION, VR::DS),
+            (tags::RESCALE_SLOPE, VR::DS),
+            (tags::RESCALE_INTERCEPT, VR::DS),
+            (tags::WINDOW_CENTER, VR::DS),
+            (tags::WINDOW_WIDTH, VR::DS),
+            (tags::VOILUT_FUNCTION, VR::CS),
+        ] {
+            object.put_element(DataElement::empty(tag, vr));
+        }
+        object.put_element(DataElement::new(
+            tags::IMAGE_POSITION_PATIENT,
+            VR::DS,
+            "0\\0\\42",
+        ));
+        let transfer_syntax = TransferSyntaxRegistry
+            .get(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .unwrap();
+        let mut dataset_bytes = Vec::new();
+        object.write_dataset(&mut dataset_bytes).unwrap();
+
+        for (empty_fields, include_preamble) in [(false, true), (true, true), (false, false)] {
+            let mut original_meta = InMemDicomObject::from_element_iter([
+                DataElement::new(
+                    tags::TRANSFER_SYNTAX_UID,
+                    VR::UI,
+                    uids::EXPLICIT_VR_LITTLE_ENDIAN,
+                ),
+                DataElement::new(tags::IMPLEMENTATION_VERSION_NAME, VR::SH, "SOURCE_V1"),
+                DataElement::empty(tags::SOURCE_APPLICATION_ENTITY_TITLE, VR::AE),
+                // FileMetaTable currently discards this standard header tag.
+                DataElement::new(Tag(0x0002, 0x0026), VR::UR, "dicom://source.example"),
+            ]);
+            if empty_fields {
+                for tag in [
+                    tags::MEDIA_STORAGE_SOP_CLASS_UID,
+                    tags::MEDIA_STORAGE_SOP_INSTANCE_UID,
+                    tags::IMPLEMENTATION_CLASS_UID,
+                ] {
+                    original_meta.put_element(DataElement::empty(tag, VR::UI));
+                }
+            }
+            let mut meta_bytes = Vec::new();
+            original_meta
+                .write_dataset_with_ts(&mut meta_bytes, transfer_syntax)
+                .unwrap();
+            let group_length = u32::try_from(meta_bytes.len()).unwrap();
+            let mut bytes = if include_preamble {
+                vec![0; 128]
+            } else {
+                Vec::new()
+            };
+            bytes.extend_from_slice(b"DICM\x02\x00\x00\x00UL\x04\x00");
+            bytes.extend_from_slice(&group_length.to_le_bytes());
+            bytes.extend_from_slice(&meta_bytes);
+            bytes.extend_from_slice(&dataset_bytes);
+            std::fs::write(&path, &bytes).unwrap();
+
+            let mut expected_tags: Vec<_> =
+                std::iter::once(tags::FILE_META_INFORMATION_GROUP_LENGTH)
+                    .chain(original_meta.tags())
+                    .chain(object.tags())
+                    .map(|tag| tag.to_string())
+                    .collect();
+            expected_tags.sort();
+
+            for encoding in [
+                TextEncoding::DicomDefault,
+                TextEncoding::Auto,
+                TextEncoding::KoreanEucKr,
+                TextEncoding::Utf8,
+                TextEncoding::JapaneseShiftJis,
+            ] {
+                let loaded =
+                    crate::dicom::load_dicom_frame_with_encoding(&path, 0, encoding).unwrap();
+                let actual_tags: Vec<_> = loaded
+                    .metadata
+                    .all_items
+                    .iter()
+                    .map(|item| item.tag.clone())
+                    .collect();
+                assert_eq!(
+                    actual_tags, expected_tags,
+                    "{empty_fields}, {include_preamble}, {encoding:?}"
+                );
+                for (tag, value) in [
+                    ("(0002,0000)", group_length.to_string()),
+                    ("(0002,0013)", "SOURCE_V1".to_owned()),
+                    ("(0002,0016)", "-".to_owned()),
+                    ("(0002,0026)", "dicom://source.example".to_owned()),
+                    ("(0008,0005)", "-".to_owned()),
+                    ("(0010,0010)", "-".to_owned()),
+                    ("(0020,1041)", "-".to_owned()),
+                    ("(0028,0008)", "-".to_owned()),
+                    ("(0028,1050)", "-".to_owned()),
+                    ("(0028,1051)", "-".to_owned()),
+                    ("(0028,1052)", "-".to_owned()),
+                    ("(0028,1053)", "-".to_owned()),
+                    ("(0028,1056)", "-".to_owned()),
+                ] {
+                    let item = loaded
+                        .metadata
+                        .all_items
+                        .iter()
+                        .find(|item| item.tag == tag)
+                        .unwrap();
+                    assert_eq!(item.value, value, "{tag}, {encoding:?}");
+                }
+                assert!(loaded.metadata.overlay.patient_label.is_none());
+                assert!(loaded.metadata.overlay.slice_location.is_none());
+                assert_eq!(loaded.frame.frame_count, 1);
+                for tag in ["(0002,0002)", "(0002,0003)"] {
+                    let item = loaded
+                        .metadata
+                        .curated_items
+                        .iter()
+                        .find(|item| item.tag == tag)
+                        .unwrap();
+                    assert_eq!(item.value, "-");
+                }
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_or_empty_required_pixel_attributes_are_rejected_without_filling_them() {
+        let path = temporary_file_path("missing-required-pixel-attributes");
+        write_test_object(&path, true);
+        let original = dicom_object::open_file(&path).unwrap();
+        for tag in [
+            tags::ROWS,
+            tags::COLUMNS,
+            tags::SAMPLES_PER_PIXEL,
+            tags::PHOTOMETRIC_INTERPRETATION,
+            tags::BITS_ALLOCATED,
+            tags::BITS_STORED,
+            tags::HIGH_BIT,
+            tags::PIXEL_REPRESENTATION,
+        ] {
+            for empty in [false, true] {
+                let mut object = original.clone();
+                if empty {
+                    let vr = object.element(tag).unwrap().vr();
+                    object.put_element(DataElement::empty(tag, vr));
+                } else {
+                    object.remove_element(tag);
+                }
+                object.write_to_file(&path).unwrap();
+                let source_bytes = std::fs::read(&path).unwrap();
+                assert!(
+                    crate::dicom::load_dicom_frame(&path, 0).is_err(),
+                    "{tag}, empty: {empty}"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), source_bytes);
+            }
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
