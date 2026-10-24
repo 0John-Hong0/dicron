@@ -9,7 +9,7 @@ mod pixels;
 mod scan;
 mod text_encoding;
 
-pub(crate) use metadata::{DicomMetadata, DicomOverlayMetadata, MetadataItem};
+pub(crate) use metadata::{DicomMetadata, DicomOverlayMetadata, MetadataItem, MetadataItemKind};
 pub(crate) use model::{DicomIndex, PatientGroup, SliceItem, StudyGroup};
 #[cfg(test)]
 pub(crate) use pixels::load_dicom_frame;

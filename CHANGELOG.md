@@ -6,6 +6,9 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Browse every nested DICOM sequence and item in an expandable metadata tree, with full-path
+  copying, nested search, and expand/collapse controls.
+
 - Preserve missing and empty file-header tags when showing DICOM metadata, including unsupported
   header tags and the original group length. Keep absent Slice Location empty in image overlays.
 

@@ -15,23 +15,55 @@ mod model {
         pub(crate) image_orientation: Option<[f64; 6]>,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum MetadataItemKind {
+        Element,
+        Sequence,
+        Item,
+    }
+
     #[derive(Clone)]
     pub(crate) struct MetadataItem {
         pub(crate) tag: String,
         pub(crate) description: String,
         pub(crate) value: String,
+        pub(crate) path: String,
+        pub(crate) kind: MetadataItemKind,
+        pub(crate) children: Vec<MetadataItem>,
         // Precompute the normalized text once so filtering stays cheap per UI frame.
         search_haystack: String,
     }
 
     impl MetadataItem {
         pub(crate) fn new(tag: String, description: String, value: String) -> Self {
-            let search_haystack = format!("{tag}\n{description}\n{value}").to_lowercase();
+            let path = tag.clone();
+            Self::with_structure(
+                tag,
+                description,
+                value,
+                path,
+                MetadataItemKind::Element,
+                Vec::new(),
+            )
+        }
+
+        pub(crate) fn with_structure(
+            tag: String,
+            description: String,
+            value: String,
+            path: String,
+            kind: MetadataItemKind,
+            children: Vec<MetadataItem>,
+        ) -> Self {
+            let search_haystack = format!("{tag}\n{description}\n{value}\n{path}").to_lowercase();
 
             Self {
                 tag,
                 description,
                 value,
+                path,
+                kind,
+                children,
                 search_haystack,
             }
         }
@@ -215,6 +247,26 @@ mod format {
         if value_length
             .get()
             .is_some_and(|byte_count| byte_count > MAX_INLINE_METADATA_VALUE_BYTES)
+            && !matches!(
+                element.vr(),
+                dicom_core::VR::AE
+                    | dicom_core::VR::AS
+                    | dicom_core::VR::CS
+                    | dicom_core::VR::DA
+                    | dicom_core::VR::DS
+                    | dicom_core::VR::DT
+                    | dicom_core::VR::IS
+                    | dicom_core::VR::LO
+                    | dicom_core::VR::LT
+                    | dicom_core::VR::PN
+                    | dicom_core::VR::SH
+                    | dicom_core::VR::ST
+                    | dicom_core::VR::TM
+                    | dicom_core::VR::UC
+                    | dicom_core::VR::UI
+                    | dicom_core::VR::UR
+                    | dicom_core::VR::UT
+            )
         {
             return summarize_large_value("large value", value_length);
         }
@@ -222,6 +274,20 @@ mod format {
         let Ok(raw_value) = element.to_str() else {
             return "<non-text value>".to_owned();
         };
+
+        // These single-valued text VRs may contain literal backslashes and significant line
+        // breaks. Keep their contents intact for display, search, and copying.
+        if matches!(
+            element.vr(),
+            dicom_core::VR::LT | dicom_core::VR::ST | dicom_core::VR::UT | dicom_core::VR::UR
+        ) {
+            let text = raw_value.trim_end_matches(['\0', ' ']);
+            return if text.is_empty() {
+                "-".to_owned()
+            } else {
+                text.to_owned()
+            };
+        }
 
         format_dicom_text_value(element.tag(), raw_value.as_ref())
     }
@@ -575,11 +641,13 @@ mod curated {
 
 mod extract {
     use dicom_core::header::Header;
+    use dicom_core::value::Value;
+    use dicom_object::mem::InMemElement;
     use dicom_object::{DefaultDicomObject, InMemDicomObject};
 
     use super::curated::extract_curated_dicom_metadata;
     use super::format::{build_dicom_tag_description, get_dicom_element_text_value};
-    use super::model::{DicomMetadata, MetadataItem};
+    use super::model::{DicomMetadata, MetadataItem, MetadataItemKind};
     use super::overlay::extract_overlay_metadata;
 
     pub(crate) fn extract_dicom_metadata(
@@ -600,28 +668,66 @@ mod extract {
         let mut metadata_items: Vec<MetadataItem> = original_meta
             .into_iter()
             .flat_map(InMemDicomObject::iter)
-            .map(|element| {
-                MetadataItem::new(
-                    element.tag().to_string(),
-                    build_dicom_tag_description(
-                        element.tag(),
-                        &format!("File Meta ({})", element.vr()),
-                    ),
-                    get_dicom_element_text_value(element),
-                )
-            })
-            .chain(dicom_object.iter().map(|element| {
-                MetadataItem::new(
-                    element.tag().to_string(),
-                    build_dicom_tag_description(element.tag(), element.vr().to_string()),
-                    get_dicom_element_text_value(element),
-                )
-            }))
+            .map(|element| extract_element(element, ""))
+            .chain(
+                dicom_object
+                    .iter()
+                    .map(|element| extract_element(element, "")),
+            )
             .collect();
 
         metadata_items.sort_by(|left, right| left.tag.cmp(&right.tag));
 
         metadata_items
+    }
+
+    fn extract_element(element: &InMemElement, parent_path: &str) -> MetadataItem {
+        let tag = element.tag().to_string();
+        let path = if parent_path.is_empty() {
+            tag.clone()
+        } else {
+            format!("{parent_path} / {tag}")
+        };
+        let description = build_dicom_tag_description(element.tag(), element.vr().to_string());
+        let Value::Sequence(sequence) = element.value() else {
+            return MetadataItem::with_structure(
+                tag,
+                description,
+                get_dicom_element_text_value(element),
+                path,
+                MetadataItemKind::Element,
+                Vec::new(),
+            );
+        };
+        let children = sequence
+            .items()
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let label = format!("Item {}", index + 1);
+                let item_path = format!("{path} / {label}");
+                let elements: Vec<_> = item
+                    .iter()
+                    .map(|child| extract_element(child, &item_path))
+                    .collect();
+                MetadataItem::with_structure(
+                    String::new(),
+                    label,
+                    format!("{} elements", elements.len()),
+                    item_path,
+                    MetadataItemKind::Item,
+                    elements,
+                )
+            })
+            .collect();
+        MetadataItem::with_structure(
+            tag,
+            description,
+            format!("{} items", sequence.items().len()),
+            path,
+            MetadataItemKind::Sequence,
+            children,
+        )
     }
 
     #[cfg(test)]
@@ -794,11 +900,155 @@ mod extract {
             assert_eq!(patient_name.description, "PatientName");
             assert_eq!(patient_name.value, "Doe^Jane");
         }
+
+        #[test]
+        fn nested_metadata_preserves_item_order_paths_empty_values_and_full_text() {
+            use super::super::model::MetadataItemKind;
+            use dicom_core::{Length, Tag, value::Value};
+
+            let mut object = metadata_test_object();
+            let long_text = format!(
+                "{}\\literal\nlast searchable needle",
+                "Long text ".repeat(600)
+            );
+            let deep = InMemDicomObject::from_element_iter([DataElement::new(
+                tags::REFERENCED_SOP_INSTANCE_UID,
+                VR::UI,
+                "2.25.303",
+            )]);
+            let first = InMemDicomObject::from_element_iter([
+                DataElement::new(tags::CODE_VALUE, VR::SH, "first"),
+                DataElement::empty(tags::PATIENT_ID, VR::LO),
+                DataElement::new(
+                    tags::REFERENCED_IMAGE_SEQUENCE,
+                    VR::SQ,
+                    Value::new_sequence(vec![deep], Length::UNDEFINED),
+                ),
+                DataElement::new(Tag(0x7777, 0x1001), VR::UT, long_text.clone()),
+            ]);
+            let third = InMemDicomObject::from_element_iter([DataElement::new(
+                tags::CODE_VALUE,
+                VR::SH,
+                "third",
+            )]);
+            object.put_element(DataElement::new(
+                tags::PROCEDURE_CODE_SEQUENCE,
+                VR::SQ,
+                Value::new_sequence(
+                    vec![first, InMemDicomObject::new_empty(), third],
+                    Length::UNDEFINED,
+                ),
+            ));
+            object.put_element(DataElement::empty(tags::REFERENCED_STUDY_SEQUENCE, VR::SQ));
+            object.put_element(DataElement::new(
+                tags::REFERENCED_SERIES_SEQUENCE,
+                VR::SQ,
+                Value::new_sequence(Vec::<InMemDicomObject>::new(), Length::UNDEFINED),
+            ));
+            let mut original = Vec::new();
+            object.write_dataset(&mut original).unwrap();
+
+            let metadata = extract_dicom_metadata(&object, None);
+            let sequence = metadata
+                .all_items
+                .iter()
+                .find(|item| item.tag == "(0008,1032)")
+                .unwrap();
+            assert_eq!(sequence.kind, MetadataItemKind::Sequence);
+            assert_eq!(sequence.value, "3 items");
+            assert_eq!(sequence.children.len(), 3);
+            assert_eq!(
+                sequence
+                    .children
+                    .iter()
+                    .map(|item| item.description.as_str())
+                    .collect::<Vec<_>>(),
+                ["Item 1", "Item 2", "Item 3"]
+            );
+            assert!(
+                sequence
+                    .children
+                    .iter()
+                    .all(|item| item.kind == MetadataItemKind::Item && item.tag.is_empty())
+            );
+
+            let first = &sequence.children[0];
+            let third = &sequence.children[2];
+            let code = |item: &super::MetadataItem| {
+                item.children
+                    .iter()
+                    .find(|child| child.tag == "(0008,0100)")
+                    .unwrap()
+                    .value
+                    .clone()
+            };
+            assert_eq!(code(first), "first");
+            assert_eq!(code(third), "third");
+            let first_code = first
+                .children
+                .iter()
+                .find(|item| item.tag == "(0008,0100)")
+                .unwrap();
+            let third_code = third
+                .children
+                .iter()
+                .find(|item| item.tag == "(0008,0100)")
+                .unwrap();
+            assert_eq!(first_code.path, "(0008,1032) / Item 1 / (0008,0100)");
+            assert_ne!(first_code.path, third_code.path);
+            assert!(
+                first
+                    .children
+                    .iter()
+                    .any(|item| item.tag == "(0010,0020)" && item.value == "-")
+            );
+            assert!(sequence.children[1].children.is_empty());
+            assert_eq!(sequence.children[1].value, "0 elements");
+
+            let inner = first
+                .children
+                .iter()
+                .find(|item| item.tag == "(0008,1140)")
+                .unwrap();
+            let reference = &inner.children[0].children[0];
+            assert_eq!(reference.value, "2.25.303");
+            assert_eq!(
+                reference.path,
+                "(0008,1032) / Item 1 / (0008,1140) / Item 1 / (0008,1155)"
+            );
+            let text = first
+                .children
+                .iter()
+                .find(|item| item.tag == "(7777,1001)")
+                .unwrap();
+            assert_eq!(text.value, long_text);
+            assert!(text.matches_search("last searchable needle"));
+            assert!(text.matches_search("\\literal\n"));
+            for tag in ["(0008,1110)", "(0008,1115)"] {
+                let empty = metadata
+                    .all_items
+                    .iter()
+                    .find(|item| item.tag == tag)
+                    .unwrap();
+                assert_eq!(empty.kind, MetadataItemKind::Sequence);
+                assert_eq!(empty.value, "0 items");
+                assert!(empty.children.is_empty());
+            }
+            assert!(
+                metadata
+                    .curated_items
+                    .iter()
+                    .any(|item| item.tag == "(0010,0020)" && item.value == "-")
+            );
+            let mut after = Vec::new();
+            object.write_dataset(&mut after).unwrap();
+            assert_eq!(after, original);
+        }
     }
 }
 
 pub(crate) use extract::extract_dicom_metadata;
-pub(crate) use model::{DicomMetadata, DicomOverlayMetadata, MetadataItem};
+pub(crate) use model::{DicomMetadata, DicomOverlayMetadata, MetadataItem, MetadataItemKind};
 
 fn clean_text_value(raw_value: &str) -> String {
     raw_value.trim().trim_matches('\0').replace('\\', ", ")
