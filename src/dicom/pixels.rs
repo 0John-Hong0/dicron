@@ -152,11 +152,11 @@ pub(crate) fn load_dicom_frame_with_encoding(
     frame_index: u32,
     text_encoding: TextEncoding,
 ) -> Result<LoadedFrame> {
-    let mut dicom_object = open_dicom_file_with_encoding(dicom_path, text_encoding)
+    let opened = open_dicom_file_with_encoding(dicom_path, text_encoding)
         .with_context(|| format!("could not open DICOM file {}", dicom_path.display()))?;
-
-    let metadata = extract_dicom_metadata(&dicom_object);
-    let frame = decode_frame(&mut dicom_object, frame_index)?;
+    let dicom_object = opened.object;
+    let metadata = extract_dicom_metadata(&dicom_object, opened.original_meta.as_ref());
+    let frame = decode_frame(&dicom_object, frame_index)?;
 
     Ok(LoadedFrame { frame, metadata })
 }
@@ -166,9 +166,8 @@ pub(crate) fn load_dicom_thumbnail(
     frame_index: u32,
     max_edge: u32,
 ) -> Result<DisplayPixels> {
-    let mut dicom_object = open_dicom_file(dicom_path)
+    let dicom_object = open_dicom_file(dicom_path)
         .with_context(|| format!("could not open DICOM file {}", dicom_path.display()))?;
-    remove_empty_voi_lut_function(&mut dicom_object);
     let decoded = decode_pixel_frame(&dicom_object, frame_index)?;
     let overlay_bitmaps = read_overlay_bitmaps(&dicom_object, frame_index);
     let rgba = render_decoded_frame(&decoded, None, &overlay_bitmaps)?;
@@ -186,8 +185,7 @@ pub(crate) fn load_dicom_thumbnail(
     })
 }
 
-fn decode_frame(dicom_object: &mut DefaultDicomObject, frame_index: u32) -> Result<DecodedFrame> {
-    remove_empty_voi_lut_function(dicom_object);
+fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<DecodedFrame> {
     let decoded = decode_pixel_frame(dicom_object, frame_index)?.to_owned();
 
     let frame_count = first_parsed::<u32>(dicom_object, "NumberOfFrames")
@@ -209,6 +207,23 @@ fn decode_frame(dicom_object: &mut DefaultDicomObject, frame_index: u32) -> Resu
 }
 
 fn decode_pixel_frame(object: &DefaultDicomObject, frame: u32) -> Result<DecodedPixelData<'_>> {
+    // dicom-pixeldata rejects a zero-length optional VOI LUT Function. Apply its missing-value
+    // behavior on a decoding copy, keeping the loaded source dataset and its empty tag intact.
+    if object
+        .element(tags::VOILUT_FUNCTION)
+        .is_ok_and(|element| element.length().get() == Some(0))
+    {
+        let mut decoding_object = object.clone();
+        decoding_object.remove_element(tags::VOILUT_FUNCTION);
+        return decode_pixel_frame_inner(&decoding_object, frame).map(|decoded| decoded.to_owned());
+    }
+    decode_pixel_frame_inner(object, frame)
+}
+
+fn decode_pixel_frame_inner(
+    object: &DefaultDicomObject,
+    frame: u32,
+) -> Result<DecodedPixelData<'_>> {
     let result = if object.meta().transfer_syntax.trim_end_matches(['\0', ' '])
         == jpeg_extended::TRANSFER_SYNTAX
     {
@@ -217,17 +232,6 @@ fn decode_pixel_frame(object: &DefaultDicomObject, frame: u32) -> Result<Decoded
         object.decode_pixel_data_frame(frame).map_err(Into::into)
     };
     result.with_context(|| format!("could not decode DICOM pixel data frame {}", frame + 1))
-}
-
-fn remove_empty_voi_lut_function(dicom_object: &mut DefaultDicomObject) {
-    // A zero-length optional VOI LUT Function is equivalent to an absent value.
-    // dicom-pixeldata rejects the empty element before decoding any pixels.
-    if dicom_object
-        .element(tags::VOILUT_FUNCTION)
-        .is_ok_and(|element| element.length().get() == Some(0))
-    {
-        dicom_object.remove_element(tags::VOILUT_FUNCTION);
-    }
 }
 
 fn build_pixel_probe(decoded: &DecodedPixelData<'_>) -> Option<PixelProbeData> {
@@ -401,6 +405,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use dicom_core::header::HasLength;
     use dicom_core::{DataElement, PrimitiveValue, Tag, VR};
     use dicom_dictionary_std::{tags, uids};
     use dicom_object::{DefaultDicomObject, FileDicomObject, FileMetaTableBuilder};
@@ -454,8 +459,8 @@ mod tests {
 
     #[test]
     fn overlay_plane_appears_in_full_image_and_thumbnail_without_changing_the_probe() {
-        let mut object = black_two_by_two_image_with_overlay_pixel();
-        let frame = decode_frame(&mut object, 0).unwrap();
+        let object = black_two_by_two_image_with_overlay_pixel();
+        let frame = decode_frame(&object, 0).unwrap();
         let pixels = render_frame(&frame, None).unwrap();
 
         assert_eq!((pixels.width, pixels.height), (2, 2));
@@ -481,7 +486,7 @@ mod tests {
     #[test]
     fn zero_overlay_background_respects_custom_and_file_windows() {
         let mut object = black_two_by_two_image_with_overlay_pixel();
-        let frame = decode_frame(&mut object, 0).unwrap();
+        let frame = decode_frame(&object, 0).unwrap();
         let pixels = render_frame(
             &frame,
             Some(super::DicomWindow {
@@ -494,7 +499,7 @@ mod tests {
 
         object.put_element(DataElement::new(tags::WINDOW_CENTER, VR::DS, "0"));
         object.put_element(DataElement::new(tags::WINDOW_WIDTH, VR::DS, "1"));
-        let frame = decode_frame(&mut object, 0).unwrap();
+        let frame = decode_frame(&object, 0).unwrap();
         assert_eq!(render_frame(&frame, None).unwrap().rgba, vec![255; 16]);
     }
 
@@ -518,7 +523,7 @@ mod tests {
             VR::SQ,
             dicom_core::value::Value::new_sequence(vec![lut], dicom_core::Length::UNDEFINED),
         ));
-        let frame = decode_frame(&mut object, 0).unwrap();
+        let frame = decode_frame(&object, 0).unwrap();
         assert_eq!(render_frame(&frame, None).unwrap().rgba, vec![255; 16]);
     }
 
@@ -526,7 +531,7 @@ mod tests {
     fn zero_frame_without_overlay_keeps_library_rendering() {
         let mut object = black_two_by_two_image_with_overlay_pixel();
         object.remove_element(Tag(0x6000, 0x3000));
-        let frame = decode_frame(&mut object, 0).unwrap();
+        let frame = decode_frame(&object, 0).unwrap();
         assert_eq!(render_frame(&frame, None).unwrap().rgba, vec![255; 16]);
     }
 
@@ -538,7 +543,7 @@ mod tests {
             VR::OB,
             PrimitiveValue::from(vec![0_u8, 64, 128, 255]),
         ));
-        let frame = decode_frame(&mut object, 0).unwrap();
+        let frame = decode_frame(&object, 0).unwrap();
         let pixels = render_frame(&frame, None).unwrap();
         assert_eq!(&pixels.rgba[..4], &[0, 0, 0, 255]);
         assert!(pixels.rgba[4] > 0 && pixels.rgba[4] < pixels.rgba[8]);
@@ -561,7 +566,7 @@ mod tests {
             VR::OW,
             PrimitiveValue::U16(vec![0_u16; 4].into()),
         ));
-        let frame = decode_frame(&mut object, 0).unwrap();
+        let frame = decode_frame(&object, 0).unwrap();
         let pixels = render_frame(&frame, None).unwrap();
         assert_eq!(
             &pixels.rgba[..12],
@@ -606,27 +611,38 @@ mod tests {
             PrimitiveValue::Empty,
         ));
 
-        let frame = decode_frame(&mut object, 0).unwrap();
+        let frame = decode_frame(&object, 0).unwrap();
         assert_eq!(
             (render_frame(&frame, None).unwrap().width, frame.frame_count),
             (2, 1)
         );
-        assert!(object.element(tags::VOILUT_FUNCTION).is_err());
+        assert_eq!(
+            object
+                .element(tags::VOILUT_FUNCTION)
+                .unwrap()
+                .length()
+                .get(),
+            Some(0)
+        );
 
         let path = std::env::temp_dir().join(format!(
             "dicron-empty-voi-lut-function-{}.dcm",
             std::process::id()
         ));
-        object.put_element(DataElement::new(
-            tags::VOILUT_FUNCTION,
-            VR::CS,
-            PrimitiveValue::Empty,
-        ));
         object.write_to_file(&path).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
         let loaded = load_dicom_frame(&path, 0).unwrap();
         assert_eq!(render_frame(&loaded.frame, None).unwrap().height, 2);
+        let voi_lut = loaded
+            .metadata
+            .all_items
+            .iter()
+            .find(|item| item.tag == "(0028,1056)")
+            .unwrap();
+        assert_eq!(voi_lut.value, "-");
         let thumbnail = load_dicom_thumbnail(&path, 0, 128).unwrap();
         assert_eq!((thumbnail.width, thumbnail.height), (2, 2));
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
         std::fs::remove_file(path).unwrap();
     }
 
