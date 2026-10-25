@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-25
+
 - Browse every nested DICOM sequence and item in an expandable metadata tree, with full-path
   copying, nested search, and expand/collapse controls.
 
