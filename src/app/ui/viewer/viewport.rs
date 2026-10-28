@@ -50,12 +50,8 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui) {
         egui::vec2(scrollbar_width.max(1.0), viewer_height),
     );
 
-    let is_pointer_over_viewer = ui.input(|input_state| {
-        input_state
-            .pointer
-            .hover_pos()
-            .is_some_and(|pointer_position| viewer_rect.contains(pointer_position))
-    });
+    // A menu or dialog over the viewer keeps the wheel for itself.
+    let is_pointer_over_viewer = ui.rect_contains_pointer(viewer_rect);
     let viewer_response = ui.interact(
         viewer_rect,
         ui.id().with("window_level_drag_area"),
@@ -331,7 +327,10 @@ fn show_viewer_overlays(
         corner_max_height,
     );
 
-    if let Some((left, right)) = metadata.and_then(side_orientation_markers) {
+    if let Some((left, right)) = metadata
+        .and_then(|metadata| metadata.image_orientation)
+        .and_then(|orientation| side_orientation_markers(orientation, app.viewport_transform))
+    {
         paint_overlay_text(
             ui.painter(),
             viewer_rect.left_center() + egui::vec2(OVERLAY_MARGIN, 0.0),
@@ -523,12 +522,20 @@ fn format_probe_number(value: f64) -> String {
 }
 
 fn side_orientation_markers(
-    metadata: &DicomOverlayMetadata,
+    orientation: [f64; 6],
+    transform: ViewportTransform,
 ) -> Option<(&'static str, &'static str)> {
-    let orientation = metadata.image_orientation?;
-    let right = dominant_patient_direction([orientation[0], orientation[1], orientation[2]])?;
-    let left = opposite_patient_direction(right);
-    Some((left, right))
+    let edge_direction = |displayed_u: f32| {
+        let (u, v) = transformed_image_uv(displayed_u, 0.5, transform);
+        // From the image centre to that edge, along the image rows and columns.
+        let (across_row, down_column) = (f64::from(u) - 0.5, f64::from(v) - 0.5);
+
+        dominant_patient_direction(std::array::from_fn(|axis| {
+            across_row * orientation[axis] + down_column * orientation[axis + 3]
+        }))
+    };
+
+    Some((edge_direction(0.0)?, edge_direction(1.0)?))
 }
 
 fn dominant_patient_direction(direction: [f64; 3]) -> Option<&'static str> {
@@ -550,18 +557,6 @@ fn dominant_patient_direction(direction: [f64; 3]) -> Option<&'static str> {
         (2, false) => "F",
         _ => unreachable!(),
     })
-}
-
-fn opposite_patient_direction(direction: &str) -> &'static str {
-    match direction {
-        "L" => "R",
-        "R" => "L",
-        "P" => "A",
-        "A" => "P",
-        "H" => "F",
-        "F" => "H",
-        _ => "",
-    }
 }
 
 fn paint_overlay_text(
@@ -750,10 +745,96 @@ mod tests {
 
     use super::{
         dominant_patient_direction, format_dicom_date, format_dicom_time, format_probe_number,
-        image_pixel_coordinates, overlay_galley_paint_passes, slice_overlay_text,
-        transformed_image_rect, window_overlay_text, zoom_viewport_around_pointer,
+        image_pixel_coordinates, overlay_galley_paint_passes, side_orientation_markers,
+        slice_overlay_text, transformed_image_rect, window_overlay_text,
+        zoom_viewport_around_pointer,
     };
     use crate::app::state::ViewportTransform;
+
+    /// The side letters must name what is drawn at each edge after a flip or a
+    /// quarter turn. A quarter turn is clockwise, and flips act on the screen
+    /// after it: an axial slice turned once shows its posterior (bottom) side
+    /// on the left.
+    #[test]
+    fn side_markers_follow_flips_and_rotations() {
+        const AXIAL: [f64; 6] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        const CORONAL: [f64; 6] = [1.0, 0.0, 0.0, 0.0, 0.0, -1.0];
+        let transform = |flip_horizontal, flip_vertical, rotation_quarters| ViewportTransform {
+            flip_horizontal,
+            flip_vertical,
+            rotation_quarters,
+            ..Default::default()
+        };
+
+        for (orientation, view, expected) in [
+            (AXIAL, transform(false, false, 0), ("R", "L")),
+            (AXIAL, transform(true, false, 0), ("L", "R")),
+            (AXIAL, transform(false, true, 0), ("R", "L")),
+            (AXIAL, transform(false, false, 1), ("P", "A")),
+            (AXIAL, transform(false, false, 2), ("L", "R")),
+            (AXIAL, transform(false, false, 3), ("A", "P")),
+            (AXIAL, transform(true, false, 1), ("A", "P")),
+            (AXIAL, transform(false, true, 1), ("P", "A")),
+            (CORONAL, transform(false, false, 0), ("R", "L")),
+            (CORONAL, transform(false, false, 1), ("F", "H")),
+        ] {
+            assert_eq!(
+                side_orientation_markers(orientation, view),
+                Some(expected),
+                "flips {}/{}, quarters {}",
+                view.flip_horizontal,
+                view.flip_vertical,
+                view.rotation_quarters
+            );
+        }
+    }
+
+    #[test]
+    fn wheel_over_a_popup_is_not_consumed_by_the_viewer() {
+        for show_popup in [false, true] {
+            let context = egui::Context::default();
+            let mut app = crate::app::DicronApp::default();
+            for frame in 0..3 {
+                let mut events = vec![egui::Event::PointerMoved(egui::pos2(150.0, 150.0))];
+                if frame == 2 {
+                    events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, -1.0),
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(500.0, 400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let _ = context.run_ui(input, |ui| {
+                    if show_popup {
+                        egui::Area::new(egui::Id::new("test_popup"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(egui::pos2(100.0, 100.0))
+                            .show(ui.ctx(), |ui| {
+                                ui.set_min_size(egui::vec2(200.0, 200.0));
+                                ui.label("Popup");
+                            });
+                    }
+                    egui::CentralPanel::default().show_inside(ui, |ui| super::show(&mut app, ui));
+                });
+            }
+            let remaining = context.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event, egui::Event::MouseWheel { .. }))
+                    .count()
+            });
+            assert_eq!(remaining, usize::from(show_popup));
+        }
+    }
 
     fn assert_approximately_equal(actual: f32, expected: f32) {
         assert!(
