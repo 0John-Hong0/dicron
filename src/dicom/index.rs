@@ -468,28 +468,29 @@ fn compare_slice_items(left: &SliceItem, right: &SliceItem) -> Ordering {
 
 fn compare_optional_f64(left: Option<f64>, right: Option<f64>) -> Ordering {
     match (left, right) {
-        (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+        // A total order: the standard sort panics on a comparison that is not
+        // one, and the scan thread with it.
+        (Some(left), Some(right)) => left.total_cmp(&right),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
     }
 }
 
-/// Through-plane sort key for a slice. Prefers the projection of
-/// `ImagePositionPatient` (0020,0032) onto the slice normal derived from
-/// `ImageOrientationPatient` (0020,0037) — which is correct for axial,
-/// sagittal, coronal, and oblique acquisitions alike. Falls back to the raw Z
-/// component when orientation is absent, and to `None` when position is absent.
+/// Where a slice sorts along its stack, or `None` when its position does not
+/// give a usable number, such as `NaN` or an overflowing value; such slices
+/// sort after the others, like slices without a position.
 fn compute_slice_sort_position_from_values(
     position: Option<[f64; 3]>,
     orientation: Option<[f64; 6]>,
 ) -> Option<f64> {
     let position = position?;
-    let Some(orientation) = orientation else {
-        return Some(position[2]);
+    let sort_position = match orientation {
+        Some(orientation) => project_onto_slice_normal(position, orientation),
+        None => position[2],
     };
 
-    Some(project_onto_slice_normal(position, orientation))
+    sort_position.is_finite().then_some(sort_position)
 }
 
 /// Projection of an `ImagePositionPatient` point onto the slice normal
@@ -546,6 +547,59 @@ mod tests {
     const AXIAL: [f64; 6] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
     const SAGITTAL: [f64; 6] = [0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
     const CORONAL: [f64; 6] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+    /// Slices whose positions are not numbers must not break the sort order;
+    /// mixed with instance numbers that run against the positions they used
+    /// to make the standard sort panic and the folder fail to open.
+    #[test]
+    fn unusable_slice_positions_preserve_instance_order_and_sort_last_without_instances() {
+        let slice = |index: usize, position: [f64; 3]| SliceItem {
+            path: std::path::PathBuf::from(format!("{index:02}.dcm")),
+            display_name: String::new(),
+            frame_index: 0,
+            instance_number: Some(40 - index as i32),
+            sort_position: compute_slice_sort_position_from_values(Some(position), Some(AXIAL)),
+        };
+        let slices: Vec<SliceItem> = (0..40)
+            .map(|index| {
+                if index % 10 == 3 {
+                    slice(index, [f64::NAN; 3])
+                } else if index == 17 {
+                    slice(index, [0.0, 0.0, f64::INFINITY])
+                } else {
+                    slice(index, [0.0, 0.0, index as f64])
+                }
+            })
+            .collect();
+
+        for rotation in 0..slices.len() {
+            let mut sorted = slices.clone();
+            sorted.rotate_left(rotation);
+            sorted.sort_by(compare_slice_items);
+
+            let names: Vec<_> = sorted
+                .iter()
+                .map(|slice| slice.path.to_str().unwrap().to_owned())
+                .collect();
+            let expected: Vec<_> = (0..40)
+                .rev()
+                .map(|index| format!("{index:02}.dcm"))
+                .collect();
+            assert_eq!(names, expected, "instance order, rotation {rotation}");
+
+            for slice in &mut sorted {
+                slice.instance_number = None;
+            }
+            sorted.sort_by(compare_slice_items);
+            let names: Vec<_> = sorted
+                .iter()
+                .map(|slice| slice.path.to_str().unwrap())
+                .collect();
+            let unusable = ["03.dcm", "13.dcm", "17.dcm", "23.dcm", "33.dcm"];
+            assert_eq!(names[35..], unusable, "spatial order, rotation {rotation}");
+            assert!(names[..35].is_sorted(), "rotation {rotation}");
+        }
+    }
 
     #[test]
     fn axial_projection_is_raw_z() {

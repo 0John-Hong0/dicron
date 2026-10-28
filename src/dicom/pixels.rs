@@ -3,9 +3,10 @@
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use dicom_core::header::HasLength;
-use dicom_dictionary_std::tags;
+use dicom_core::{DataElement, PrimitiveValue, VR};
+use dicom_dictionary_std::{tags, uids};
 use dicom_object::DefaultDicomObject;
 use dicom_pixeldata::{
     ConvertOptions, DecodedPixelData, PhotometricInterpretation, PixelDecoder, VoiLutOption,
@@ -156,7 +157,7 @@ pub(crate) fn load_dicom_frame_with_encoding(
         .with_context(|| format!("could not open DICOM file {}", dicom_path.display()))?;
     let dicom_object = opened.object;
     let metadata = extract_dicom_metadata(&dicom_object, opened.original_meta.as_ref());
-    let frame = decode_frame(&dicom_object, frame_index)?;
+    let frame = contain_decoder_panic(|| decode_frame(&dicom_object, frame_index))?;
 
     Ok(LoadedFrame { frame, metadata })
 }
@@ -168,9 +169,9 @@ pub(crate) fn load_dicom_thumbnail(
 ) -> Result<DisplayPixels> {
     let dicom_object = open_dicom_file(dicom_path)
         .with_context(|| format!("could not open DICOM file {}", dicom_path.display()))?;
-    let decoded = decode_pixel_frame(&dicom_object, frame_index)?;
+    let decoded = contain_decoder_panic(|| decode_pixel_frame(&dicom_object, frame_index))?;
     let overlay_bitmaps = read_overlay_bitmaps(&dicom_object, frame_index);
-    let rgba = render_decoded_frame(&decoded, None, &overlay_bitmaps)?;
+    let rgba = contain_decoder_panic(|| render_decoded_frame(&decoded, None, &overlay_bitmaps))?;
     let (width, height) = thumbnail_dimensions(rgba.width(), rgba.height(), max_edge.max(1));
     let rgba = if (width, height) == (rgba.width(), rgba.height()) {
         rgba
@@ -183,6 +184,159 @@ pub(crate) fn load_dicom_thumbnail(
         height: rgba.height() as usize,
         rgba: rgba.into_raw(),
     })
+}
+
+/// Run code that calls into the pixel decoders, turning a panic inside them
+/// into an error.
+///
+/// Some codecs behind dicom-pixeldata index out of bounds on malformed input,
+/// such as an RLE fragment cut short by an interrupted copy, instead of
+/// returning an error. The 2D viewer decodes on the UI thread, where that
+/// panic would close the application.
+pub(crate) fn contain_decoder_panic<T>(decode: impl FnOnce() -> Result<T>) -> Result<T> {
+    // Nothing the closure built survives a panic, so no broken state is seen.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(decode))
+        .unwrap_or_else(|_| Err(anyhow!("the pixel data is damaged or not supported")))
+}
+
+/// Whether any frame of a JPEG image sets a restart interval. jpeg-decoder
+/// 0.3.2 resets only its Huffman state at the restart markers of a lossless
+/// scan and keeps predicting across them, so every interval after the first
+/// decodes offset by a constant, with no error.
+fn uses_jpeg_restart_intervals(dicom_object: &DefaultDicomObject) -> bool {
+    dicom_object
+        .element(tags::PIXEL_DATA)
+        .ok()
+        .and_then(|element| element.value().fragments())
+        .is_some_and(|fragments| {
+            fragments.iter().any(|fragment| {
+                jpeg_restart_interval(fragment).is_some_and(|interval| interval > 0)
+            })
+        })
+}
+
+/// The restart interval a JPEG stream defines before its first scan, if the
+/// stream starts one here.
+fn jpeg_restart_interval(stream: &[u8]) -> Option<u16> {
+    if !stream.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+
+    let mut position = 2;
+    loop {
+        // Any number of fill bytes may precede a marker.
+        while stream.get(position + 1) == Some(&0xFF) {
+            position += 1;
+        }
+        let (0xFF, marker) = (*stream.get(position)?, *stream.get(position + 1)?) else {
+            return None;
+        };
+        let length = usize::from(u16::from_be_bytes([
+            *stream.get(position + 2)?,
+            *stream.get(position + 3)?,
+        ]));
+
+        match marker {
+            0xDD => {
+                return Some(u16::from_be_bytes([
+                    *stream.get(position + 4)?,
+                    *stream.get(position + 5)?,
+                ]));
+            }
+            // The first scan starts without a restart interval.
+            0xDA => return None,
+            _ => position += 2 + length,
+        }
+    }
+}
+
+/// The frame as an uncompressed copy of the object when it is 8-bit grayscale
+/// RLE. dicom-transfer-syntax-registry 0.9.1 decodes that one sample late: for
+/// one sample per pixel it starts writing at `samples_per_pixel - byte_offset`,
+/// which is 1 for 8-bit data, so the first pixel reads 0, the last is lost and
+/// every row begins with the previous row's last pixel. The single segment such
+/// a frame holds is unpacked here instead, and dicom-pixeldata decodes the copy
+/// as native pixel data with the object's own attributes.
+fn native_8_bit_rle_frame(
+    dicom_object: &DefaultDicomObject,
+    frame_index: u32,
+) -> Result<Option<DefaultDicomObject>> {
+    if first_parsed::<u16>(dicom_object, "BitsAllocated") != Some(8)
+        || first_parsed::<u16>(dicom_object, "SamplesPerPixel").unwrap_or(1) != 1
+    {
+        return Ok(None);
+    }
+    let (Some(rows), Some(columns)) = (
+        first_parsed::<usize>(dicom_object, "Rows"),
+        first_parsed::<usize>(dicom_object, "Columns"),
+    ) else {
+        return Ok(None);
+    };
+    let Some(fragment) = dicom_object
+        .element(tags::PIXEL_DATA)
+        .ok()
+        .and_then(|element| element.value().fragments())
+        .and_then(|fragments| fragments.get(frame_index as usize))
+    else {
+        return Ok(None);
+    };
+    // One segment, starting after the 64 byte header, is all 8-bit grayscale
+    // data has; anything else is left to the library.
+    let header = |index: usize| {
+        fragment
+            .get(index * 4..index * 4 + 4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
+    };
+    let (Some(1), Some(segment_start)) = (header(0), header(1)) else {
+        return Ok(None);
+    };
+
+    let samples = fragment
+        .get(segment_start..)
+        .and_then(|segment| unpack_bits(segment, rows * columns))
+        .context("the RLE pixel data is damaged")?;
+    let mut native = dicom_object.clone();
+    native.put_element(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OB,
+        PrimitiveValue::from(samples),
+    ));
+    native.put_element(DataElement::new(
+        tags::NUMBER_OF_FRAMES,
+        VR::IS,
+        PrimitiveValue::from("1"),
+    ));
+    native.meta_mut().transfer_syntax = uids::EXPLICIT_VR_LITTLE_ENDIAN.to_owned();
+
+    Ok(Some(native))
+}
+
+/// The first `length` bytes a PackBits run sequence expands to, or `None` when
+/// it ends short of them.
+fn unpack_bits(packed: &[u8], length: usize) -> Option<Vec<u8>> {
+    let mut packed = packed.iter().copied();
+    let mut unpacked = Vec::with_capacity(length);
+
+    while unpacked.len() < length {
+        match packed.next()? as i8 {
+            -128 => {}
+            literal @ 0.. => {
+                for _ in 0..=literal {
+                    unpacked.push(packed.next()?);
+                }
+            }
+            repeat => {
+                let byte = packed.next()?;
+                unpacked.extend(std::iter::repeat_n(
+                    byte,
+                    (1 - isize::from(repeat)) as usize,
+                ));
+            }
+        }
+    }
+
+    unpacked.truncate(length);
+    Some(unpacked)
 }
 
 fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<DecodedFrame> {
@@ -224,6 +378,21 @@ fn decode_pixel_frame_inner(
     object: &DefaultDicomObject,
     frame: u32,
 ) -> Result<DecodedPixelData<'_>> {
+    let transfer_syntax = object.meta().transfer_syntax();
+    if matches!(
+        transfer_syntax,
+        uids::JPEG_LOSSLESS | uids::JPEG_LOSSLESS_SV1
+    ) && uses_jpeg_restart_intervals(object)
+    {
+        bail!(
+            "this JPEG Lossless image uses restart intervals, which the JPEG decoder reads wrongly"
+        );
+    }
+    if transfer_syntax == uids::RLE_LOSSLESS
+        && let Some(native) = native_8_bit_rle_frame(object, frame)?
+    {
+        return Ok(native.decode_pixel_data_frame(0)?.to_owned());
+    }
     let result = if object.meta().transfer_syntax.trim_end_matches(['\0', ' '])
         == jpeg_extended::TRANSFER_SYNTAX
     {
@@ -263,7 +432,9 @@ pub(crate) fn render_frame(
     frame: &DecodedFrame,
     window: Option<DicomWindow>,
 ) -> Result<DisplayPixels> {
-    let rgba = render_decoded_frame(&frame.decoded, window, &frame.overlay_bitmaps)?;
+    let rgba = contain_decoder_panic(|| {
+        render_decoded_frame(&frame.decoded, window, &frame.overlay_bitmaps)
+    })?;
 
     Ok(DisplayPixels {
         width: rgba.width() as usize,
@@ -404,6 +575,95 @@ where
 }
 
 #[cfg(test)]
+fn write_rle_test_slice(path: &Path, position: &str, bits_allocated: u16, kept_fraction: f64) {
+    use dicom_core::value::PixelFragmentSequence;
+    use dicom_object::{FileDicomObject, FileMetaTableBuilder};
+
+    const SIDE: u16 = 64;
+    // RLE stores each byte of a sample in a segment of its own, most
+    // significant first; each segment is written here as literal runs of 128
+    // bytes, after a 64 byte header that lists where the segments start.
+    let segments: Vec<Vec<u8>> = if bits_allocated == 8 {
+        vec![(0..SIDE * SIDE).map(|index| (index % 251) as u8).collect()]
+    } else {
+        let samples: Vec<u16> = (0..SIDE * SIDE).map(|index| index * 7).collect();
+        (0..2)
+            .map(|byte| {
+                samples
+                    .iter()
+                    .map(|sample| sample.to_be_bytes()[byte])
+                    .collect()
+            })
+            .collect()
+    };
+    let mut rle = Vec::new();
+    rle.extend_from_slice(&(segments.len() as u32).to_le_bytes());
+    let mut segment_start = 64;
+    let packed: Vec<Vec<u8>> = segments
+        .iter()
+        .map(|bytes| {
+            bytes
+                .chunks(128)
+                .flat_map(|run| std::iter::once((run.len() - 1) as u8).chain(run.iter().copied()))
+                .collect()
+        })
+        .collect();
+    for segment in &packed {
+        rle.extend_from_slice(&(segment_start as u32).to_le_bytes());
+        segment_start += segment.len();
+    }
+    rle.resize(64, 0);
+    for segment in &packed {
+        rle.extend_from_slice(segment);
+    }
+
+    let meta = FileMetaTableBuilder::new()
+        .transfer_syntax(uids::RLE_LOSSLESS)
+        .media_storage_sop_class_uid(uids::CT_IMAGE_STORAGE)
+        .media_storage_sop_instance_uid("2.25.700")
+        .build()
+        .unwrap();
+    let mut object = FileDicomObject::new_empty_with_meta(meta);
+    for (tag, value) in [
+        (tags::ROWS, SIDE),
+        (tags::COLUMNS, SIDE),
+        (tags::SAMPLES_PER_PIXEL, 1),
+        (tags::BITS_ALLOCATED, bits_allocated),
+        (tags::BITS_STORED, bits_allocated),
+        (tags::HIGH_BIT, bits_allocated - 1),
+        (tags::PIXEL_REPRESENTATION, 0),
+    ] {
+        object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+    }
+    object.put_element(DataElement::new(
+        tags::PHOTOMETRIC_INTERPRETATION,
+        VR::CS,
+        PrimitiveValue::from("MONOCHROME2"),
+    ));
+    for (tag, value) in [
+        (tags::IMAGE_POSITION_PATIENT, position),
+        (tags::IMAGE_ORIENTATION_PATIENT, "1\\0\\0\\0\\1\\0"),
+        (tags::PIXEL_SPACING, "1\\1"),
+    ] {
+        object.put_element(DataElement::new(tag, VR::DS, PrimitiveValue::from(value)));
+    }
+    object.put_element(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OB,
+        PixelFragmentSequence::new(Vec::<u32>::new(), vec![rle]),
+    ));
+    object.write_to_file(path).unwrap();
+
+    let length = std::fs::metadata(path).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len((length as f64 * kept_fraction) as u64)
+        .unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use dicom_core::header::HasLength;
     use dicom_core::{DataElement, PrimitiveValue, Tag, VR};
@@ -412,9 +672,153 @@ mod tests {
     use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
 
     use super::{
-        decode_frame, finite_value_range, load_dicom_frame, load_dicom_thumbnail, render_frame,
-        thumbnail_dimensions,
+        PixelProbeValue, decode_frame, finite_value_range, jpeg_restart_interval, load_dicom_frame,
+        load_dicom_thumbnail, render_frame, thumbnail_dimensions, write_rle_test_slice,
     };
+
+    /// A compressed file cut short must fail to open, not take the
+    /// application down with a panic inside the decoder.
+    #[test]
+    fn damaged_compressed_pixel_data_is_an_error_not_a_crash() {
+        let directory = std::env::temp_dir();
+        let intact = directory.join(format!("dicron-pixels-rle-{}.dcm", std::process::id()));
+        let truncated = directory.join(format!(
+            "dicron-pixels-rle-truncated-{}.dcm",
+            std::process::id()
+        ));
+        write_rle_test_slice(&intact, "0\\0\\0", 16, 1.0);
+        write_rle_test_slice(&truncated, "0\\0\\0", 16, 0.7);
+
+        let loaded = load_dicom_frame(&intact, 0);
+        let damaged = load_dicom_frame(&truncated, 0);
+        let damaged_thumbnail = load_dicom_thumbnail(&truncated, 0, 32);
+        let _ = std::fs::remove_file(&intact);
+        let _ = std::fs::remove_file(&truncated);
+
+        // The intact fixture really is RLE that decodes to its samples.
+        let loaded = loaded.unwrap();
+        assert_eq!(
+            loaded.frame.pixel_probe(1, 1),
+            Some(PixelProbeValue::Monochrome(65.0 * 7.0))
+        );
+        let error = format!("{:#}", damaged.err().expect("the damaged file opened"));
+        assert!(error.contains("damaged"), "{error}");
+        assert!(damaged_thumbnail.is_err());
+    }
+
+    /// 8-bit RLE is unpacked in place: the library alone would put every
+    /// sample one pixel late.
+    #[test]
+    fn eight_bit_rle_decodes_every_sample_in_place() {
+        let directory = std::env::temp_dir();
+        let intact = directory.join(format!("dicron-pixels-rle8-{}.dcm", std::process::id()));
+        let truncated = directory.join(format!(
+            "dicron-pixels-rle8-truncated-{}.dcm",
+            std::process::id()
+        ));
+        write_rle_test_slice(&intact, "0\\0\\0", 8, 1.0);
+        write_rle_test_slice(&truncated, "0\\0\\0", 8, 0.7);
+
+        let loaded = load_dicom_frame(&intact, 0);
+        let thumbnail = load_dicom_thumbnail(&intact, 0, 64);
+        let damaged = load_dicom_frame(&truncated, 0);
+        let _ = std::fs::remove_file(&intact);
+        let _ = std::fs::remove_file(&truncated);
+
+        let loaded = loaded.unwrap();
+        for (x, y, expected) in [(0, 0, 0.0), (1, 1, 65.0), (63, 63, 79.0)] {
+            assert_eq!(
+                loaded.frame.pixel_probe(x, y),
+                Some(PixelProbeValue::Monochrome(expected)),
+                "({x}, {y})"
+            );
+        }
+        assert!(thumbnail.is_ok());
+        let error = format!("{:#}", damaged.err().expect("the damaged file opened"));
+        assert!(error.contains("damaged"), "{error}");
+    }
+
+    #[test]
+    fn restart_intervals_are_read_from_the_stream_header() {
+        let header = |segments: &[&[u8]]| -> Vec<u8> {
+            let mut stream = vec![0xFF, 0xD8];
+            for segment in segments {
+                stream.extend_from_slice(segment);
+            }
+            stream
+        };
+        let frame_header = [0xFF, 0xC3, 0x00, 0x05, 0x0C, 0x00, 0x01];
+        let restart = [0xFF, 0xDD, 0x00, 0x04, 0x00, 0x08];
+        let no_restart = [0xFF, 0xDD, 0x00, 0x04, 0x00, 0x00];
+        let scan = [0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xDD, 0x00, 0x04, 0x00, 0x08];
+
+        assert_eq!(
+            jpeg_restart_interval(&header(&[&frame_header, &restart, &scan])),
+            Some(8)
+        );
+        assert_eq!(
+            jpeg_restart_interval(&header(&[&frame_header, &no_restart, &scan])),
+            Some(0)
+        );
+        // A marker inside the scan is not a header.
+        assert_eq!(
+            jpeg_restart_interval(&header(&[&frame_header, &scan])),
+            None
+        );
+        assert_eq!(jpeg_restart_interval(&restart), None);
+        assert_eq!(jpeg_restart_interval(&header(&[&frame_header])), None);
+    }
+
+    /// A JPEG Lossless image that uses restart intervals is refused before the
+    /// decoder can turn every other band of it into wrong values.
+    #[test]
+    fn jpeg_lossless_with_restart_intervals_is_refused() {
+        use dicom_core::value::PixelFragmentSequence;
+        use dicom_object::{FileDicomObject, FileMetaTableBuilder};
+
+        let path = std::env::temp_dir().join(format!(
+            "dicron-pixels-jpeg-restart-{}.dcm",
+            std::process::id()
+        ));
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::JPEG_LOSSLESS_SV1)
+            .media_storage_sop_class_uid(uids::CT_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid("2.25.701")
+            .build()
+            .unwrap();
+        let mut object = FileDicomObject::new_empty_with_meta(meta);
+        for (tag, value) in [
+            (tags::ROWS, 2_u16),
+            (tags::COLUMNS, 2),
+            (tags::SAMPLES_PER_PIXEL, 1),
+            (tags::BITS_ALLOCATED, 16),
+            (tags::BITS_STORED, 12),
+            (tags::HIGH_BIT, 11),
+            (tags::PIXEL_REPRESENTATION, 0),
+        ] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            PrimitiveValue::from("MONOCHROME2"),
+        ));
+        let stream = vec![
+            0xFF, 0xD8, 0xFF, 0xDD, 0x00, 0x04, 0x00, 0x01, 0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9,
+        ];
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PixelFragmentSequence::new(Vec::<u32>::new(), vec![stream]),
+        ));
+        object.write_to_file(&path).unwrap();
+
+        let loaded = load_dicom_frame(&path, 0);
+        let _ = std::fs::remove_file(&path);
+
+        let error = format!("{:#}", loaded.err().expect("the image was decoded"));
+        assert!(error.contains("restart intervals"), "{error}");
+    }
 
     fn black_two_by_two_image_with_overlay_pixel() -> DefaultDicomObject {
         let meta = FileMetaTableBuilder::new()

@@ -6,6 +6,11 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Handle damaged compressed pixel data without closing the viewer, correct 8-bit grayscale RLE
+  sample placement, and reject JPEG Lossless restart-interval streams that the decoder misreads.
+- Keep DICOM scans stable when slice positions contain invalid numbers, preserving numeric
+  InstanceNumber ordering.
+
 ## [0.5.0] - 2026-10-25
 
 - Browse every nested DICOM sequence and item in an expandable metadata tree, with full-path
