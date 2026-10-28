@@ -213,10 +213,11 @@ fn series_open_slice_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(debug_assertions)]
     use crate::app::ui::dicom_tree::hierarchy::TREE_ROW_GAP;
-    use crate::app::ui::dicom_tree::test_support::{
-        id_change_warning_count, painted_texts, run_frame, test_slices,
-    };
+    #[cfg(debug_assertions)]
+    use crate::app::ui::dicom_tree::test_support::id_change_warning_count;
+    use crate::app::ui::dicom_tree::test_support::{painted_texts, run_frame, test_slices};
 
     #[derive(Default)]
     struct NoopThumbnails;

@@ -178,6 +178,7 @@ fn show_slice_row(
 mod tests {
     use super::*;
     use crate::app::ui::dicom_tree::hierarchy::TREE_ROW_GAP;
+    #[cfg(debug_assertions)]
     use crate::app::ui::dicom_tree::test_support::{
         id_change_warning_count, run_frame, test_slices,
     };
