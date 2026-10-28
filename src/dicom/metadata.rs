@@ -100,18 +100,17 @@ mod model {
 }
 
 mod overlay {
-    use std::str::FromStr;
-
     use dicom_object::DefaultDicomObject;
 
+    use super::super::elements::{element_text, first_parsed, parsed_values};
     use super::model::DicomOverlayMetadata;
 
     pub(super) fn extract_overlay_metadata(
         dicom_object: &DefaultDicomObject,
     ) -> DicomOverlayMetadata {
         let patient_name =
-            optional_text(dicom_object, "PatientName").map(|name| name.replace('^', " "));
-        let patient_id = optional_text(dicom_object, "PatientID");
+            element_text(dicom_object, "PatientName").map(|name| name.replace('^', " "));
+        let patient_id = element_text(dicom_object, "PatientID");
         let patient_label = match (patient_name, patient_id) {
             (Some(name), Some(id)) => Some(format!("{name} ({id})")),
             (Some(name), None) => Some(name),
@@ -126,61 +125,16 @@ mod overlay {
 
         DicomOverlayMetadata {
             patient_label,
-            study_description: optional_text(dicom_object, "StudyDescription"),
-            series_description: optional_text(dicom_object, "SeriesDescription"),
-            manufacturer: optional_text(dicom_object, "Manufacturer"),
-            modality: optional_text(dicom_object, "Modality"),
-            study_date: optional_text(dicom_object, "StudyDate"),
-            study_time: optional_text(dicom_object, "StudyTime"),
+            study_description: element_text(dicom_object, "StudyDescription"),
+            series_description: element_text(dicom_object, "SeriesDescription"),
+            manufacturer: element_text(dicom_object, "Manufacturer"),
+            modality: element_text(dicom_object, "Modality"),
+            study_date: element_text(dicom_object, "StudyDate"),
+            study_time: element_text(dicom_object, "StudyTime"),
             slice_thickness,
             slice_location,
             image_orientation: parsed_values(dicom_object, "ImageOrientationPatient"),
         }
-    }
-
-    fn optional_text(dicom_object: &DefaultDicomObject, keyword: &str) -> Option<String> {
-        let text = dicom_object
-            .element_by_name(keyword)
-            .ok()?
-            .to_str()
-            .ok()?
-            .trim()
-            .trim_matches('\0')
-            .trim()
-            .to_owned();
-
-        (!text.is_empty()).then_some(text)
-    }
-
-    fn first_parsed<T>(dicom_object: &DefaultDicomObject, keyword: &str) -> Option<T>
-    where
-        T: FromStr,
-    {
-        optional_text(dicom_object, keyword)?
-            .split('\\')
-            .next()?
-            .trim()
-            .parse()
-            .ok()
-    }
-
-    fn parsed_values<const N: usize>(
-        dicom_object: &DefaultDicomObject,
-        keyword: &str,
-    ) -> Option<[f64; N]> {
-        let text = optional_text(dicom_object, keyword)?;
-        let values: Vec<_> = text
-            .split('\\')
-            .map(str::trim)
-            .map(str::parse::<f64>)
-            .collect::<Result<_, _>>()
-            .ok()?;
-
-        let values: [f64; N] = values.try_into().ok()?;
-        values
-            .iter()
-            .all(|value| value.is_finite())
-            .then_some(values)
     }
 }
 

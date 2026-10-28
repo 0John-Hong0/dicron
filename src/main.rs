@@ -14,6 +14,10 @@ use eframe::egui::{self, FontData, FontDefinitions, FontFamily, FontTweak};
 #[cfg(target_os = "linux")]
 use winit::platform::x11::EventLoopBuilderExtX11;
 
+/// Multisampling requested from eframe. The volume rendering pipeline draws
+/// into egui's own render pass, so its sample count must match this exactly.
+pub(crate) const EGUI_MSAA_SAMPLES: u16 = 0;
+
 fn main() -> eframe::Result {
     let startup_paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
 
@@ -24,6 +28,8 @@ fn main() -> eframe::Result {
             .with_min_inner_size([900.0, 600.0])
             .with_app_id("dicron")
             .with_icon(load_window_icon()),
+        multisampling: EGUI_MSAA_SAMPLES,
+        wgpu_options: wgpu_options(),
         #[cfg(target_os = "linux")]
         event_loop_builder: Some(Box::new(|event_loop_builder| {
             // winit 0.30 receives file drops on X11, but not on its Wayland backend.
@@ -48,6 +54,30 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+/// eframe's wgpu setup, asking for the 3D texture size the adapter offers.
+///
+/// egui-wgpu requests WebGL2's limits from a GL adapter, whose 256 voxel 3D
+/// textures would halve volume rendering's resolution on a machine that falls
+/// back to OpenGL, though native GL drivers offer 2048 or more.
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    let default_descriptor = Arc::clone(&setup.device_descriptor);
+
+    setup.device_descriptor = Arc::new(move |adapter| {
+        let mut descriptor = default_descriptor(adapter);
+        descriptor.required_limits.max_texture_dimension_3d = descriptor
+            .required_limits
+            .max_texture_dimension_3d
+            .max(adapter.limits().max_texture_dimension_3d);
+        descriptor
+    });
+
+    eframe::egui_wgpu::WgpuConfiguration {
+        wgpu_setup: setup.into(),
+        ..Default::default()
+    }
 }
 
 fn load_window_icon() -> egui::IconData {

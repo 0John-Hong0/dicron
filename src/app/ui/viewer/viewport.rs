@@ -1,22 +1,20 @@
 //! Image display, fitting, zooming, panning, and clipping.
 
-use std::sync::Arc;
-
 use eframe::egui;
 
 use super::{controls, image_texture::fit_image_to_available_space};
 use crate::app::DicronApp;
 use crate::app::state::ViewportTransform;
+use crate::app::ui::overlay::{
+    OVERLAY_FONT_SIZE, OVERLAY_LINE_GAP, OVERLAY_MARGIN, identification_overlay_text,
+    join_overlay_lines, paint_overlay_text, paint_transformed_image, transformed_image_rect,
+    transformed_image_uv, zoom_viewport_around_pointer,
+};
+use crate::dicom::dominant_patient_direction;
 use crate::dicom::{DicomOverlayMetadata, PixelProbeValue};
 use crate::theme;
 
-const MIN_VIEWER_ZOOM: f32 = 0.1;
-const MAX_VIEWER_ZOOM: f32 = 20.0;
-const VIEWER_ZOOM_DRAG_SENSITIVITY: f32 = 0.01;
-const OVERLAY_MARGIN: f32 = theme::SPACE_MD;
-const OVERLAY_FONT_SIZE: f32 = 13.0;
 const OVERLAY_BLOCK_GAP: f32 = theme::SPACE_LG;
-const OVERLAY_LINE_GAP: f32 = theme::SPACE_XXS;
 
 pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui) {
     let raw_available_size = ui.available_size();
@@ -151,87 +149,6 @@ fn handle_viewport_transform(
     }
 }
 
-fn zoom_viewport_around_pointer(
-    transform: &mut ViewportTransform,
-    vertical_drag: f32,
-    viewer_center: egui::Pos2,
-    anchor: egui::Pos2,
-) {
-    if vertical_drag == 0.0 {
-        return;
-    }
-
-    let previous_zoom = transform.zoom;
-    let zoom_factor = (vertical_drag * VIEWER_ZOOM_DRAG_SENSITIVITY).exp();
-    let next_zoom = (previous_zoom * zoom_factor).clamp(MIN_VIEWER_ZOOM, MAX_VIEWER_ZOOM);
-    let applied_factor = next_zoom / previous_zoom;
-    let anchor_from_center = anchor - viewer_center;
-
-    transform.pan = anchor_from_center + (transform.pan - anchor_from_center) * applied_factor;
-    transform.zoom = next_zoom;
-}
-
-fn transformed_image_rect(
-    viewer_rect: egui::Rect,
-    fitted_image_size: egui::Vec2,
-    transform: ViewportTransform,
-) -> egui::Rect {
-    let displayed_size = if transform.rotation_quarters.is_multiple_of(2) {
-        fitted_image_size
-    } else {
-        egui::vec2(fitted_image_size.y, fitted_image_size.x)
-    };
-
-    egui::Rect::from_center_size(
-        viewer_rect.center() + transform.pan,
-        displayed_size * transform.zoom,
-    )
-}
-
-fn paint_transformed_image(
-    painter: &egui::Painter,
-    texture_id: egui::TextureId,
-    image_rect: egui::Rect,
-    transform: ViewportTransform,
-) {
-    let mut mesh = egui::Mesh::with_texture(texture_id);
-    let positions = [
-        image_rect.left_top(),
-        image_rect.right_top(),
-        image_rect.left_bottom(),
-        image_rect.right_bottom(),
-    ];
-    let uvs = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
-        .map(|(u, v)| transformed_image_uv(u, v, transform));
-
-    for (position, (u, v)) in positions.into_iter().zip(uvs) {
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: position,
-            uv: egui::pos2(u, v),
-            color: egui::Color32::WHITE,
-        });
-    }
-    mesh.indices.extend_from_slice(&[0, 1, 2, 2, 1, 3]);
-    painter.add(egui::Shape::mesh(mesh));
-}
-
-fn transformed_image_uv(mut u: f32, mut v: f32, transform: ViewportTransform) -> (f32, f32) {
-    if transform.flip_horizontal {
-        u = 1.0 - u;
-    }
-    if transform.flip_vertical {
-        v = 1.0 - v;
-    }
-
-    match transform.rotation_quarters % 4 {
-        0 => (u, v),
-        1 => (v, 1.0 - u),
-        2 => (1.0 - u, 1.0 - v),
-        3 => (1.0 - v, u),
-        _ => unreachable!(),
-    }
-}
-
 fn show_viewer_overlays(
     app: &DicronApp,
     ui: &egui::Ui,
@@ -244,7 +161,7 @@ fn show_viewer_overlays(
         (viewer_rect.width() - OVERLAY_MARGIN * 2.0 - OVERLAY_BLOCK_GAP).max(0.0);
     let corner_max_height =
         ((viewer_rect.height() - OVERLAY_MARGIN * 2.0 - OVERLAY_BLOCK_GAP) / 2.0).max(0.0);
-    let top_left_text = top_left_overlay_text(metadata);
+    let top_left_text = identification_overlay_text(metadata);
     let top_right_text = top_right_overlay_text(metadata);
     let (top_left_max_width, top_right_max_width) = paired_overlay_widths(
         ui.painter(),
@@ -350,15 +267,6 @@ fn show_viewer_overlays(
     }
 }
 
-fn top_left_overlay_text(metadata: Option<&DicomOverlayMetadata>) -> Option<String> {
-    let metadata = metadata?;
-    join_overlay_lines([
-        metadata.patient_label.as_deref(),
-        metadata.study_description.as_deref(),
-        metadata.series_description.as_deref(),
-    ])
-}
-
 fn top_right_overlay_text(metadata: Option<&DicomOverlayMetadata>) -> Option<String> {
     let metadata = metadata?;
     let study_datetime = format_study_datetime(
@@ -388,17 +296,6 @@ fn bottom_left_overlay_text(
     }
 
     (!lines.is_empty()).then(|| lines.join("\n"))
-}
-
-fn join_overlay_lines<const N: usize>(lines: [Option<&str>; N]) -> Option<String> {
-    let text = lines
-        .into_iter()
-        .flatten()
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    (!text.is_empty()).then_some(text)
 }
 
 fn format_study_datetime(date: Option<&str>, time: Option<&str>) -> Option<String> {
@@ -521,6 +418,10 @@ fn format_probe_number(value: f64) -> String {
     }
 }
 
+/// The patient directions at the middle of the displayed left and right edges.
+///
+/// Each edge is traced back through the same mapping that draws the image, so
+/// a flip or a quarter turn moves the letters with the anatomy.
 fn side_orientation_markers(
     orientation: [f64; 6],
     transform: ViewportTransform,
@@ -536,79 +437,6 @@ fn side_orientation_markers(
     };
 
     Some((edge_direction(0.0)?, edge_direction(1.0)?))
-}
-
-fn dominant_patient_direction(direction: [f64; 3]) -> Option<&'static str> {
-    let (axis, value) = direction
-        .into_iter()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| left.abs().total_cmp(&right.abs()))?;
-
-    if !value.is_finite() || value.abs() < f64::EPSILON {
-        return None;
-    }
-
-    Some(match (axis, value.is_sign_positive()) {
-        (0, true) => "L",
-        (0, false) => "R",
-        (1, true) => "P",
-        (1, false) => "A",
-        (2, true) => "H",
-        (2, false) => "F",
-        _ => unreachable!(),
-    })
-}
-
-fn paint_overlay_text(
-    painter: &egui::Painter,
-    position: egui::Pos2,
-    anchor: egui::Align2,
-    text: &str,
-    max_width: f32,
-    max_height: f32,
-) {
-    let font = egui::FontId::monospace(OVERLAY_FONT_SIZE);
-    let line_height = painter
-        .layout_no_wrap("Ag".to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
-        .size()
-        .y;
-    let line_step = line_height + OVERLAY_LINE_GAP;
-    let lines: Vec<_> = text.lines().filter(|line| !line.is_empty()).collect();
-    let max_lines = if max_height.is_finite() {
-        ((max_height + OVERLAY_LINE_GAP) / line_step).floor() as usize
-    } else {
-        lines.len()
-    };
-
-    if max_lines == 0 || lines.is_empty() || max_width <= 0.0 {
-        return;
-    }
-
-    let visible_line_count = lines.len().min(max_lines);
-    let first_visible_line = if anchor.y() == egui::Align::Max {
-        lines.len() - visible_line_count
-    } else {
-        0
-    };
-    let visible_lines = &lines[first_visible_line..first_visible_line + visible_line_count];
-    let block_height = line_height * visible_line_count as f32
-        + OVERLAY_LINE_GAP * visible_line_count.saturating_sub(1) as f32;
-    let block_top = match anchor.y() {
-        egui::Align::Min => position.y,
-        egui::Align::Center => position.y - block_height / 2.0,
-        egui::Align::Max => position.y - block_height,
-    };
-    let line_anchor = egui::Align2([anchor.x(), egui::Align::Min]);
-
-    for (line_index, line) in visible_lines.iter().enumerate() {
-        let Some(galley) = layout_overlay_line(painter, line, &font, max_width) else {
-            continue;
-        };
-        let line_position = egui::pos2(position.x, block_top + line_index as f32 * line_step);
-        let line_rect = line_anchor.anchor_size(line_position, galley.size());
-
-        paint_overlay_galley(painter, line_rect.min, galley);
-    }
 }
 
 fn paired_overlay_widths(
@@ -648,108 +476,17 @@ fn overlay_text_width(painter: &egui::Painter, text: &str, font: &egui::FontId) 
         .fold(0.0, f32::max)
 }
 
-fn layout_overlay_line(
-    painter: &egui::Painter,
-    text: &str,
-    font: &egui::FontId,
-    max_width: f32,
-) -> Option<Arc<egui::Galley>> {
-    let full_galley =
-        painter.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER);
-    if full_galley.size().x <= max_width {
-        return Some(full_galley);
-    }
-
-    const TRUNCATION_SUFFIX: &str = "...";
-    let suffix_galley = painter.layout_no_wrap(
-        TRUNCATION_SUFFIX.to_owned(),
-        font.clone(),
-        egui::Color32::PLACEHOLDER,
-    );
-    if suffix_galley.size().x > max_width {
-        return None;
-    }
-
-    let characters: Vec<_> = text.chars().collect();
-    let mut minimum = 0;
-    let mut maximum = characters.len();
-
-    while minimum < maximum {
-        let candidate_length = (minimum + maximum).div_ceil(2);
-        let candidate = truncated_overlay_line(&characters, candidate_length);
-        let candidate_width = painter
-            .layout_no_wrap(candidate, font.clone(), egui::Color32::PLACEHOLDER)
-            .size()
-            .x;
-
-        if candidate_width <= max_width {
-            minimum = candidate_length;
-        } else {
-            maximum = candidate_length - 1;
-        }
-    }
-
-    Some(painter.layout_no_wrap(
-        truncated_overlay_line(&characters, minimum),
-        font.clone(),
-        egui::Color32::PLACEHOLDER,
-    ))
-}
-
-fn truncated_overlay_line(characters: &[char], prefix_length: usize) -> String {
-    characters
-        .iter()
-        .take(prefix_length)
-        .chain(['.', '.', '.'].iter())
-        .collect()
-}
-
-fn paint_overlay_galley(painter: &egui::Painter, position: egui::Pos2, galley: Arc<egui::Galley>) {
-    let paint_passes = overlay_galley_paint_passes(painter);
-
-    for _ in 0..paint_passes {
-        painter.galley_with_override_text_color(
-            position + egui::vec2(1.0, 1.0),
-            galley.clone(),
-            egui::Color32::from_black_alpha(180),
-        );
-    }
-
-    for _ in 0..paint_passes {
-        painter.galley_with_override_text_color(
-            position,
-            galley.clone(),
-            egui::Color32::from_white_alpha(220),
-        );
-    }
-}
-
-fn overlay_galley_paint_passes(painter: &egui::Painter) -> usize {
-    let alpha_from_coverage = painter.fonts(|fonts| fonts.options().alpha_from_coverage);
-
-    // The font atlas is configured from the active global theme, even though the viewer uses a
-    // local dark style. Dark coverage is `2c - c²`, equivalent to compositing an opaque linear
-    // coverage mask twice. A second coincident overlay pass restores that stronger edge coverage.
-    // Keep the correction local so ordinary light-theme UI text is unaffected, and leave the
-    // existing dark overlay path as a single pass.
-    if alpha_from_coverage == egui::epaint::AlphaFromCoverage::LIGHT_MODE_DEFAULT {
-        2
-    } else {
-        1
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use eframe::egui;
 
     use super::{
         dominant_patient_direction, format_dicom_date, format_dicom_time, format_probe_number,
-        image_pixel_coordinates, overlay_galley_paint_passes, side_orientation_markers,
-        slice_overlay_text, transformed_image_rect, window_overlay_text,
-        zoom_viewport_around_pointer,
+        image_pixel_coordinates, side_orientation_markers, slice_overlay_text,
+        transformed_image_rect, window_overlay_text, zoom_viewport_around_pointer,
     };
     use crate::app::state::ViewportTransform;
+    use crate::app::ui::overlay::VIEWER_ZOOM_DRAG_SENSITIVITY;
 
     /// The side letters must name what is drawn at each edge after a flip or a
     /// quarter turn. A quarter turn is clockwise, and flips act on the screen
@@ -916,7 +653,7 @@ mod tests {
         let relative_anchor = (anchor - before.min) / before.size();
         zoom_viewport_around_pointer(
             &mut transform,
-            std::f32::consts::LN_2 / super::VIEWER_ZOOM_DRAG_SENSITIVITY,
+            std::f32::consts::LN_2 / VIEWER_ZOOM_DRAG_SENSITIVITY,
             viewer_rect.center(),
             anchor,
         );
@@ -939,18 +676,5 @@ mod tests {
         assert_eq!(dominant_patient_direction([1.0, 0.0, 0.0]), Some("L"));
         assert_eq!(dominant_patient_direction([0.0, -0.9, 0.1]), Some("A"));
         assert_eq!(dominant_patient_direction([0.0, 0.0, 0.0]), None);
-    }
-
-    #[test]
-    fn overlay_compensates_for_light_font_coverage_only() {
-        let context = egui::Context::default();
-
-        for (theme, expected_passes) in [(egui::Theme::Dark, 1), (egui::Theme::Light, 2)] {
-            context.set_theme(theme);
-
-            let _ = context.run_ui(Default::default(), |ui| {
-                assert_eq!(overlay_galley_paint_passes(ui.painter()), expected_passes);
-            });
-        }
     }
 }

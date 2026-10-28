@@ -2,11 +2,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui;
 
-use crate::dicom::{DicomIndex, DicomOverlayMetadata, MetadataItem, TextEncoding};
+use crate::dicom::{DicomIndex, DicomOverlayMetadata, MetadataItem, TextEncoding, Volume};
 use crate::release_check::UpdateCheckOutcome;
 use crate::settings::AppSettings;
 
@@ -14,6 +15,10 @@ use super::background_tasks::{ReleaseCheckJob, ScanController};
 use super::frame_cache::DecodedCache;
 use super::frame_loading::FrameLoadController;
 use super::series_thumbnail_cache::SeriesThumbnailCache;
+use super::three_d_state::{
+    GpuBudget, MprMode, MprQuality, MprState, SavedMprView, VolumeRenderState,
+};
+use super::volume_job::{PreparedVolume, VolumeJobController, volume_is_at_target};
 
 pub(super) type SeriesKey = (usize, usize, usize);
 
@@ -96,6 +101,13 @@ impl Default for PlaybackState {
 pub(super) struct WindowLevel {
     pub(super) center: f64,
     pub(super) width: f64,
+}
+
+impl WindowLevel {
+    /// The centres the window editors accept, in 2D and 3D alike.
+    pub(super) const CENTER_RANGE: std::ops::RangeInclusive<f64> = -100_000.0..=100_000.0;
+    /// The widths the window editors accept, in 2D and 3D alike.
+    pub(super) const WIDTH_RANGE: std::ops::RangeInclusive<f64> = 1.0..=200_000.0;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -320,6 +332,173 @@ impl AboutDialogState {
     }
 }
 
+/// The 3D workspace the central panel can switch to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ThreeDMode {
+    Mpr,
+    Mip,
+    VolumeRendering,
+}
+
+impl ThreeDMode {
+    pub(super) const ALL: [Self; 3] = [Self::Mpr, Self::Mip, Self::VolumeRendering];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Mpr => "MPR",
+            Self::Mip => "MIP",
+            Self::VolumeRendering => "Volume Rendering",
+        }
+    }
+
+    /// How the MPR views sample the volume in this mode, if it shows them.
+    pub(super) fn mpr_mode(self) -> Option<MprMode> {
+        match self {
+            Self::Mpr => Some(MprMode::Slice),
+            Self::Mip => Some(MprMode::MipSlab),
+            Self::VolumeRendering => None,
+        }
+    }
+}
+
+/// What the central panel and its control row currently show.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum ViewMode {
+    #[default]
+    TwoD,
+    ThreeD(ThreeDMode),
+}
+
+impl ViewMode {
+    pub(super) fn three_d_mode(self) -> Option<ThreeDMode> {
+        match self {
+            Self::TwoD => None,
+            Self::ThreeD(mode) => Some(mode),
+        }
+    }
+}
+
+/// What the wgpu renderer behind egui can do, read from the render state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct GpuInfo {
+    pub(super) max_texture_dimension_3d: u32,
+}
+
+#[derive(Default)]
+pub(super) struct ThreeDState {
+    pub(super) view_mode: ViewMode,
+    pub(super) job: VolumeJobController,
+    /// The workspace on screen, if any.
+    pub(super) active: Option<ActiveVolumeView>,
+    /// A prepared volume the user did not open, kept to avoid rebuilding it.
+    pub(super) cached: Option<(SeriesKey, u64, PreparedVolume)>,
+    /// Series the user opened despite the low-resolution warning.
+    pub(super) low_resolution_accepted: HashSet<(SeriesKey, u64)>,
+    /// Series whose reconstruction failed, with the message it failed with.
+    /// Selecting one inside 3D returns to it in 2D with that message instead
+    /// of decoding it again; only an explicit 3D request retries it.
+    pub(super) build_failures: HashMap<(SeriesKey, u64), String>,
+    pub(super) low_resolution_prompt: Option<LowResolutionPrompt>,
+    /// How each series' workspace was left when another replaced it, so a
+    /// return to it opens where the user was: the planes, slabs, window and
+    /// zoom, and the volume rendering camera and preset.
+    pub(super) saved_views: HashMap<(SeriesKey, u64), (SavedMprView, VolumeRenderState)>,
+    /// The renderer's limits, once a frame has read the wgpu render state.
+    pub(super) gpu: Option<GpuInfo>,
+    pub(super) gpu_available: bool,
+    /// Why volume rendering gave up on this device, if it did.
+    pub(super) render_failure: Option<String>,
+    /// The volume whose texture the renderer was last told to keep.
+    pub(super) wanted_gpu_volume: Option<u64>,
+    /// Frames the tree selection has pointed at a series with no volume yet.
+    pub(super) pending_selection_frames: u8,
+}
+
+impl ThreeDState {
+    /// Whether the workspace on screen was built from exactly this series.
+    pub(super) fn active_matches(&self, series_key: SeriesKey, fingerprint: u64) -> bool {
+        self.active.as_ref().is_some_and(|active| {
+            active.series_key == series_key && active.fingerprint == fingerprint
+        })
+    }
+
+    /// Whether a volume for exactly this series is kept but not shown.
+    pub(super) fn cached_matches(&self, series_key: SeriesKey, fingerprint: u64) -> bool {
+        self.cached
+            .as_ref()
+            .is_some_and(|(cached_key, cached_fingerprint, _)| {
+                *cached_key == series_key && *cached_fingerprint == fingerprint
+            })
+    }
+
+    /// Whether a running job is already preparing exactly this series.
+    pub(super) fn job_matches(&self, series_key: SeriesKey, fingerprint: u64) -> bool {
+        self.job.request().is_some_and(|request| {
+            request.series_key == series_key && request.fingerprint == fingerprint
+        })
+    }
+
+    /// Why reconstructing this series failed, if it has been tried and failed.
+    pub(super) fn build_failure(&self, series_key: SeriesKey, fingerprint: u64) -> Option<&str> {
+        self.build_failures
+            .get(&(series_key, fingerprint))
+            .map(String::as_str)
+    }
+}
+
+pub(super) struct ActiveVolumeView {
+    pub(super) series_key: SeriesKey,
+    pub(super) fingerprint: u64,
+    /// Who and what the series is, taken when the workspace opened, so the
+    /// views name the series they were built from.
+    pub(super) series_overlay: Option<DicomOverlayMetadata>,
+    pub(super) prepared: PreparedVolume,
+    pub(super) low_resolution: bool,
+    pub(super) mpr: MprState,
+    pub(super) render: VolumeRenderState,
+    /// How large a volume rendering texture this workspace may still try.
+    pub(super) gpu_budget: GpuBudget,
+}
+
+impl ActiveVolumeView {
+    /// Let go of the downsampled copy a series over the MPR budget was built
+    /// with, once the planes show another grid: it can take 512 MB, and
+    /// choosing Auto again resamples it anew.
+    pub(super) fn release_unshown_planes(&mut self) {
+        let source = &self.prepared.series.volume;
+
+        if !Arc::ptr_eq(&self.prepared.mpr, source)
+            && !Arc::ptr_eq(&self.prepared.mpr, &self.mpr.volume)
+        {
+            self.prepared.mpr = Arc::clone(source);
+        }
+    }
+
+    /// The volume already in memory that shows `quality`, if one does: the
+    /// planes' own, the one prepared with the series, or the source itself.
+    pub(super) fn volume_for_quality(&self, quality: MprQuality) -> Option<Arc<Volume>> {
+        let source = &self.prepared.series.volume;
+        let Some(target_mm) = quality.target_mm(source) else {
+            return Some(Arc::clone(source));
+        };
+
+        [&self.mpr.volume, &self.prepared.mpr, source]
+            .into_iter()
+            .find(|volume| volume_is_at_target(volume, source, target_mm))
+            .cloned()
+    }
+}
+
+/// A built volume waiting for the user to confirm its coarse geometry.
+pub(super) struct LowResolutionPrompt {
+    pub(super) prepared: PreparedVolume,
+    pub(super) series_key: SeriesKey,
+    pub(super) fingerprint: u64,
+    pub(super) mode: ThreeDMode,
+    /// What makes the series coarse, as the warning words it.
+    pub(super) cause: String,
+}
+
 pub(crate) struct DicronApp {
     pub(super) open_source: Option<OpenSource>,
     pub(super) text_encoding: TextEncoding,
@@ -343,9 +522,16 @@ pub(crate) struct DicronApp {
     pub(super) scan: ScanController,
     pub(super) frame_load: FrameLoadController,
     pub(super) viewer_scroll_slice_remainder: f32,
+    /// Whether a widget owned the keyboard when the last frame ended. egui
+    /// releases a focused field as soon as Escape arrives, before the
+    /// shortcuts are read, so that Escape is the field's and not a shortcut.
+    pub(super) keyboard_owned_last_frame: bool,
     pub(super) viewport_transform: ViewportTransform,
     pub(super) viewport_zoom_anchor: Option<egui::Pos2>,
     pub(super) playback: PlaybackState,
+
+    pub(super) three_d: ThreeDState,
+
     pub(super) panel_layout: PanelLayout,
     // Bumped when the preference changes so CollapsingHeaders get fresh ids.
     pub(super) tree_view_generation: u64,
@@ -380,9 +566,11 @@ impl Default for DicronApp {
             scan: ScanController::default(),
             frame_load: FrameLoadController::default(),
             viewer_scroll_slice_remainder: 0.0,
+            keyboard_owned_last_frame: false,
             viewport_transform: ViewportTransform::default(),
             viewport_zoom_anchor: None,
             playback: PlaybackState::default(),
+            three_d: ThreeDState::default(),
             panel_layout: PanelLayout::default(),
             tree_view_generation: 0,
             settings,

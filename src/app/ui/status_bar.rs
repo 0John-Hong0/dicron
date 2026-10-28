@@ -1,11 +1,12 @@
 //! Scan/image-loading progress and dismissible warning/error status rendering.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use crate::app::background_tasks::ScanProgress;
 use crate::app::frame_loading::FrameLoadPhase;
+use crate::app::volume_job::{PREPARING_GPU_MESSAGE, VolumeJobProgress, VolumeJobStage};
 
 pub(super) fn show_loading_status(
     ui: &mut egui::Ui,
@@ -48,6 +49,53 @@ pub(super) fn show_loading_status(
     Some(ui.add(egui::ProgressBar::new(progress).animate(false).text(text)))
 }
 
+/// The progress of a 3D preparation, with a Cancel button when `cancellable`.
+/// Returns whether it was clicked.
+pub(super) fn show_volume_build_status(
+    ui: &mut egui::Ui,
+    job_state: Option<&VolumeJobProgress>,
+    cancellable: bool,
+) -> bool {
+    let Some(job_state) = job_state else {
+        return false;
+    };
+
+    ui.separator();
+
+    let (progress, text) = match job_state.stage {
+        VolumeJobStage::Decoding => {
+            let progress = if job_state.total_slice_count == 0 {
+                0.0
+            } else {
+                job_state.decoded_slice_count as f32 / job_state.total_slice_count as f32
+            };
+            let eta_text = format_eta(estimate_eta(
+                job_state.started_at,
+                job_state.decoded_slice_count,
+                job_state.total_slice_count,
+            ));
+
+            (
+                progress,
+                format!(
+                    "Preparing 3D  {} / {} slices | ETA {}",
+                    job_state.decoded_slice_count, job_state.total_slice_count, eta_text
+                ),
+            )
+        }
+        VolumeJobStage::Resampling => (1.0, "Preparing 3D  resampling…".to_owned()),
+        VolumeJobStage::PreparingGpu => (1.0, PREPARING_GPU_MESSAGE.to_owned()),
+    };
+
+    ui.add(egui::ProgressBar::new(progress).text(text));
+
+    cancellable
+        && ui
+            .button("Cancel")
+            .on_hover_text("Stop preparing the 3D view")
+            .clicked()
+}
+
 pub(super) fn show_error_status(ui: &mut egui::Ui, error_message: Option<&str>) -> bool {
     let Some(error_message) = error_message else {
         return false;
@@ -82,6 +130,22 @@ fn estimate_scan_eta(scan_state: &ScanProgress) -> Option<Duration> {
     Some(Duration::from_secs_f64(
         seconds_per_file * remaining_file_count as f64,
     ))
+}
+
+/// The time the remaining work should take at the rate observed so far.
+fn estimate_eta(started_at: Instant, processed: usize, total: usize) -> Option<Duration> {
+    if processed == 0 || total == 0 {
+        return None;
+    }
+
+    let seconds_per_item = started_at.elapsed().as_secs_f64() / processed as f64;
+    let remaining = total.saturating_sub(processed);
+
+    Some(Duration::from_secs_f64(seconds_per_item * remaining as f64))
+}
+
+fn format_eta(eta: Option<Duration>) -> String {
+    eta.map_or_else(|| "calculating...".to_owned(), format_duration)
 }
 
 fn format_duration(duration: Duration) -> String {

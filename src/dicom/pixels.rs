@@ -360,7 +360,10 @@ fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<D
     })
 }
 
-fn decode_pixel_frame(object: &DefaultDicomObject, frame: u32) -> Result<DecodedPixelData<'_>> {
+pub(crate) fn decode_pixel_frame(
+    object: &DefaultDicomObject,
+    frame: u32,
+) -> Result<DecodedPixelData<'_>> {
     // dicom-pixeldata rejects a zero-length optional VOI LUT Function. Apply its missing-value
     // behavior on a decoding copy, keeping the loaded source dataset and its empty tag intact.
     if object
@@ -575,7 +578,12 @@ where
 }
 
 #[cfg(test)]
-fn write_rle_test_slice(path: &Path, position: &str, bits_allocated: u16, kept_fraction: f64) {
+pub(crate) fn write_rle_test_slice(
+    path: &Path,
+    position: &str,
+    bits_allocated: u16,
+    kept_fraction: f64,
+) {
     use dicom_core::value::PixelFragmentSequence;
     use dicom_object::{FileDicomObject, FileMetaTableBuilder};
 

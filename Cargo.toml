@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"
+bytemuck = { version = "1.25", features = ["derive"] }
 dicom-core = "0.10.0"
 dicom-dictionary-std = { version = "0.10.0", features = ["sop-class"] }
 dicom-encoding = "0.10.0"
@@ -25,8 +26,9 @@ dicom-parser = "0.10.0"
 dicom-pixeldata = { version = "0.10.0", features = ["charls", "image", "openjpeg-sys"] }
 dicom-transfer-syntax-registry = "0.10.0"
 dirs-next = "1.0.2"
-eframe = "0.34.3"
+eframe = { version = "0.34.3", features = ["wgpu"] }
 egui = "0.34.3"
+half = "2.7"
 image = "0.25.6"
 rfd = "0.17.2"
 semver = "1.0.28"
