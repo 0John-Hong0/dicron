@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-28
+
 - Add a 3D workspace with patient-oriented MPR, draggable thick-slab MIP, and GPU volume
   rendering with transfer-function presets and shading.
 - Prepare volumes in the background with progress and cancellation. Keep reconstruction tied to
