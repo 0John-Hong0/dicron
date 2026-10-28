@@ -6,6 +6,9 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Keep patient orientation letters correct after image flips and rotations, and leave wheel
+  input to menus and dialogs that cover the image viewer.
+
 - Handle damaged compressed pixel data without closing the viewer, correct 8-bit grayscale RLE
   sample placement, and reject JPEG Lossless restart-interval streams that the decoder misreads.
 - Keep DICOM scans stable when slice positions contain invalid numbers, preserving numeric
