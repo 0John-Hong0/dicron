@@ -9,9 +9,6 @@ use crate::app::state::{
 use crate::dicom::DicomWindow;
 use crate::theme;
 
-const EDIT_CENTER_RANGE: std::ops::RangeInclusive<f64> = -100_000.0..=100_000.0;
-const EDIT_WIDTH_RANGE: std::ops::RangeInclusive<f64> = 1.0..=200_000.0;
-
 impl WindowLevelState {
     pub(in crate::app) fn current(&self) -> WindowLevel {
         self.current
@@ -235,7 +232,7 @@ impl DicronApp {
                         ui.label("Window Level");
                         ui.add(
                             egui::DragValue::new(&mut self.edit_windowing_dialog.center)
-                                .range(EDIT_CENTER_RANGE)
+                                .range(WindowLevel::CENTER_RANGE)
                                 .speed(1.0),
                         );
                         ui.end_row();
@@ -243,7 +240,7 @@ impl DicronApp {
                         ui.label("Window Width");
                         ui.add(
                             egui::DragValue::new(&mut self.edit_windowing_dialog.width)
-                                .range(EDIT_WIDTH_RANGE)
+                                .range(WindowLevel::WIDTH_RANGE)
                                 .speed(1.0),
                         );
                         ui.end_row();

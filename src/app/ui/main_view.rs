@@ -3,22 +3,27 @@
 use eframe::egui;
 
 use self::panel_resize::ResizeSide;
+use super::three_d::ThreeDControlAction;
 use super::toolbar::ToolbarAction;
-use super::{metadata_panel, status_bar as status, toolbar, viewer};
+use super::{metadata_panel, status_bar as status, three_d, toolbar, viewer};
 use crate::app::DicronApp;
 use crate::settings::DicomTreeViewMode;
 use crate::theme;
 
-pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
     let check_for_updates_on_startup = app.settings.check_for_updates_on_startup;
     app.about_dialog
         .poll(ui.ctx(), check_for_updates_on_startup);
 
+    three_d::sync_render_state(app, frame, ui.ctx());
     app.receive_scan_messages(ui.ctx());
+    app.receive_volume_job_messages(ui.ctx());
     app.receive_frame_load(ui.ctx());
     app.handle_dropped_paths(ui.ctx());
     app.handle_keyboard_shortcuts(ui.ctx());
     app.handle_autoplay(ui.ctx());
+    app.ensure_volume_for_selection(ui.ctx());
+    app.ensure_gpu_volume(ui.ctx());
     panel_resize::clamp_panel_widths(ui, &mut app.panel_layout);
 
     egui::Panel::top("toolbar_panel")
@@ -35,15 +40,27 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
 
             app.about_dialog.show(ui.ctx(), &mut app.settings);
 
+            // Read after the toolbar action so opening or leaving 3D swaps the
+            // control row in the same frame.
+            let in_three_d = app.three_d.view_mode.three_d_mode().is_some();
+
             if toolbar::show_loaded_dicom_status(ui, app.selected_dicom_path.as_deref()) {
                 ui.add(egui::Separator::default().spacing(theme::SPACE_XXS));
 
-                if let Some(action) = viewer::show_controls(app, ui) {
+                if in_three_d {
+                    if let Some(action) = three_d::show_control_row(app, ui) {
+                        app.handle_three_d_control_action(ui.ctx(), action);
+                    }
+                } else if let Some(action) = viewer::show_controls(app, ui) {
                     app.handle_viewer_control_action(ui.ctx(), action);
                 }
             }
 
             let _ = status::show_loading_status(ui, app.scan.progress(), app.frame_load.progress());
+            // In 3D, 2D and Escape already leave a preparation behind.
+            if status::show_volume_build_status(ui, app.three_d.job.progress(), !in_three_d) {
+                app.cancel_volume_build();
+            }
 
             if status::show_error_status(ui, app.error_message.as_deref()) {
                 app.error_message = None;
@@ -120,16 +137,84 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui, _frame: &mut eframe::
 
     panel_resize::show_resize_rail(ui, ResizeSide::Right, &mut app.panel_layout);
 
+    let in_three_d = app.three_d.view_mode.three_d_mode().is_some();
+
     egui::CentralPanel::default()
         .frame(theme::viewer_frame(ui.style()))
         .show_inside(ui, |ui| {
             let dark_style = ui.ctx().style_of(egui::Theme::Dark);
             ui.set_style(dark_style);
-            viewer::show(app, ui);
+
+            if in_three_d {
+                three_d::show_body(app, ui);
+            } else {
+                viewer::show(app, ui);
+            }
         });
 
     app.about_dialog.show_notification(ui.ctx());
     app.show_edit_windowing_dialog(ui.ctx());
+    show_low_resolution_prompt(app, ui.ctx());
+
+    app.keyboard_owned_last_frame = ui.ctx().egui_wants_keyboard_input();
+}
+
+/// The warning shown before a coarse series is opened in 3D.
+fn show_low_resolution_prompt(app: &mut DicronApp, context: &egui::Context) {
+    let Some(prompt) = &app.three_d.low_resolution_prompt else {
+        return;
+    };
+    let geometry = &prompt.prepared.series.geometry;
+    let slice_count = geometry.slice_count;
+    let slice_thickness_mm = geometry.slice_thickness_mm;
+    let slice_spacing = geometry.slice_spacing_text();
+    let cause = prompt.cause.clone();
+    let mut accepted = false;
+
+    let modal_response =
+        egui::Modal::new(egui::Id::new("low_resolution_three_d_dialog")).show(context, |ui| {
+            ui.set_min_width(360.0);
+            ui.set_max_width(440.0);
+            ui.heading("Low-resolution 3D source");
+            ui.separator();
+
+            ui.label(format!("Images: {slice_count}"));
+            ui.label(format!(
+                "Slice Thickness: {}",
+                slice_thickness_mm
+                    .map_or_else(|| "-".to_owned(), |thickness| format!("{thickness:.2} mm"))
+            ));
+            ui.label(format!("Z Spacing: {slice_spacing}"));
+
+            ui.add_space(theme::SPACE_XS);
+            ui.add(
+                egui::Label::new(format!(
+                    "This series has {cause}, so coronal, sagittal and 3D views may show \
+                     stair-stepping or blurring."
+                ))
+                .wrap(),
+            );
+            ui.add_space(theme::SPACE_SM);
+
+            ui.horizontal(|ui| {
+                if ui.button("Open Low-resolution 3D").clicked() {
+                    accepted = true;
+                    ui.close();
+                }
+
+                if ui.button("Cancel").clicked() {
+                    ui.close();
+                }
+            });
+        });
+
+    if modal_response.should_close() {
+        if accepted {
+            app.accept_low_resolution_prompt();
+        } else {
+            app.cancel_low_resolution_prompt();
+        }
+    }
 }
 
 fn request_toolbar_relayout_if_clipped(ui: &egui::Ui) {
@@ -238,12 +323,26 @@ impl DicronApp {
         }
     }
 
+    fn handle_three_d_control_action(
+        &mut self,
+        context: &egui::Context,
+        action: ThreeDControlAction,
+    ) {
+        match action {
+            ThreeDControlAction::LeaveThreeD => self.leave_three_d(),
+            ThreeDControlAction::SetMode(mode) => self.open_three_d_mode(context, mode),
+            ThreeDControlAction::ResetView => self.reset_three_d_view(),
+            ThreeDControlAction::SetQuality(quality) => self.set_mpr_quality(context, quality),
+        }
+    }
+
     fn handle_viewer_control_action(
         &mut self,
         context: &egui::Context,
         action: viewer::ViewerControlAction,
     ) {
         match action {
+            viewer::ViewerControlAction::OpenThreeD(mode) => self.open_three_d_mode(context, mode),
             viewer::ViewerControlAction::ResetView => self.reset_view(context),
             viewer::ViewerControlAction::FlipHorizontal => self.flip_viewer_horizontal(),
             viewer::ViewerControlAction::FlipVertical => self.flip_viewer_vertical(),

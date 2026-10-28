@@ -6,7 +6,9 @@ mod frame_cache;
 mod frame_loading;
 mod series_thumbnail_cache;
 mod state;
+mod three_d_state;
 mod ui;
+mod volume_job;
 
 pub(crate) use state::DicronApp;
 

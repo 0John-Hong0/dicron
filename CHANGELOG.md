@@ -6,6 +6,13 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Add a 3D workspace with patient-oriented MPR, draggable thick-slab MIP, and GPU volume
+  rendering with transfer-function presets and shading.
+- Prepare volumes in the background with progress and cancellation. Keep reconstruction tied to
+  the selected series, preserve views when returning to a series, and open at the selected 2D slice.
+- Validate patient geometry, interpolate uneven slice spacing, preserve physical proportions,
+  and bound MPR/GPU copies while warning about low-resolution source series.
+
 - Keep patient orientation letters correct after image flips and rotations, and leave wheel
   input to menus and dialogs that cover the image viewer.
 

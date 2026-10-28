@@ -1055,6 +1055,7 @@ name = "dicron"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "dicom-core",
  "dicom-dictionary-std",
  "dicom-encoding",
@@ -1065,6 +1066,7 @@ dependencies = [
  "dirs-next",
  "eframe",
  "egui",
+ "half",
  "image",
  "rfd",
  "semver",

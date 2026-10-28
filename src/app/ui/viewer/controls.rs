@@ -30,8 +30,19 @@ pub(super) fn show_control_row(
     let image_loaded = app.loaded_texture.is_some();
     let active_window_preset = app.window_level.active_preset;
     let preset_button_label = format!("Preset: {}", app.window_level.active_preset_label());
+    let three_d_supported = app.series_supports_three_d();
+    let gpu_available = app.three_d.gpu_available;
 
     theme::toolbar_row(ui, |ui| {
+        // Leads the row, where the `2D` button sits once a 3D mode is open.
+        if let Some(mode) =
+            super::super::three_d::show_open_menu(ui, three_d_supported, gpu_available)
+        {
+            action = Some(ViewerControlAction::OpenThreeD(mode));
+        }
+
+        ui.separator();
+
         if ui
             .add_enabled(image_loaded, egui::Button::new("Reset Display"))
             .clicked()
