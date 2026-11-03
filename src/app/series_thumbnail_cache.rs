@@ -259,6 +259,7 @@ mod tests {
             display_name: path.to_owned(),
             frame_index,
             instance_number: None,
+            instance_creation_time: None,
             sort_position: None,
         }
     }

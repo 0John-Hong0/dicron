@@ -377,6 +377,7 @@ mod tests {
             display_name: path.to_owned(),
             frame_index,
             instance_number: None,
+            instance_creation_time: None,
             sort_position: None,
         }
     }
@@ -417,6 +418,7 @@ mod tests {
                 display_name: String::new(),
                 frame_index: 0,
                 instance_number: Some(instance as i32),
+                instance_creation_time: None,
                 sort_position: Some(f64::from(z)),
             });
         }

@@ -1283,6 +1283,74 @@ mod tests {
     }
 
     #[test]
+    fn series_uses_creation_time_when_instance_number_is_missing_or_empty() {
+        // Creation time must beat both filename and physical position, while
+        // numbered images keep their numeric order ahead of unnumbered ones.
+        let cases = [
+            (None, Some("101112.9"), "-10"),
+            (Some(""), Some("101112.10"), "10"),
+            (None, Some("101112.100000"), "0"),
+            (Some(""), Some("101112.000001"), "50"),
+            (None, Some("101112"), "100"),
+            (Some(""), Some(""), "-30"),
+            (None, None, "-20"),
+            (Some(""), Some("not-a-time"), "-40"),
+            (None, Some("10"), "999"),
+            (Some("12"), Some("000000"), "0"),
+            (Some("2"), Some("120000"), "0"),
+            (Some("1"), Some("235959"), "0"),
+        ];
+        let paths: Vec<_> = (0..cases.len())
+            .map(|index| temporary_file_path(&format!("creation-time-{index}")))
+            .collect();
+
+        // Exercise both the lazy header scan and the streaming deflate path.
+        for transfer_syntax in [
+            uids::EXPLICIT_VR_LITTLE_ENDIAN,
+            uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN,
+        ] {
+            for (path, (instance_number, creation_time, position)) in paths.iter().zip(cases) {
+                write_test_object(path, true);
+                let mut object = dicom_object::open_file(path).unwrap();
+                for (tag, vr, value) in [
+                    (tags::PATIENT_ID, VR::LO, "creation-time-patient"),
+                    (tags::STUDY_INSTANCE_UID, VR::UI, "2.25.721"),
+                    (tags::SERIES_INSTANCE_UID, VR::UI, "2.25.722"),
+                ] {
+                    object.put_element(DataElement::new(tag, vr, value));
+                }
+                for (tag, vr, value) in [
+                    (tags::INSTANCE_NUMBER, VR::IS, instance_number),
+                    (tags::INSTANCE_CREATION_TIME, VR::TM, creation_time),
+                ] {
+                    if let Some(value) = value {
+                        object.put_element(DataElement::new(tag, vr, value));
+                    }
+                }
+                object.put_element(DataElement::new(
+                    tags::IMAGE_POSITION_PATIENT,
+                    VR::DS,
+                    format!("0\\0\\{position}"),
+                ));
+                object.update_meta(|meta| {
+                    meta.transfer_syntax = transfer_syntax.to_owned();
+                });
+                object.write_to_file(path).unwrap();
+            }
+
+            let index =
+                build_for_inputs_with_progress(&paths, &AtomicBool::new(false), |_| {}).unwrap();
+            let slices = &index.patients[0].studies[0].series_groups[0].slices;
+            let actual: Vec<_> = slices.iter().map(|slice| &slice.path).collect();
+            let expected = [11, 10, 9, 8, 4, 3, 2, 1, 0, 7, 5, 6].map(|index| &paths[index]);
+            assert_eq!(actual, expected, "transfer syntax: {transfer_syntax}");
+        }
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn lazy_scan_uses_the_declared_character_set_for_index_text() {
         let path = temporary_file_path("utf8-index-metadata");
         write_test_object(&path, true);

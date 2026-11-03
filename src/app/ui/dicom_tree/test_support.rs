@@ -11,6 +11,7 @@ pub(super) fn test_slices(count: usize) -> Vec<SliceItem> {
             display_name: format!("#{index}"),
             frame_index: 0,
             instance_number: None,
+            instance_creation_time: None,
             sort_position: None,
         })
         .collect()

@@ -1727,6 +1727,7 @@ mod tests {
                 display_name: format!("slice {index}"),
                 frame_index: 0,
                 instance_number: Some(index as i32 + 1),
+                instance_creation_time: None,
                 sort_position: None,
             });
             paths.push(path);
@@ -2167,6 +2168,7 @@ mod tests {
                     display_name: String::new(),
                     frame_index: 0,
                     instance_number: None,
+                    instance_creation_time: None,
                     sort_position: None,
                 })
                 .collect(),
@@ -2201,6 +2203,7 @@ mod tests {
                     display_name: String::new(),
                     frame_index: 0,
                     instance_number: None,
+                    instance_creation_time: None,
                     sort_position: None,
                 })
                 .collect(),
@@ -3064,6 +3067,7 @@ mod tests {
                 display_name: String::new(),
                 frame_index: 0,
                 instance_number: None,
+                instance_creation_time: None,
                 sort_position: Some(if index < 2 { 0.0 } else { 1.0 }),
             })
             .collect();

@@ -37,7 +37,10 @@ pub(crate) struct SliceItem {
     pub(crate) display_name: String,
     pub(crate) frame_index: u32,
     pub(crate) instance_number: Option<i32>,
-    /// Signed through-plane position used to break ties in `InstanceNumber`:
+    /// `InstanceCreationTime` in microseconds since midnight, used for ordering
+    /// slices without `InstanceNumber`. Omitted time components are zero.
+    pub(crate) instance_creation_time: Option<u64>,
+    /// Signed through-plane position used after instance number or creation time:
     /// the projection of `ImagePositionPatient` onto the slice normal when
     /// orientation is known, otherwise the raw Z position.
     pub(crate) sort_position: Option<f64>,
