@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-03
+
 - Order images without an Instance Number by Instance Creation Time, including fractional seconds.
 
 ## [0.6.0] - 2026-10-28
