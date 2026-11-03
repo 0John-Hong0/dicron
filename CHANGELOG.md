@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Order images without an Instance Number by Instance Creation Time, including fractional seconds.
+
 ## [0.6.0] - 2026-10-28
 
 - Add a 3D workspace with patient-oriented MPR, draggable thick-slab MIP, and GPU volume

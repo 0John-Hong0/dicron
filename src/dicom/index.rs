@@ -31,6 +31,7 @@ pub(in crate::dicom) struct DicomIndexMetadata {
     series_number: Option<i32>,
     modality: Option<String>,
     instance_number: Option<i32>,
+    instance_creation_time: Option<u64>,
     image_position_patient: Option<[f64; 3]>,
     image_orientation_patient: Option<[f64; 6]>,
     number_of_frames: Option<u32>,
@@ -56,6 +57,7 @@ impl DicomIndexMetadata {
                 | tags::SERIES_NUMBER
                 | tags::MODALITY
                 | tags::INSTANCE_NUMBER
+                | tags::INSTANCE_CREATION_TIME
                 | tags::IMAGE_POSITION_PATIENT
                 | tags::IMAGE_ORIENTATION_PATIENT
                 | tags::NUMBER_OF_FRAMES
@@ -80,6 +82,7 @@ impl DicomIndexMetadata {
             tags::SERIES_NUMBER => self.series_number = first_parsed_value(value),
             tags::MODALITY => self.modality = text_value(value),
             tags::INSTANCE_NUMBER => self.instance_number = first_parsed_value(value),
+            tags::INSTANCE_CREATION_TIME => self.instance_creation_time = time_value(value),
             tags::IMAGE_POSITION_PATIENT => self.image_position_patient = parsed_array_value(value),
             tags::IMAGE_ORIENTATION_PATIENT => {
                 self.image_orientation_patient = parsed_array_value(value)
@@ -117,6 +120,7 @@ pub(in crate::dicom) struct DicomIndexEntry {
     modality: Option<String>,
     file_path: std::path::PathBuf,
     instance_number: Option<i32>,
+    instance_creation_time: Option<u64>,
     sort_position: Option<f64>,
     number_of_frames: u32,
 }
@@ -150,6 +154,7 @@ impl DicomIndexEntry {
             series_number,
             modality,
             instance_number,
+            instance_creation_time,
             image_position_patient,
             image_orientation_patient,
             number_of_frames,
@@ -199,6 +204,7 @@ impl DicomIndexEntry {
             modality,
             file_path: file_path.to_path_buf(),
             instance_number,
+            instance_creation_time,
             sort_position,
             number_of_frames,
         })
@@ -221,6 +227,7 @@ impl DicomIndexBuilder {
             modality,
             file_path,
             instance_number,
+            instance_creation_time,
             sort_position,
             number_of_frames,
         } = entry;
@@ -259,6 +266,7 @@ impl DicomIndexBuilder {
                     display_name: slice_display_name,
                     frame_index,
                     instance_number,
+                    instance_creation_time,
                     sort_position,
                 });
         }
@@ -458,9 +466,17 @@ pub(in crate::dicom) fn sort_index(patients: &mut [PatientGroup]) {
 }
 
 fn compare_slice_items(left: &SliceItem, right: &SliceItem) -> Ordering {
-    left.instance_number
-        .unwrap_or(i32::MAX)
-        .cmp(&right.instance_number.unwrap_or(i32::MAX))
+    let instance_order = match (left.instance_number, right.instance_number) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left
+            .instance_creation_time
+            .unwrap_or(u64::MAX)
+            .cmp(&right.instance_creation_time.unwrap_or(u64::MAX)),
+    };
+
+    instance_order
         .then_with(|| compare_optional_f64(left.sort_position, right.sort_position))
         .then_with(|| left.path.cmp(&right.path))
         .then_with(|| left.frame_index.cmp(&right.frame_index))
@@ -530,6 +546,14 @@ where
         .ok()
 }
 
+fn time_value(value: &PrimitiveValue) -> Option<u64> {
+    let time = value.to_time().ok()?;
+    let seconds = u64::from(*time.hour()) * 3600
+        + u64::from(time.minute().copied().unwrap_or(0)) * 60
+        + u64::from(time.second().copied().unwrap_or(0));
+    Some(seconds * 1_000_000 + u64::from(time.fraction_micro().unwrap_or(0)))
+}
+
 fn parsed_array_value<const N: usize>(value: &PrimitiveValue) -> Option<[f64; N]> {
     let raw = value.to_str();
     let mut parsed_values = raw.trim().trim_matches('\0').split('\\');
@@ -558,6 +582,7 @@ mod tests {
             display_name: String::new(),
             frame_index: 0,
             instance_number: Some(40 - index as i32),
+            instance_creation_time: None,
             sort_position: compute_slice_sort_position_from_values(Some(position), Some(AXIAL)),
         };
         let slices: Vec<SliceItem> = (0..40)

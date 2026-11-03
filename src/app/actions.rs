@@ -1775,6 +1775,7 @@ impl DicronApp {
                     display_name: String::new(),
                     frame_index: 0,
                     instance_number: Some(slice_index + 1),
+                    instance_creation_time: None,
                     sort_position: Some(f64::from(slice_index)),
                 })
                 .collect(),
@@ -2206,6 +2207,7 @@ mod loading_tests {
                 display_name: "missing".to_owned(),
                 frame_index: 0,
                 instance_number: None,
+                instance_creation_time: None,
                 sort_position: None,
             },
         );
@@ -2302,6 +2304,7 @@ mod loading_tests {
                 display_name: "second".to_owned(),
                 frame_index: 0,
                 instance_number: Some(2),
+                instance_creation_time: None,
                 sort_position: Some(1.0),
             });
 
@@ -2786,6 +2789,7 @@ mod three_d_tests {
                         display_name: format!("slice {position}"),
                         frame_index: 0,
                         instance_number: Some(position as i32 + 1),
+                        instance_creation_time: None,
                         sort_position: Some(position as f64),
                     })
                     .collect();
@@ -3767,6 +3771,7 @@ mod three_d_tests {
                 display_name: "second".to_owned(),
                 frame_index: 0,
                 instance_number: Some(2),
+                instance_creation_time: None,
                 sort_position: Some(1.0),
             });
         app.dicom_index = Some(index.clone());
@@ -3793,6 +3798,7 @@ mod three_d_tests {
                 display_name: "second".to_owned(),
                 frame_index: 0,
                 instance_number: Some(2),
+                instance_creation_time: None,
                 sort_position: Some(1.0),
             });
         let mut app = DicronApp {
@@ -4036,6 +4042,7 @@ mod three_d_tests {
                 display_name: "second".to_owned(),
                 frame_index: 0,
                 instance_number: Some(2),
+                instance_creation_time: None,
                 sort_position: Some(1.0),
             });
         let second = index.patients[0].studies[0].series_groups[0].clone();
@@ -4085,6 +4092,7 @@ mod three_d_tests {
             display_name: "missing".to_owned(),
             frame_index: 0,
             instance_number: Some(2),
+            instance_creation_time: None,
             sort_position: Some(1.0),
         });
         index.patients[0].studies[0].series_groups.push(second);
