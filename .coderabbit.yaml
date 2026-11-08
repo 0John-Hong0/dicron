@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://www.coderabbit.ai/integrations/schema.v2.json
+
+language: en-US
+tone_instructions: >-
+  Be concise and direct. State the bug, its impact, and a concrete fix.
+  Avoid praise, jokes, roleplay, and decorative prose. Explain uncertainty.
+
+reviews:
+  profile: chill
+
+  # Keep the change summary in the bot's comment.
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  poem: false
+  sequence_diagrams: false
+
+  # Leave approval decisions to maintainers.
+  auto_approvals:
+    enabled: false
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+
+  path_instructions:
+    - path: "**/*"
+      instructions: >-
+        Follow CONTRIBUTING.md. Focus on actionable correctness, security,
+        and performance problems introduced by the change. Avoid cosmetic
+        refactors and speculative issues; explain a concrete failure scenario.
+        Flag newly introduced fallback behavior unless the maintainer explicitly
+        approved it. Dicron is a non-diagnostic desktop viewer; preserve that
+        scope. Do not request real patient data or reproduce patient identifiers
+        in review comments. Use synthetic fixtures for suggested regression tests.
+
+    - path: "src/dicom/**/*.rs"
+      instructions: >-
+        Treat DICOM files as untrusted input. Check bounds, allocation sizes,
+        arithmetic overflow, malformed metadata, and decoding errors. Check
+        pixel signedness, bit depth, frame indexing, transfer syntax handling,
+        photometric interpretation, rescale slope/intercept, and window/level.
+        For geometry and volumes, check patient orientation, row/column spacing,
+        slice ordering, physical dimensions, and interpolation. Identify the
+        input that would produce an incorrect image or crash before flagging it.
+
+    - path: "src/app/**"
+      instructions: >-
+        Check that scanning, decoding, and volume preparation keep the UI
+        responsive. Check cancellation, stale worker results, cache invalidation,
+        and state isolation when switching patients, studies, series, or frames.
+        For 2D and 3D rendering, check coordinate transforms, patient direction
+        labels, window/level consistency, texture dimensions, GPU buffer layout,
+        and memory limits. When Rust and WGSL interfaces change, check that both
+        sides agree. Preserve the documented Linux and Windows behavior.
