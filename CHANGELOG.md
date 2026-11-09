@@ -14,6 +14,8 @@ This project uses semantic versioning while it remains practical for a small des
   a low-resolution warning accepted for a series that is no longer selected.
 - Evict older decoded frames and metadata when the cache exceeds its 512 MiB budget.
 - Use the measured intensity range for grayscale images without a usable DICOM window or contrast lookup table.
+- Use each enhanced DICOM frame's own contrast window and rescale values for display, Reset,
+  pixel readouts, and drag limits, including 8-bit grayscale RLE frames.
 
 ## [0.6.1] - 2026-11-03
 
