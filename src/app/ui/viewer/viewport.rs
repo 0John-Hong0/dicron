@@ -6,9 +6,9 @@ use super::{controls, image_texture::fit_image_to_available_space};
 use crate::app::DicronApp;
 use crate::app::state::ViewportTransform;
 use crate::app::ui::overlay::{
-    OVERLAY_FONT_SIZE, OVERLAY_LINE_GAP, OVERLAY_MARGIN, identification_overlay_text,
-    join_overlay_lines, paint_overlay_text, paint_transformed_image, transformed_image_rect,
-    transformed_image_uv, zoom_viewport_around_pointer,
+    OVERLAY_FONT_SIZE, OVERLAY_MARGIN, identification_overlay_text, join_overlay_lines,
+    paint_overlay_text, paint_transformed_image, transformed_image_rect, transformed_image_uv,
+    zoom_viewport_around_pointer,
 };
 use crate::dicom::dominant_patient_direction;
 use crate::dicom::{DicomOverlayMetadata, PixelProbeValue};
@@ -88,7 +88,13 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui) {
 
     if let Some(loaded_texture) = &app.loaded_texture {
         let texture_size = loaded_texture.size_vec2();
-        let fitted_image_size = fit_image_to_available_space(texture_size, viewer_rect.size());
+        let pixel_aspect_ratio = app
+            .metadata
+            .overlay
+            .as_ref()
+            .and_then(|metadata| metadata.pixel_aspect_ratio);
+        let fitted_image_size =
+            fit_image_to_available_space(texture_size, pixel_aspect_ratio, viewer_rect.size());
 
         if fitted_image_size.x > 0.0 && fitted_image_size.y > 0.0 {
             let image_rect =
@@ -254,7 +260,7 @@ fn show_viewer_overlays(
             egui::Align2::LEFT_CENTER,
             left,
             available_overlay_width,
-            OVERLAY_FONT_SIZE + OVERLAY_LINE_GAP,
+            viewer_rect.height(),
         );
         paint_overlay_text(
             ui.painter(),
@@ -262,7 +268,7 @@ fn show_viewer_overlays(
             egui::Align2::RIGHT_CENTER,
             right,
             available_overlay_width,
-            OVERLAY_FONT_SIZE + OVERLAY_LINE_GAP,
+            viewer_rect.height(),
         );
     }
 }
@@ -487,6 +493,9 @@ mod tests {
     };
     use crate::app::state::ViewportTransform;
     use crate::app::ui::overlay::VIEWER_ZOOM_DRAG_SENSITIVITY;
+    use dicom_core::{DataElement, PrimitiveValue, Tag, VR};
+    use dicom_dictionary_std::{tags, uids};
+    use dicom_object::{FileDicomObject, FileMetaTableBuilder};
 
     /// The side letters must name what is drawn at each edge after a flip or a
     /// quarter turn. A quarter turn is clockwise, and flips act on the screen
@@ -570,6 +579,175 @@ mod tests {
                     .count()
             });
             assert_eq!(remaining, usize::from(show_popup));
+        }
+    }
+
+    /// A temporary 8-bit MONOCHROME2 image, `columns` wide and `rows` tall,
+    /// carrying the given text elements, loaded the way the viewer opens a
+    /// file. The file is removed once loaded.
+    fn app_showing_image(
+        context: &egui::Context,
+        label: &str,
+        [columns, rows]: [u16; 2],
+        text_elements: &[(Tag, VR, &str)],
+    ) -> crate::app::DicronApp {
+        let path = std::env::temp_dir().join(format!(
+            "dicron-viewport-{label}-{}.dcm",
+            std::process::id()
+        ));
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .media_storage_sop_class_uid(uids::SECONDARY_CAPTURE_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid("2.25.800")
+            .build()
+            .unwrap();
+        let mut object = FileDicomObject::new_empty_with_meta(meta);
+        for (tag, value) in [
+            (tags::ROWS, rows),
+            (tags::COLUMNS, columns),
+            (tags::SAMPLES_PER_PIXEL, 1),
+            (tags::BITS_ALLOCATED, 8),
+            (tags::BITS_STORED, 8),
+            (tags::HIGH_BIT, 7),
+            (tags::PIXEL_REPRESENTATION, 0),
+        ] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            PrimitiveValue::from("MONOCHROME2"),
+        ));
+        for &(tag, vr, value) in text_elements {
+            object.put_element(DataElement::new(tag, vr, PrimitiveValue::from(value)));
+        }
+        let pixel_count = usize::from(columns) * usize::from(rows);
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from(
+                (0..pixel_count)
+                    .map(|index| (index % 251) as u8)
+                    .collect::<Vec<_>>(),
+            ),
+        ));
+        object.write_to_file(&path).unwrap();
+
+        let mut app = crate::app::DicronApp {
+            dicom_index: crate::dicom::build_for_file(&path).ok(),
+            ..Default::default()
+        };
+        let loaded = app.load_slice_by_indices(context, 0, 0, 0, 0);
+        std::fs::remove_file(&path).unwrap();
+        assert!(loaded, "{:?}", app.error_message);
+        app
+    }
+
+    fn viewer_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 400.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// Everything the viewer paints in one frame.
+    fn paint_viewer(context: &egui::Context, app: &mut crate::app::DicronApp) -> Vec<egui::Shape> {
+        let output = context.run_ui(viewer_input(), |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| super::show(app, ui));
+        });
+
+        fn flatten(shape: egui::Shape, shapes: &mut Vec<egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(nested) => {
+                    for shape in nested {
+                        flatten(shape, shapes);
+                    }
+                }
+                shape => shapes.push(shape),
+            }
+        }
+        let mut shapes = Vec::new();
+        for clipped in output.shapes {
+            flatten(clipped.shape, &mut shapes);
+        }
+        shapes
+    }
+
+    fn painted_texts(shapes: &[egui::Shape]) -> Vec<String> {
+        shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Both side letters must show however the app's fonts measure at the
+    /// display's scale factor.
+    #[test]
+    fn side_markers_are_painted_with_the_app_fonts_at_any_scale() {
+        for (app_fonts, pixels_per_point) in [
+            (true, 1.0),
+            (true, 1.25),
+            (true, 1.5),
+            (true, 2.0),
+            (false, 1.25),
+        ] {
+            let context = egui::Context::default();
+            if app_fonts {
+                crate::configure_fonts(&context);
+            }
+            context.set_pixels_per_point(pixels_per_point);
+            let mut app = app_showing_image(
+                &context,
+                "side-markers",
+                [4, 4],
+                &[(tags::IMAGE_ORIENTATION_PATIENT, VR::DS, "1\\0\\0\\0\\1\\0")],
+            );
+
+            paint_viewer(&context, &mut app);
+            let texts = painted_texts(&paint_viewer(&context, &mut app));
+
+            assert_eq!(context.pixels_per_point(), pixels_per_point);
+            for letter in ["R", "L"] {
+                assert!(
+                    texts.iter().any(|text| text == letter),
+                    "{letter} missing with app fonts {app_fonts} at {pixels_per_point}: {texts:?}"
+                );
+            }
+        }
+    }
+
+    /// The painted image uses the pixel proportions recorded in the DICOM file.
+    #[test]
+    fn painted_images_use_declared_pixel_proportions() {
+        for (tag, vr, value, expected_aspect) in [
+            (tags::PIXEL_SPACING, VR::DS, "2\\1", 1.0),
+            (tags::PIXEL_ASPECT_RATIO, VR::IS, "4\\1", 0.5),
+        ] {
+            let context = egui::Context::default();
+            let mut app = app_showing_image(
+                &context,
+                "pixel-proportions",
+                [100, 50],
+                &[(tag, vr, value)],
+            );
+            let texture = app.loaded_texture.as_ref().unwrap().id();
+            let shapes = paint_viewer(&context, &mut app);
+            let image = shapes
+                .iter()
+                .find_map(|shape| match shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == texture => {
+                        Some(mesh.calc_bounds())
+                    }
+                    _ => None,
+                })
+                .expect("the image is painted");
+            assert_approximately_equal(image.aspect_ratio(), expected_aspect);
         }
     }
 

@@ -28,7 +28,10 @@ use walkdir::WalkDir;
 
 use super::index::{DicomIndexBuilder, DicomIndexEntry, DicomIndexMetadata, PixelDataExtent};
 use super::model::DicomIndex;
-use super::text_encoding::{AutoEncodingEvidence, MAX_DETECTION_TEXT_VALUE_BYTES, TextEncoding};
+use super::text_encoding::{
+    AutoEncodingEvidence, MAX_DETECTION_TEXT_VALUE_BYTES, TextEncoding,
+    declared_extension_character_set,
+};
 
 const EXPLICIT_VR_BIG_ENDIAN_UID: &str = "1.2.840.10008.1.2.2";
 const MAX_SCAN_WORKERS: usize = 8;
@@ -101,6 +104,16 @@ pub(crate) struct OpenedDicomFile {
     // Read actual header elements separately: FileMetaTable fills missing fields and drops
     // unsupported tags. Its normalized values belong to decoding, not source metadata.
     pub(crate) original_meta: Option<InMemDicomObject>,
+}
+
+/// What the text before the pixel data says about its character set.
+#[derive(Debug, PartialEq)]
+enum CharsetProbe {
+    /// SpecificCharacterSet is present. Holds the character set of an ISO 2022 declaration
+    /// with an empty first value, which the parser itself does not apply.
+    Declared(Option<SpecificCharacterSet>),
+    /// SpecificCharacterSet is absent. Holds the encoding detected from the text values.
+    Undeclared(Option<TextEncoding>),
 }
 
 struct DatasetSource {
@@ -833,21 +846,23 @@ fn is_value_representation(value: &[u8]) -> bool {
 
 fn resolve_assumed_charset(file_path: &Path, mode: TextEncoding) -> SpecificCharacterSet {
     match mode {
-        TextEncoding::DicomDefault => SpecificCharacterSet::ISO_IR_6,
         TextEncoding::KoreanEucKr | TextEncoding::Utf8 | TextEncoding::JapaneseShiftJis => {
             mode.assumed_character_set()
         }
-        TextEncoding::Auto => detect_missing_charset_encoding(file_path)
-            .ok()
-            .flatten()
-            .map_or(
-                SpecificCharacterSet::ISO_IR_6,
-                TextEncoding::assumed_character_set,
-            ),
+        TextEncoding::Auto | TextEncoding::DicomDefault => match probe_charset(file_path, mode) {
+            Ok(CharsetProbe::Declared(Some(declared))) => declared,
+            Ok(CharsetProbe::Undeclared(Some(detected))) if mode == TextEncoding::Auto => {
+                detected.assumed_character_set()
+            }
+            _ => SpecificCharacterSet::ISO_IR_6,
+        },
     }
 }
 
-fn detect_missing_charset_encoding(file_path: &Path) -> Result<Option<TextEncoding>> {
+/// Reads what the file says about its character set. Only Auto mode looks at the text values of
+/// an undeclared file; other modes stop once the reader has passed (0008,0005).
+fn probe_charset(file_path: &Path, mode: TextEncoding) -> Result<CharsetProbe> {
+    let detect_undeclared = mode == TextEncoding::Auto;
     let DatasetSource {
         reader,
         transfer_syntax_uid,
@@ -863,11 +878,12 @@ fn detect_missing_charset_encoding(file_path: &Path) -> Result<Option<TextEncodi
                 transfer_syntax,
                 0,
             )?;
-            probe_dataset(&mut LazyDataSetReader::new(decoder))
+            probe_dataset(&mut LazyDataSetReader::new(decoder), detect_undeclared)
         }
         Codec::Dataset(None) => anyhow::bail!("unsupported DICOM data set encoding"),
         Codec::None | Codec::EncapsulatedPixelData(..) => probe_dataset(
             &mut LazyDataSetReader::new_with_ts(reader, transfer_syntax)?,
+            detect_undeclared,
         ),
     }
 }
@@ -881,7 +897,10 @@ fn is_detection_text(tag: Tag, vr: VR) -> bool {
 }
 
 /// Reads only the bounded text values used to detect an undeclared character set.
-fn probe_dataset<S>(tokens: &mut LazyDataSetReader<S>) -> Result<Option<TextEncoding>>
+fn probe_dataset<S>(
+    tokens: &mut LazyDataSetReader<S>,
+    detect_undeclared: bool,
+) -> Result<CharsetProbe>
 where
     S: StatefulDecode,
 {
@@ -891,8 +910,26 @@ where
     while let Some(token) = tokens.advance() {
         match token? {
             // The declared charset has priority, including an empty declaration.
-            LazyDataToken::ElementHeader(header) if header.tag == tags::SPECIFIC_CHARACTER_SET => {
-                return Ok(None);
+            LazyDataToken::ElementHeader(header)
+                if sequence_depth == 0 && header.tag == tags::SPECIFIC_CHARACTER_SET =>
+            {
+                if header.len.0 as usize > MAX_DETECTION_TEXT_VALUE_BYTES {
+                    return Ok(CharsetProbe::Declared(None));
+                }
+                let value = tokens
+                    .advance()
+                    .context("missing Specific Character Set value")??
+                    .into_value_with_strategy(ValueReadStrategy::Raw)?;
+                return Ok(CharsetProbe::Declared(declared_extension_character_set(
+                    &value.to_bytes(),
+                )));
+            }
+            LazyDataToken::ElementHeader(header)
+                if !detect_undeclared
+                    && sequence_depth == 0
+                    && header.tag > tags::SPECIFIC_CHARACTER_SET =>
+            {
+                return Ok(CharsetProbe::Undeclared(None));
             }
             // DICOM's tag order places (0008,0005) before pixel data. Leave image bytes unread.
             LazyDataToken::ElementHeader(header)
@@ -905,7 +942,7 @@ where
                 if sequence_depth == 0 && is_detection_text(header.tag, header.vr) =>
             {
                 if header.len.0 as usize > MAX_DETECTION_TEXT_VALUE_BYTES {
-                    return Ok(None);
+                    return Ok(CharsetProbe::Undeclared(None));
                 }
                 let value = tokens
                     .advance()
@@ -927,7 +964,7 @@ where
         }
     }
 
-    Ok(evidence.detect())
+    Ok(CharsetProbe::Undeclared(evidence.detect()))
 }
 
 fn scan_dicom_file(file_path: &Path, text_encoding: TextEncoding) -> Result<ScannedDicomFile> {
@@ -1154,9 +1191,9 @@ mod tests {
     use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
 
     use super::{
-        TextEncoding, build_for_file, build_for_file_with_encoding, build_for_inputs_with_progress,
-        build_for_inputs_with_progress_with_encoding, detect_missing_charset_encoding,
-        open_dicom_file, scan_worker_count_for,
+        CharsetProbe, TextEncoding, build_for_file, build_for_file_with_encoding,
+        build_for_inputs_with_progress, build_for_inputs_with_progress_with_encoding,
+        open_dicom_file, probe_charset, scan_worker_count_for,
     };
 
     static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
@@ -1693,7 +1730,10 @@ mod tests {
         ));
         object.write_to_file(&path).unwrap();
 
-        assert_eq!(detect_missing_charset_encoding(&path).unwrap(), None);
+        assert_eq!(
+            probe_charset(&path, TextEncoding::Auto).unwrap(),
+            CharsetProbe::Declared(None)
+        );
         let index = build_for_file_with_encoding(&path, TextEncoding::KoreanEucKr).unwrap();
 
         assert_eq!(index.patients[0].display_name, "홍길동 (patient-utf8)");
@@ -1736,8 +1776,8 @@ mod tests {
         std::fs::write(&path, &encoded_file).unwrap();
 
         assert_eq!(
-            detect_missing_charset_encoding(&path).unwrap(),
-            Some(TextEncoding::KoreanEucKr)
+            probe_charset(&path, TextEncoding::Auto).unwrap(),
+            CharsetProbe::Undeclared(Some(TextEncoding::KoreanEucKr))
         );
         let default_index = build_for_file(&path).unwrap();
         assert_ne!(default_index.patients[0].display_name, "홍길동");
@@ -1784,8 +1824,8 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         assert_eq!(
-            detect_missing_charset_encoding(&path).unwrap(),
-            Some(TextEncoding::Utf8)
+            probe_charset(&path, TextEncoding::Auto).unwrap(),
+            CharsetProbe::Undeclared(Some(TextEncoding::Utf8))
         );
         let default = build_for_file_with_encoding(&path, TextEncoding::DicomDefault).unwrap();
         let auto = build_for_file_with_encoding(&path, TextEncoding::Auto).unwrap();
@@ -1828,8 +1868,8 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         assert_eq!(
-            detect_missing_charset_encoding(&path).unwrap(),
-            Some(TextEncoding::JapaneseShiftJis)
+            probe_charset(&path, TextEncoding::Auto).unwrap(),
+            CharsetProbe::Undeclared(Some(TextEncoding::JapaneseShiftJis))
         );
         let default = build_for_file_with_encoding(&path, TextEncoding::DicomDefault).unwrap();
         let auto = build_for_file_with_encoding(&path, TextEncoding::Auto).unwrap();
@@ -1871,7 +1911,10 @@ mod tests {
         bytes[offset..offset + 8].copy_from_slice(&encoded_name);
         std::fs::write(&path, bytes).unwrap();
 
-        assert_eq!(detect_missing_charset_encoding(&path).unwrap(), None);
+        assert_eq!(
+            probe_charset(&path, TextEncoding::Auto).unwrap(),
+            CharsetProbe::Undeclared(None)
+        );
         let default = build_for_file_with_encoding(&path, TextEncoding::DicomDefault).unwrap();
         let auto = build_for_file_with_encoding(&path, TextEncoding::Auto).unwrap();
         let manual = build_for_file_with_encoding(&path, TextEncoding::JapaneseShiftJis).unwrap();
@@ -1887,6 +1930,383 @@ mod tests {
             loaded.metadata.overlay.patient_label.as_deref(),
             Some("山田太郎")
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Writes a test image whose PatientName holds `raw_name` byte for byte.
+    fn write_test_object_with_raw_patient_name(
+        path: &Path,
+        specific_character_set: Option<&[&str]>,
+        raw_name: &[u8],
+    ) {
+        write_test_object(path, true);
+        let mut object = dicom_object::open_file(path).unwrap();
+        if let Some(values) = specific_character_set {
+            object.put_element(DataElement::new(
+                tags::SPECIFIC_CHARACTER_SET,
+                VR::CS,
+                PrimitiveValue::Strs(values.iter().map(|value| value.to_string()).collect()),
+            ));
+        }
+        let placeholder: Vec<u8> = (0..raw_name.len())
+            .map(|index| b'A' + (index % 26) as u8)
+            .collect();
+        object.put_element(DataElement::new(
+            tags::PATIENT_NAME,
+            VR::PN,
+            PrimitiveValue::from(String::from_utf8(placeholder.clone()).unwrap()),
+        ));
+        object.write_to_file(path).unwrap();
+
+        let mut bytes = std::fs::read(path).unwrap();
+        let offset = bytes
+            .windows(placeholder.len())
+            .position(|window| window == placeholder)
+            .unwrap();
+        bytes[offset..offset + raw_name.len()].copy_from_slice(raw_name);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Asserts the patient name the tree, overlay and metadata panel show for `encoding`.
+    fn assert_displayed_patient_name(path: &Path, encoding: TextEncoding, expected_name: &str) {
+        let index = build_for_file_with_encoding(path, encoding).unwrap();
+        assert_eq!(
+            index.patients[0].display_name, expected_name,
+            "tree, {encoding:?}"
+        );
+
+        let loaded = crate::dicom::load_dicom_frame_with_encoding(path, 0, encoding).unwrap();
+        assert_eq!(
+            loaded.metadata.overlay.patient_label.as_deref(),
+            Some(expected_name.replace('^', " ").as_str()),
+            "overlay, {encoding:?}"
+        );
+        let name_item = loaded
+            .metadata
+            .all_items
+            .iter()
+            .find(|item| item.tag == "(0010,0010)")
+            .unwrap();
+        assert_eq!(name_item.value, expected_name, "metadata, {encoding:?}");
+        assert!(
+            loaded
+                .metadata
+                .all_items
+                .iter()
+                .chain(&loaded.metadata.curated_items)
+                .all(|item| !item.value.contains('\u{1b}')),
+            "escape sequence shown in metadata, {encoding:?}"
+        );
+    }
+
+    #[test]
+    fn declared_iso_2022_korean_names_show_hangul_without_escape_sequences() {
+        let path = temporary_file_path("iso-2022-korean");
+        let mut raw_name = b"Hong^Gildong=\x1b$)C".to_vec();
+        raw_name.extend(
+            TextEncoding::KoreanEucKr
+                .assumed_character_set()
+                .encode("홍^길동")
+                .unwrap(),
+        );
+        write_test_object_with_raw_patient_name(&path, Some(&["", "ISO 2022 IR 149"]), &raw_name);
+
+        for encoding in [
+            TextEncoding::Auto,
+            TextEncoding::DicomDefault,
+            TextEncoding::KoreanEucKr,
+        ] {
+            assert_displayed_patient_name(&path, encoding, "Hong^Gildong=홍^길동");
+        }
+
+        // Deflated data sets take the streaming probe.
+        let deflated_path = temporary_file_path("iso-2022-korean-deflated");
+        let mut object = dicom_object::open_file(&path).unwrap();
+        object.update_meta(|meta| {
+            meta.transfer_syntax = uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN.to_owned();
+        });
+        object.write_to_file(&deflated_path).unwrap();
+        assert_displayed_patient_name(&deflated_path, TextEncoding::Auto, "Hong^Gildong=홍^길동");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(deflated_path).unwrap();
+    }
+
+    #[test]
+    fn declared_iso_2022_japanese_names_show_kanji_without_escape_sequences() {
+        let path = temporary_file_path("iso-2022-japanese");
+        // JIS X 0208 bytes of 山田 and 太郎, each between ESC $ B and ESC ( B.
+        let raw_name = b"Yamada^Tarou=\x1b$B;3ED\x1b(B^\x1b$BB@O:\x1b(B";
+        write_test_object_with_raw_patient_name(&path, Some(&["", "ISO 2022 IR 87"]), raw_name);
+
+        for encoding in [TextEncoding::Auto, TextEncoding::DicomDefault] {
+            assert_displayed_patient_name(&path, encoding, "Yamada^Tarou=山田^太郎");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn declared_iso_2022_japanese_with_explicit_ir_6_first_value_shows_kanji() {
+        let path = temporary_file_path("iso-2022-japanese-explicit-ir-6");
+        // JIS X 0208 bytes of 山田 and 太郎, each between ESC $ B and ESC ( B.
+        let raw_name = b"Yamada^Tarou=\x1b$B;3ED\x1b(B^\x1b$BB@O:\x1b(B";
+        write_test_object_with_raw_patient_name(
+            &path,
+            Some(&["ISO 2022 IR 6", "ISO 2022 IR 87"]),
+            raw_name,
+        );
+
+        for encoding in [
+            TextEncoding::Auto,
+            TextEncoding::DicomDefault,
+            TextEncoding::JapaneseShiftJis,
+        ] {
+            assert_displayed_patient_name(&path, encoding, "Yamada^Tarou=山田^太郎");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn manual_japanese_mode_shows_kanji_of_an_iso_2022_ir_87_declaration() {
+        let path = temporary_file_path("iso-2022-japanese-manual-shift-jis");
+        let raw_name = b"Yamada^Tarou=\x1b$B;3ED\x1b(B^\x1b$BB@O:\x1b(B";
+        write_test_object_with_raw_patient_name(&path, Some(&["", "ISO 2022 IR 87"]), raw_name);
+
+        assert_displayed_patient_name(
+            &path,
+            TextEncoding::JapaneseShiftJis,
+            "Yamada^Tarou=山田^太郎",
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dicom_default_probe_stops_after_the_specific_character_set_position() {
+        let path = temporary_file_path("undeclared-korean-default-probe");
+        let raw_name = TextEncoding::KoreanEucKr
+            .assumed_character_set()
+            .encode("홍길동")
+            .unwrap();
+        write_test_object_with_raw_patient_name(&path, None, &raw_name);
+
+        assert_eq!(
+            probe_charset(&path, TextEncoding::Auto).unwrap(),
+            CharsetProbe::Undeclared(Some(TextEncoding::KoreanEucKr))
+        );
+        // DICOM default mode never applies detected text, so it does not read the text values.
+        assert_eq!(
+            probe_charset(&path, TextEncoding::DicomDefault).unwrap(),
+            CharsetProbe::Undeclared(None)
+        );
+
+        let declared_path = temporary_file_path("declared-korean-default-probe");
+        write_test_object_with_raw_patient_name(
+            &declared_path,
+            Some(&["", "ISO 2022 IR 149"]),
+            &korean_iso_2022("홍길동"),
+        );
+        assert_eq!(
+            probe_charset(&declared_path, TextEncoding::DicomDefault).unwrap(),
+            CharsetProbe::Declared(super::SpecificCharacterSet::from_code("ISO 2022 IR 149"))
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(declared_path).unwrap();
+    }
+
+    fn korean_iso_2022(text: &str) -> Vec<u8> {
+        let mut bytes = b"\x1b$)C".to_vec();
+        bytes.extend(
+            TextEncoding::KoreanEucKr
+                .assumed_character_set()
+                .encode(text)
+                .unwrap(),
+        );
+        bytes
+    }
+
+    /// Writes a test image with each `(tag, vr, raw)` value stored byte for byte; values in
+    /// `nested` go into one item of the Request Attributes Sequence.
+    fn write_test_object_with_raw_values(
+        path: &Path,
+        specific_character_set: &[&str],
+        values: &[(Tag, VR, Vec<u8>)],
+        nested: &[(Tag, VR, Vec<u8>)],
+    ) {
+        write_test_object(path, true);
+        let mut object = dicom_object::open_file(path).unwrap();
+        object.put_element(DataElement::new(
+            tags::SPECIFIC_CHARACTER_SET,
+            VR::CS,
+            PrimitiveValue::Strs(
+                specific_character_set
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect(),
+            ),
+        ));
+        let mut next_placeholder = 0_u8;
+        let mut placeholder_for = |raw: &[u8]| {
+            next_placeholder += 1;
+            let mut placeholder = format!("Z{next_placeholder:02}");
+            while placeholder.len() < raw.len() {
+                placeholder.push('x');
+            }
+            placeholder
+        };
+        let mut replacements = Vec::new();
+        for (tag, vr, raw) in values {
+            let placeholder = placeholder_for(raw);
+            object.put_element(DataElement::new(
+                *tag,
+                *vr,
+                PrimitiveValue::from(placeholder.clone()),
+            ));
+            replacements.push((placeholder, raw.clone()));
+        }
+        if !nested.is_empty() {
+            let mut item = InMemDicomObject::new_empty();
+            for (tag, vr, raw) in nested {
+                let placeholder = placeholder_for(raw);
+                item.put(DataElement::new(
+                    *tag,
+                    *vr,
+                    PrimitiveValue::from(placeholder.clone()),
+                ));
+                replacements.push((placeholder, raw.clone()));
+            }
+            object.put_element(DataElement::new(
+                tags::REQUEST_ATTRIBUTES_SEQUENCE,
+                VR::SQ,
+                dicom_core::value::DataSetSequence::from(vec![item]),
+            ));
+        }
+        object.write_to_file(path).unwrap();
+
+        let mut bytes = std::fs::read(path).unwrap();
+        for (placeholder, raw) in replacements {
+            let offset = bytes
+                .windows(placeholder.len())
+                .position(|window| window == placeholder.as_bytes())
+                .unwrap();
+            bytes[offset..offset + raw.len()].copy_from_slice(&raw);
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn assert_no_escape_in_metadata(items: &[crate::dicom::MetadataItem]) {
+        for item in items {
+            assert!(
+                !item.value.contains('\u{1b}'),
+                "{}: {:?}",
+                item.tag,
+                item.value
+            );
+            assert!(!item.matches_search("\u{1b}"), "{}", item.tag);
+            assert_no_escape_in_metadata(&item.children);
+        }
+    }
+
+    #[test]
+    fn declared_iso_2022_korean_text_of_every_vr_and_nested_items_shows_hangul() {
+        let path = temporary_file_path("iso-2022-korean-vrs");
+        write_test_object_with_raw_values(
+            &path,
+            &["", "ISO 2022 IR 149"],
+            &[
+                (
+                    tags::STUDY_DESCRIPTION,
+                    VR::LO,
+                    korean_iso_2022("흉부 검사"),
+                ),
+                (
+                    tags::SERIES_DESCRIPTION,
+                    VR::LO,
+                    korean_iso_2022("조영 증강"),
+                ),
+                (tags::INSTITUTION_NAME, VR::LO, korean_iso_2022("서울 병원")),
+                (tags::STATION_NAME, VR::SH, korean_iso_2022("검사실")),
+                (tags::IMAGE_COMMENTS, VR::LT, korean_iso_2022("판독 메모")),
+                (
+                    tags::PATIENT_COMMENTS,
+                    VR::LT,
+                    [b"Note ".as_slice(), &korean_iso_2022("주의"), b" end"].concat(),
+                ),
+            ],
+            &[(
+                tags::REQUESTED_PROCEDURE_DESCRIPTION,
+                VR::LO,
+                korean_iso_2022("요청 검사"),
+            )],
+        );
+
+        for encoding in [TextEncoding::Auto, TextEncoding::DicomDefault] {
+            let index = build_for_file_with_encoding(&path, encoding).unwrap();
+            let study = &index.patients[0].studies[0];
+            assert!(
+                study.display_name.contains("흉부 검사"),
+                "{encoding:?}: {}",
+                study.display_name
+            );
+            assert_eq!(
+                study.series_groups[0].series_description.as_deref(),
+                Some("조영 증강"),
+                "{encoding:?}"
+            );
+
+            let loaded = crate::dicom::load_dicom_frame_with_encoding(&path, 0, encoding).unwrap();
+            let items = &loaded.metadata.all_items;
+            for (tag, expected) in [
+                ("(0008,0080)", "서울 병원"),
+                ("(0008,1010)", "검사실"),
+                ("(0020,4000)", "판독 메모"),
+                ("(0010,4000)", "Note 주의 end"),
+                ("(0032,1060)", "요청 검사"),
+            ] {
+                assert_eq!(
+                    find_metadata_value(items, tag),
+                    Some(expected),
+                    "{tag}, {encoding:?}"
+                );
+            }
+            assert_no_escape_in_metadata(items);
+            assert_no_escape_in_metadata(&loaded.metadata.curated_items);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn iso_2022_korean_with_explicit_ir_6_first_value_shows_hangul() {
+        // 'ISO 2022 IR 6\ISO 2022 IR 149' is the same declaration as '\ISO 2022 IR 149', so
+        // the Korean group shows as Hangul, not as the Latin-1 "È«^±æµ¿", in every mode.
+        let path = temporary_file_path("iso-2022-korean-explicit-ir-6");
+        let raw_name = [b"Hong^Gildong=".as_slice(), &korean_iso_2022("홍^길동")].concat();
+        write_test_object_with_raw_patient_name(
+            &path,
+            Some(&["ISO 2022 IR 6", "ISO 2022 IR 149"]),
+            &raw_name,
+        );
+        for encoding in [
+            TextEncoding::Auto,
+            TextEncoding::DicomDefault,
+            TextEncoding::KoreanEucKr,
+        ] {
+            assert_displayed_patient_name(&path, encoding, "Hong^Gildong=홍^길동");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn iso_2022_japanese_with_ir_13_first_value_shows_kanji() {
+        // The usual Japanese declaration 'ISO 2022 IR 13\ISO 2022 IR 87' shows the half-width
+        // katakana and the kanji group, not the JIS bytes ";3ED^B@O:".
+        let path = temporary_file_path("iso-2022-japanese-ir-13");
+        // ﾔﾏﾀﾞ^ﾀﾛｳ in JIS X 0201, then 山田^太郎 in JIS X 0208 between ESC $ B and ESC ( J.
+        let raw_name = b"\xd4\xcf\xc0\xde^\xc0\xdb\xb3=\x1b$B;3ED\x1b(J^\x1b$BB@O:\x1b(J";
+        write_test_object_with_raw_patient_name(
+            &path,
+            Some(&["ISO 2022 IR 13", "ISO 2022 IR 87"]),
+            raw_name,
+        );
+        assert_displayed_patient_name(&path, TextEncoding::Auto, "ﾔﾏﾀﾞ^ﾀﾛｳ=山田^太郎");
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3732,6 +4152,341 @@ mod tests {
         for (path_name, error) in [("scan", scanned), ("open", loaded)] {
             let error = error.unwrap_or_default();
             assert!(error.ends_with(&expected_error), "{path_name}: {error}");
+        }
+    }
+
+    fn adv_deflated_copy(path: &Path, label: &str) -> PathBuf {
+        let deflated_path = temporary_file_path(label);
+        let mut object = dicom_object::open_file(path).unwrap();
+        object.update_meta(|meta| {
+            meta.transfer_syntax = uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN.to_owned();
+        });
+        object.write_to_file(&deflated_path).unwrap();
+        deflated_path
+    }
+
+    #[test]
+    fn adv_deflated_dicom_default_probe_stops_after_the_specific_character_set_position() {
+        let path = temporary_file_path("adv-undeclared-korean-default-probe");
+        let raw_name = TextEncoding::KoreanEucKr
+            .assumed_character_set()
+            .encode("홍길동")
+            .unwrap();
+        write_test_object_with_raw_patient_name(&path, None, &raw_name);
+        let deflated_path =
+            adv_deflated_copy(&path, "adv-undeclared-korean-default-probe-deflated");
+
+        assert_eq!(
+            probe_charset(&deflated_path, TextEncoding::Auto).unwrap(),
+            CharsetProbe::Undeclared(Some(TextEncoding::KoreanEucKr))
+        );
+        assert_eq!(
+            probe_charset(&deflated_path, TextEncoding::DicomDefault).unwrap(),
+            CharsetProbe::Undeclared(None)
+        );
+
+        let declared_path = temporary_file_path("adv-declared-korean-default-probe");
+        write_test_object_with_raw_patient_name(
+            &declared_path,
+            Some(&["", "ISO 2022 IR 149"]),
+            &korean_iso_2022("홍길동"),
+        );
+        let declared_deflated_path =
+            adv_deflated_copy(&declared_path, "adv-declared-korean-default-probe-deflated");
+        assert_eq!(
+            probe_charset(&declared_deflated_path, TextEncoding::DicomDefault).unwrap(),
+            CharsetProbe::Declared(super::SpecificCharacterSet::from_code("ISO 2022 IR 149"))
+        );
+        assert_displayed_patient_name(
+            &declared_deflated_path,
+            TextEncoding::DicomDefault,
+            "홍길동",
+        );
+        for path in [path, deflated_path, declared_path, declared_deflated_path] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn adv_iso_2022_ir_100_korean_segment_ends_at_an_explicit_latin_1_designation() {
+        let path = temporary_file_path("adv-iso-2022-ir-100-korean-explicit-reset");
+        let raw_name = [
+            b"Gr\xf6\xdfe=".as_slice(),
+            &korean_iso_2022("홍"),
+            b"\x1b-A=Gr\xf6\xdfe",
+        ]
+        .concat();
+        write_test_object_with_raw_patient_name(
+            &path,
+            Some(&["ISO 2022 IR 100", "ISO 2022 IR 149"]),
+            &raw_name,
+        );
+        for encoding in [TextEncoding::Auto, TextEncoding::DicomDefault] {
+            assert_displayed_patient_name(&path, encoding, "Größe=홍=Größe");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn iso_2022_ir_100_latin_1_group_after_a_korean_group_keeps_its_letters() {
+        // 'ISO 2022 IR 100\ISO 2022 IR 149' makes Latin-1 active again before '='
+        // (PS3.5 6.1.2.5.3), so the last group reads "Größe", not "Gr秤e".
+        let path = temporary_file_path("adv-iso-2022-ir-100-korean-implicit-reset");
+        let raw_name = [
+            b"Gr\xf6\xdfe=".as_slice(),
+            &korean_iso_2022("홍"),
+            b"=Gr\xf6\xdfe",
+        ]
+        .concat();
+        write_test_object_with_raw_patient_name(
+            &path,
+            Some(&["ISO 2022 IR 100", "ISO 2022 IR 149"]),
+            &raw_name,
+        );
+        for encoding in [TextEncoding::Auto, TextEncoding::DicomDefault] {
+            assert_displayed_patient_name(&path, encoding, "Größe=홍=Größe");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn iso_2022_korean_symbols_without_hangul_keep_their_reading() {
+        // KS X 1001 ° (A1 C6) and ± (A1 BE) after ESC $ ) C show as "°±" in every mode. Under
+        // '\ISO 2022 IR 149' the Korean codec has already read them as U+00B0 U+00B1, which
+        // are not mapped back to bytes B0 B1, the Hangul "갚". Under 'ISO 2022 IR 6\...' the
+        // parser reads them as Latin-1, and they are decoded as KS X 1001.
+        let path = temporary_file_path("adv-iso-2022-korean-symbols");
+        let raw_name = korean_iso_2022("Tilt 0°±2");
+        for first_value in ["", "ISO 2022 IR 6"] {
+            write_test_object_with_raw_patient_name(
+                &path,
+                Some(&[first_value, "ISO 2022 IR 149"]),
+                &raw_name,
+            );
+            for encoding in [
+                TextEncoding::Auto,
+                TextEncoding::DicomDefault,
+                TextEncoding::KoreanEucKr,
+            ] {
+                assert_displayed_patient_name(&path, encoding, "Tilt 0°±2");
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_decodes_undeclared_korean_text_next_to_a_value_that_is_also_valid_utf8() {
+        let path = temporary_file_path("undeclared-korean-with-utf8-shaped-value");
+        let korean = TextEncoding::KoreanEucKr.assumed_character_set();
+        // EUC-KR 홍길동 is not UTF-8. EUC-KR 처치 is also the valid UTF-8 text "óġ".
+        let raw_name = korean.encode("홍길동").unwrap();
+        let raw_description = korean.encode("처치").unwrap();
+        assert_eq!(std::str::from_utf8(&raw_description), Ok("óġ"));
+        write_test_object(&path, true);
+        let mut object = dicom_object::open_file(&path).unwrap();
+        object.put_element(DataElement::new(
+            tags::PATIENT_NAME,
+            VR::PN,
+            PrimitiveValue::from("ZNAMEx"),
+        ));
+        object.put_element(DataElement::new(
+            tags::STUDY_DESCRIPTION,
+            VR::LO,
+            PrimitiveValue::from("ZDSC"),
+        ));
+        object.write_to_file(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        for (placeholder, raw) in [
+            (b"ZNAMEx".as_slice(), &raw_name),
+            (b"ZDSC".as_slice(), &raw_description),
+        ] {
+            let offset = bytes
+                .windows(placeholder.len())
+                .position(|window| window == placeholder)
+                .unwrap();
+            bytes[offset..offset + raw.len()].copy_from_slice(raw);
+        }
+        std::fs::write(&path, bytes).unwrap();
+
+        assert_displayed_patient_name(&path, TextEncoding::Auto, "홍길동");
+        let loaded =
+            crate::dicom::load_dicom_frame_with_encoding(&path, 0, TextEncoding::Auto).unwrap();
+        assert_eq!(
+            find_metadata_value(&loaded.metadata.all_items, "(0008,1030)"),
+            Some("처치")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn auto_decodes_undeclared_korean_names_whose_bytes_are_also_valid_utf8() {
+        let path = temporary_file_path("utf8-shaped-korean");
+        // EUC-KR 황창호 is also the valid UTF-8 text "Ȳâȣ".
+        let raw_name = TextEncoding::KoreanEucKr
+            .assumed_character_set()
+            .encode("황창호")
+            .unwrap();
+        assert!(std::str::from_utf8(&raw_name).is_ok());
+        write_test_object_with_raw_patient_name(&path, None, &raw_name);
+
+        assert_displayed_patient_name(&path, TextEncoding::Auto, "황창호");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn series_orders_creation_time_by_creation_date_across_midnight() {
+        // Each series lists (instance number, creation date, creation time) in
+        // the expected order. Positions run against that order, so they only
+        // decide when the creation values do not.
+        let series = [
+            // Created across midnight: the first day comes first.
+            (
+                "2.25.731",
+                vec![
+                    (None, Some("20240101"), "235958"),
+                    (None, Some("20240101"), "235959.5"),
+                    (None, Some("20240102"), "000000"),
+                    (None, Some("20240102"), "000001"),
+                ],
+            ),
+            // Without dates the time of day alone decides, as before.
+            (
+                "2.25.732",
+                vec![
+                    (None, None, "000000"),
+                    (None, None, "000001"),
+                    (None, None, "235958"),
+                    (None, None, "235959"),
+                ],
+            ),
+            // One image without a date: a date cannot be compared with an
+            // unknown one, so the whole series keeps the time-only order.
+            (
+                "2.25.733",
+                vec![
+                    (None, Some("20240102"), "000000"),
+                    (None, None, "120000"),
+                    (None, Some("20240101"), "235959"),
+                ],
+            ),
+            // InstanceNumber still decides before the creation date and time.
+            (
+                "2.25.734",
+                vec![
+                    (Some("1"), Some("20240102"), "000001"),
+                    (Some("2"), Some("20240101"), "235959"),
+                    (None, Some("20240101"), "235958"),
+                    (None, Some("20240102"), "000000"),
+                ],
+            ),
+        ];
+
+        let mut paths = Vec::new();
+        for (series_uid, images) in &series {
+            let image_count = images.len();
+            for (image_index, (instance_number, creation_date, creation_time)) in
+                images.iter().enumerate()
+            {
+                let path =
+                    temporary_file_path(&format!("creation-date-{series_uid}-{image_index}"));
+                write_test_object(&path, true);
+                let mut object = dicom_object::open_file(&path).unwrap();
+                for (tag, vr, value) in [
+                    (tags::PATIENT_ID, VR::LO, Some("creation-date-patient")),
+                    (tags::STUDY_INSTANCE_UID, VR::UI, Some("2.25.730")),
+                    (tags::SERIES_INSTANCE_UID, VR::UI, Some(*series_uid)),
+                    (tags::INSTANCE_NUMBER, VR::IS, *instance_number),
+                    (tags::INSTANCE_CREATION_DATE, VR::DA, *creation_date),
+                    (tags::INSTANCE_CREATION_TIME, VR::TM, Some(*creation_time)),
+                ] {
+                    if let Some(value) = value {
+                        object.put_element(DataElement::new(tag, vr, value));
+                    }
+                }
+                object.put_element(DataElement::new(
+                    tags::IMAGE_POSITION_PATIENT,
+                    VR::DS,
+                    format!("0\\0\\{}", image_count - image_index),
+                ));
+                object.write_to_file(&path).unwrap();
+                paths.push(path);
+            }
+        }
+
+        let index =
+            build_for_inputs_with_progress(&paths, &AtomicBool::new(false), |_| {}).unwrap();
+        let series_groups = &index.patients[0].studies[0].series_groups;
+        assert_eq!(series_groups.len(), series.len());
+        let mut expected_paths = paths.iter();
+        for (series_group, (series_uid, images)) in series_groups.iter().zip(&series) {
+            let actual: Vec<_> = series_group
+                .slices
+                .iter()
+                .map(|slice| &slice.path)
+                .collect();
+            let expected: Vec<_> = expected_paths.by_ref().take(images.len()).collect();
+            assert_eq!(actual, expected, "series {series_uid}");
+        }
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn creation_dates_order_across_a_year_end_beside_numbered_and_timeless_images() {
+        // (instance number, creation date, creation time, position), in the
+        // expected order. Positions run against it for the timed images.
+        let images = [
+            (Some("1"), None, Some("235959"), "60"),
+            (Some("2"), None, Some("000000"), "50"),
+            (None, Some("20231231"), Some("235959.999999"), "40"),
+            (None, Some("20240101"), Some("000000"), "30"),
+            (None, Some("20240101"), Some("000001"), "20"),
+            (None, Some("20240201"), Some("000000"), "10"),
+            // No creation time: last, in position order.
+            (None, Some("20230101"), None, "100"),
+            (None, None, None, "200"),
+        ];
+        let paths: Vec<_> = (0..images.len())
+            .map(|index| temporary_file_path(&format!("creation-year-end-{index}")))
+            .collect();
+
+        for deflated in [false, true] {
+            for (path, (instance_number, date, time, position)) in paths.iter().zip(images) {
+                write_test_object(path, true);
+                let mut object = dicom_object::open_file(path).unwrap();
+                for (tag, vr, value) in [
+                    (tags::PATIENT_ID, VR::LO, Some("creation-year-end-patient")),
+                    (tags::STUDY_INSTANCE_UID, VR::UI, Some("2.25.740")),
+                    (tags::SERIES_INSTANCE_UID, VR::UI, Some("2.25.741")),
+                    (tags::INSTANCE_NUMBER, VR::IS, instance_number),
+                    (tags::INSTANCE_CREATION_DATE, VR::DA, date),
+                    (tags::INSTANCE_CREATION_TIME, VR::TM, time),
+                ] {
+                    if let Some(value) = value {
+                        object.put_element(DataElement::new(tag, vr, value));
+                    }
+                }
+                object.put_element(DataElement::new(
+                    tags::IMAGE_POSITION_PATIENT,
+                    VR::DS,
+                    format!("0\\0\\{position}"),
+                ));
+                object.write_to_file(path).unwrap();
+                if deflated {
+                    rewrite_as_deflated(path);
+                }
+            }
+
+            let index =
+                build_for_inputs_with_progress(&paths, &AtomicBool::new(false), |_| {}).unwrap();
+            let slices = &index.patients[0].studies[0].series_groups[0].slices;
+            let actual: Vec<_> = slices.iter().map(|slice| &slice.path).collect();
+            let expected: Vec<_> = paths.iter().collect();
+            assert_eq!(actual, expected, "deflated {deflated}");
+        }
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
         }
     }
 }

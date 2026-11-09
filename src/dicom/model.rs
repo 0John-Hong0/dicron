@@ -37,11 +37,21 @@ pub(crate) struct SliceItem {
     pub(crate) display_name: String,
     pub(crate) frame_index: u32,
     pub(crate) instance_number: Option<i32>,
-    /// `InstanceCreationTime` in microseconds since midnight, used for ordering
-    /// slices without `InstanceNumber`. Omitted time components are zero.
-    pub(crate) instance_creation_time: Option<u64>,
+    /// When the instance was created, used for ordering slices without
+    /// `InstanceNumber`; `None` without a usable `InstanceCreationTime`.
+    pub(crate) instance_creation_time: Option<InstanceCreationTime>,
     /// Signed through-plane position used after instance number or creation time:
     /// the projection of `ImagePositionPatient` onto the slice normal when
     /// orientation is known, otherwise the raw Z position.
     pub(crate) sort_position: Option<f64>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct InstanceCreationTime {
+    /// `InstanceCreationDate` as the number `YYYYMMDD`, or `None` when the
+    /// date is missing or unreadable.
+    pub(crate) date: Option<u32>,
+    /// `InstanceCreationTime` in microseconds since midnight. Omitted time
+    /// components are zero.
+    pub(crate) time_of_day: u64,
 }

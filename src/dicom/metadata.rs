@@ -1,6 +1,8 @@
 //! UI-independent extraction and formatting of DICOM metadata.
 
 mod model {
+    use std::collections::HashMap;
+
     #[derive(Clone, Default)]
     pub(crate) struct DicomOverlayMetadata {
         pub(crate) patient_label: Option<String>,
@@ -13,6 +15,8 @@ mod model {
         pub(crate) slice_thickness: Option<f64>,
         pub(crate) slice_location: Option<f64>,
         pub(crate) image_orientation: Option<[f64; 6]>,
+        /// The height of one pixel over its width, or `None` for square pixels.
+        pub(crate) pixel_aspect_ratio: Option<f64>,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +34,10 @@ mod model {
         pub(crate) path: String,
         pub(crate) kind: MetadataItemKind,
         pub(crate) children: Vec<MetadataItem>,
+        /// How many items before this one in its tree share its path. A file
+        /// can repeat an element, such as a File Meta element inside its data
+        /// set, so only the path together with this names one item.
+        pub(crate) occurrence: usize,
         // Precompute the normalized text once so filtering stays cheap per UI frame.
         search_haystack: String,
     }
@@ -64,8 +72,22 @@ mod model {
                 path,
                 kind,
                 children,
+                occurrence: 0,
                 search_haystack,
             }
+        }
+
+        /// Numbers the items of a tree that share a path, in tree order.
+        pub(crate) fn number_repeated_paths(items: &mut [MetadataItem]) {
+            fn number(items: &mut [MetadataItem], seen: &mut HashMap<String, usize>) {
+                for item in items {
+                    let count = seen.entry(item.path.clone()).or_default();
+                    item.occurrence = *count;
+                    *count += 1;
+                    number(&mut item.children, seen);
+                }
+            }
+            number(items, &mut HashMap::new());
         }
 
         /// search_text is expected to already be lowercased by the caller.
@@ -83,7 +105,7 @@ mod model {
 
     #[cfg(test)]
     mod tests {
-        use super::MetadataItem;
+        use super::{MetadataItem, MetadataItemKind};
 
         #[test]
         fn friendly_and_raw_values_are_searchable() {
@@ -96,6 +118,65 @@ mod model {
             assert!(item.matches_search("explicit vr little endian"));
             assert!(item.matches_search("1.2.840.10008.1.2.1"));
         }
+
+        /// Items repeat a path when a repeated element brings its sequence
+        /// items along; each repeat counts on from the ones before it, in tree
+        /// order, while distinct paths stay first.
+        #[test]
+        fn repeated_paths_are_numbered_in_tree_order_at_every_depth() {
+            let sequence = || {
+                let leaf = MetadataItem::with_structure(
+                    "(0008,0100)".to_owned(),
+                    "CodeValue".to_owned(),
+                    String::new(),
+                    "(0008,1032) / Item 1 / (0008,0100)".to_owned(),
+                    MetadataItemKind::Element,
+                    Vec::new(),
+                );
+                MetadataItem::with_structure(
+                    "(0008,1032)".to_owned(),
+                    "Sequence".to_owned(),
+                    String::new(),
+                    "(0008,1032)".to_owned(),
+                    MetadataItemKind::Sequence,
+                    vec![MetadataItem::with_structure(
+                        String::new(),
+                        "Item 1".to_owned(),
+                        String::new(),
+                        "(0008,1032) / Item 1".to_owned(),
+                        MetadataItemKind::Item,
+                        vec![leaf],
+                    )],
+                )
+            };
+            let other = MetadataItem::new(
+                "(0010,0010)".to_owned(),
+                "PatientName".to_owned(),
+                String::new(),
+            );
+            let mut items = vec![sequence(), other, sequence()];
+            MetadataItem::number_repeated_paths(&mut items);
+
+            fn flatten(items: &[MetadataItem], result: &mut Vec<(String, usize)>) {
+                for item in items {
+                    result.push((item.path.clone(), item.occurrence));
+                    flatten(&item.children, result);
+                }
+            }
+            let mut numbered = Vec::new();
+            flatten(&items, &mut numbered);
+            let expected = [
+                ("(0008,1032)", 0),
+                ("(0008,1032) / Item 1", 0),
+                ("(0008,1032) / Item 1 / (0008,0100)", 0),
+                ("(0010,0010)", 0),
+                ("(0008,1032)", 1),
+                ("(0008,1032) / Item 1", 1),
+                ("(0008,1032) / Item 1 / (0008,0100)", 1),
+            ]
+            .map(|(path, occurrence)| (path.to_owned(), occurrence));
+            assert_eq!(numbered, expected);
+        }
     }
 }
 
@@ -104,6 +185,11 @@ mod overlay {
 
     use super::super::elements::{element_text, first_parsed, parsed_values};
     use super::model::DicomOverlayMetadata;
+
+    /// The most times taller than wide, or wider than tall, a pixel is shown.
+    /// Proportions beyond this are not a real pixel's, and would overflow or
+    /// vanish in the viewer's layout.
+    const MAX_PIXEL_ASPECT_RATIO: f64 = 1000.0;
 
     pub(super) fn extract_overlay_metadata(
         dicom_object: &DefaultDicomObject,
@@ -122,6 +208,20 @@ mod overlay {
             first_parsed::<f64>(dicom_object, "SliceThickness").filter(|value| value.is_finite());
         let slice_location =
             first_parsed::<f64>(dicom_object, "SliceLocation").filter(|value| value.is_finite());
+        // Both list the vertical value first: the distance between rows, then
+        // between columns.
+        let pixel_aspect_ratio =
+            ["PixelSpacing", "PixelAspectRatio"]
+                .into_iter()
+                .find_map(|keyword| {
+                    let [row_value, column_value] = parsed_values(dicom_object, keyword)?;
+                    let ratio = row_value / column_value;
+
+                    (row_value > 0.0
+                        && column_value > 0.0
+                        && (1.0 / MAX_PIXEL_ASPECT_RATIO..=MAX_PIXEL_ASPECT_RATIO).contains(&ratio))
+                    .then_some(ratio)
+                });
 
         DicomOverlayMetadata {
             patient_label,
@@ -134,6 +234,97 @@ mod overlay {
             slice_thickness,
             slice_location,
             image_orientation: parsed_values(dicom_object, "ImageOrientationPatient"),
+            pixel_aspect_ratio,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use dicom_core::{DataElement, PrimitiveValue, VR};
+        use dicom_dictionary_std::{tags, uids};
+        use dicom_object::{FileDicomObject, FileMetaTableBuilder};
+
+        use super::extract_overlay_metadata;
+
+        fn pixel_aspect_ratio(spacing: Option<&str>, aspect_ratio: Option<&str>) -> Option<f64> {
+            let meta = FileMetaTableBuilder::new()
+                .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+                .media_storage_sop_class_uid(uids::SECONDARY_CAPTURE_IMAGE_STORAGE)
+                .media_storage_sop_instance_uid("2.25.102")
+                .build()
+                .unwrap();
+            let mut object = FileDicomObject::new_empty_with_meta(meta);
+            if let Some(spacing) = spacing {
+                object.put_element(DataElement::new(
+                    tags::PIXEL_SPACING,
+                    VR::DS,
+                    PrimitiveValue::from(spacing),
+                ));
+            }
+            if let Some(aspect_ratio) = aspect_ratio {
+                object.put_element(DataElement::new(
+                    tags::PIXEL_ASPECT_RATIO,
+                    VR::IS,
+                    PrimitiveValue::from(aspect_ratio),
+                ));
+            }
+
+            extract_overlay_metadata(&object).pixel_aspect_ratio
+        }
+
+        #[test]
+        fn pixel_proportions_come_from_spacing_then_aspect_ratio() {
+            assert_eq!(
+                pixel_aspect_ratio(Some("0.5\\0.25"), Some("1\\3")),
+                Some(2.0)
+            );
+            assert_eq!(pixel_aspect_ratio(None, Some("4\\3")), Some(4.0 / 3.0));
+            // Spacing that cannot be a pixel's size gives way to the ratio.
+            for unusable in ["0\\1", "-1\\1", "1", "1\\x"] {
+                assert_eq!(
+                    pixel_aspect_ratio(Some(unusable), Some("1\\2")),
+                    Some(0.5),
+                    "{unusable}"
+                );
+            }
+            assert_eq!(pixel_aspect_ratio(Some("0\\0"), None), None);
+            // Values that are not finite sizes, or that are not one pair,
+            // also give way.
+            for unusable in [
+                "NaN\\1",
+                "1\\inf",
+                "1\\2\\3",
+                "1\\-2",
+                // Both negative: their ratio is in range, but no pixel has
+                // a negative size.
+                "-1\\-2",
+                "1e300\\1e-300",
+                "1e-300\\1e300",
+            ] {
+                assert_eq!(
+                    pixel_aspect_ratio(Some(unusable), Some("3\\1")),
+                    Some(3.0),
+                    "{unusable}"
+                );
+            }
+            assert_eq!(pixel_aspect_ratio(Some("1\\1"), Some("1\\2")), Some(1.0));
+            assert_eq!(pixel_aspect_ratio(None, Some("0\\1")), None);
+            // Pixels up to a thousand times taller than wide, or wider than
+            // tall, are shown as they are.
+            assert_eq!(pixel_aspect_ratio(Some("1000\\1"), None), Some(1000.0));
+            assert_eq!(pixel_aspect_ratio(Some("1\\1000"), None), Some(0.001));
+            // Beyond that, the source gives way to the next one, then to
+            // square pixels.
+            for unusable in ["1001\\1", "1\\1001", "1e39\\1", "1e-50\\1"] {
+                assert_eq!(
+                    pixel_aspect_ratio(Some(unusable), Some("3\\1")),
+                    Some(3.0),
+                    "{unusable}"
+                );
+                assert_eq!(pixel_aspect_ratio(Some(unusable), None), None, "{unusable}");
+                assert_eq!(pixel_aspect_ratio(None, Some(unusable)), None, "{unusable}");
+            }
+            assert_eq!(pixel_aspect_ratio(None, None), None);
         }
     }
 }
@@ -148,6 +339,9 @@ mod format {
     use dicom_dictionary_std::{StandardDataDictionary, StandardSopClassDictionary, tags};
     use dicom_object::DefaultDicomObject;
     use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
+
+    use super::super::elements::g1_read_as_latin_1;
+    use super::super::text_encoding::decode_iso_2022_text;
 
     const MAX_INLINE_METADATA_VALUE_BYTES: u32 = 4096;
 
@@ -166,11 +360,14 @@ mod format {
             return "-".to_owned();
         };
 
-        get_dicom_element_text_value(element)
+        get_dicom_element_text_value(element, g1_read_as_latin_1(dicom_object))
     }
 
+    /// `g1_read_as_latin_1` tells how the parser read ISO 2022 G1 bytes in the element's data
+    /// set, see `text_encoding::iso_2022_g1_read_as_latin_1`.
     pub(super) fn get_dicom_element_text_value<I, P>(
         element: &dicom_core::DataElement<I, P>,
+        g1_read_as_latin_1: bool,
     ) -> String
     where
         I: HasLength,
@@ -228,6 +425,7 @@ mod format {
         let Ok(raw_value) = element.to_str() else {
             return "<non-text value>".to_owned();
         };
+        let raw_value = decode_iso_2022_text(&raw_value, g1_read_as_latin_1);
 
         // These single-valued text VRs may contain literal backslashes and significant line
         // breaks. Keep their contents intact for display, search, and copying.
@@ -372,7 +570,7 @@ mod format {
                 (tags::PATIENT_NAME, VR::PN),
             ] {
                 let element: DataElement<InMemDicomObject> = DataElement::empty(tag, vr);
-                assert_eq!(super::get_dicom_element_text_value(&element), "-");
+                assert_eq!(super::get_dicom_element_text_value(&element, false), "-");
             }
         }
     }
@@ -571,9 +769,10 @@ mod curated {
                 "Media Storage SOP Instance UID",
             ),
         ] {
-            let value = original_meta
-                .and_then(|meta| meta.get(tag))
-                .map_or_else(|| "-".to_owned(), get_dicom_element_text_value);
+            let value = original_meta.and_then(|meta| meta.get(tag)).map_or_else(
+                || "-".to_owned(),
+                |element| get_dicom_element_text_value(element, false),
+            );
             metadata_items.push(MetadataItem::new(
                 tag.to_string(),
                 description.to_owned(),
@@ -599,6 +798,7 @@ mod extract {
     use dicom_object::mem::InMemElement;
     use dicom_object::{DefaultDicomObject, InMemDicomObject};
 
+    use super::super::elements::g1_read_as_latin_1;
     use super::curated::extract_curated_dicom_metadata;
     use super::format::{build_dicom_tag_description, get_dicom_element_text_value};
     use super::model::{DicomMetadata, MetadataItem, MetadataItemKind};
@@ -619,23 +819,29 @@ mod extract {
         dicom_object: &DefaultDicomObject,
         original_meta: Option<&InMemDicomObject>,
     ) -> Vec<MetadataItem> {
+        let g1_read_as_latin_1 = g1_read_as_latin_1(dicom_object);
         let mut metadata_items: Vec<MetadataItem> = original_meta
             .into_iter()
             .flat_map(InMemDicomObject::iter)
-            .map(|element| extract_element(element, ""))
+            .map(|element| extract_element(element, "", false))
             .chain(
                 dicom_object
                     .iter()
-                    .map(|element| extract_element(element, "")),
+                    .map(|element| extract_element(element, "", g1_read_as_latin_1)),
             )
             .collect();
 
         metadata_items.sort_by(|left, right| left.tag.cmp(&right.tag));
+        MetadataItem::number_repeated_paths(&mut metadata_items);
 
         metadata_items
     }
 
-    fn extract_element(element: &InMemElement, parent_path: &str) -> MetadataItem {
+    fn extract_element(
+        element: &InMemElement,
+        parent_path: &str,
+        g1_read_as_latin_1: bool,
+    ) -> MetadataItem {
         let tag = element.tag().to_string();
         let path = if parent_path.is_empty() {
             tag.clone()
@@ -647,7 +853,7 @@ mod extract {
             return MetadataItem::with_structure(
                 tag,
                 description,
-                get_dicom_element_text_value(element),
+                get_dicom_element_text_value(element, g1_read_as_latin_1),
                 path,
                 MetadataItemKind::Element,
                 Vec::new(),
@@ -662,7 +868,7 @@ mod extract {
                 let item_path = format!("{path} / {label}");
                 let elements: Vec<_> = item
                     .iter()
-                    .map(|child| extract_element(child, &item_path))
+                    .map(|child| extract_element(child, &item_path, g1_read_as_latin_1))
                     .collect();
                 MetadataItem::with_structure(
                     String::new(),
@@ -853,6 +1059,41 @@ mod extract {
                 .unwrap();
             assert_eq!(patient_name.description, "PatientName");
             assert_eq!(patient_name.value, "Doe^Jane");
+        }
+
+        /// A data set that repeats a File Meta element lists both, and the
+        /// occurrence tells the two rows apart; every other row is the first
+        /// with its path.
+        #[test]
+        fn all_metadata_numbers_a_file_meta_element_repeated_in_the_dataset() {
+            let mut object = metadata_test_object();
+            object.put_element(DataElement::new(
+                tags::IMPLEMENTATION_VERSION_NAME,
+                VR::SH,
+                dicom_value!(Str, "DATASETCOPY"),
+            ));
+            let mut original_meta = metadata_test_file_meta(&object);
+            original_meta.put_element(DataElement::new(
+                tags::IMPLEMENTATION_VERSION_NAME,
+                VR::SH,
+                dicom_value!(Str, "METACOPY"),
+            ));
+            let metadata = extract_dicom_metadata(&object, Some(&original_meta));
+
+            let repeated: Vec<_> = metadata
+                .all_items
+                .iter()
+                .filter(|item| item.path == "(0002,0013)")
+                .map(|item| (item.value.as_str(), item.occurrence))
+                .collect();
+            assert_eq!(repeated, [("METACOPY", 0), ("DATASETCOPY", 1)]);
+            assert!(
+                metadata
+                    .all_items
+                    .iter()
+                    .filter(|item| item.path != "(0002,0013)")
+                    .all(|item| item.occurrence == 0)
+            );
         }
 
         #[test]
