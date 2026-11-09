@@ -33,6 +33,10 @@ pub(crate) struct OverlayBitmap {
 }
 
 impl OverlayBitmap {
+    pub(super) fn byte_len(&self) -> usize {
+        self.bits.len()
+    }
+
     fn is_set(&self, row: usize, column: usize) -> bool {
         bit_at(&self.bits, row * self.columns + column)
     }

@@ -38,6 +38,11 @@ const ORIENTATION_PERPENDICULAR_TOLERANCE: f64 = 1.0e-3;
 /// A stack further off, such as one missing a slice, is interpolated from its
 /// actual positions instead.
 const SLICE_POSITION_TOLERANCE: f64 = 0.1;
+/// Planes an uneven stack may be interpolated onto, per slice it holds. Real
+/// uneven stacks need about one: a missing slice adds one plane, and mixed
+/// 0.5 and 1 mm gaps at most two per slice. A handful of slices with a few
+/// tiny gaps beside a huge one would otherwise ask for millions of planes.
+const MAX_PLANES_PER_UNEVEN_SLICE: usize = 16;
 const SLICE_POSITION_TOLERANCE_MM: f64 = 0.01;
 /// Sideways drift allowed per millimetre along the stack (a 0.06° tilt).
 const SLICE_TILT_TOLERANCE: f64 = 1.0e-3;
@@ -980,7 +985,6 @@ fn interpolate_slices(
         return Ok(Vec::new());
     }
 
-    let plane_taps = position_taps(offsets_mm, spacing_mm, depth);
     let mut data = Vec::new();
     // The slices are still held while the planes are filled.
     reserve_source_voxels(
@@ -988,6 +992,7 @@ fn interpolate_slices(
         plane_len as u64 * depth as u64,
         MAX_SOURCE_VOXELS.saturating_sub(slices.len() as u64),
     )?;
+    let plane_taps = position_taps(offsets_mm, spacing_mm, depth);
     data.resize(plane_len * depth, 0.0);
     let planes_per_worker = depth.div_ceil(worker_count(depth));
 
@@ -1528,8 +1533,44 @@ impl VolumeAssembler {
         let intervals = (length / usual_gap)
             .round_ties_even()
             .clamp(1.0, MAX_EXTENT_MM / MIN_VOXEL_MM);
+        let planes = intervals + 1.0;
+        if planes > (positions.len() * MAX_PLANES_PER_UNEVEN_SLICE) as f64 {
+            let (widest, widest_gap) = gaps
+                .iter()
+                .map(|gap| gap.abs())
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .context("3D reconstruction found no slice gaps")?;
+            bail!(
+                "3D reconstruction does not support slice gaps this uneven: slices {} and {} of {} are {} mm apart while most are {} mm apart, so filling the stack would need {planes} images, more than {MAX_PLANES_PER_UNEVEN_SLICE} per slice.",
+                widest + 1,
+                widest + 2,
+                positions.len(),
+                format_millimetres(widest_gap),
+                format_millimetres(usual_gap)
+            );
+        }
 
         Ok((length / intervals, Some(offsets)))
+    }
+}
+
+/// A distance in millimetres with its first two significant digits, so a gap
+/// of a few micrometres is not written as 0.
+fn format_millimetres(distance: f64) -> String {
+    if distance >= 1.0e6 {
+        return format!("{distance:.1e}");
+    }
+    let decimals = if distance > 0.0 {
+        (1 - distance.log10().floor() as i32).clamp(0, 9) as usize
+    } else {
+        0
+    };
+    let text = format!("{distance:.decimals$}");
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        text
     }
 }
 
@@ -2777,6 +2818,256 @@ mod tests {
                 Some("slices 3 mm or more apart"),
                 "{label}"
             );
+        }
+    }
+
+    /// Four slices whose usual gap is a micrometre but which span 9 m would be
+    /// interpolated onto millions of planes; they are refused instead.
+    #[test]
+    fn a_few_slices_with_one_huge_gap_are_refused() {
+        let series = axial_series(
+            "huge-gap",
+            &["0\\0\\0", "0\\0\\0.0011", "0\\0\\0.0022", "0\\0\\9000"],
+        );
+
+        let message = rejection_message(&series);
+
+        assert!(
+            message.contains("does not support slice gaps this uneven"),
+            "{message}"
+        );
+        assert!(
+            message
+                .contains("slices 3 and 4 of 4 are 9000 mm apart while most are 0.0011 mm apart"),
+            "{message}"
+        );
+    }
+
+    /// An uneven stack may fill up to 16 planes per slice: slices at 0, 1, 2
+    /// and 63 mm fill 64 planes 1 mm apart, and one more millimetre is refused.
+    #[test]
+    fn uneven_stacks_fill_at_most_sixteen_planes_per_slice() {
+        let within = axial_series(
+            "uneven-at-cap",
+            &["0\\0\\0", "0\\0\\1", "0\\0\\2", "0\\0\\63"],
+        );
+        let beyond = axial_series(
+            "uneven-over-cap",
+            &["0\\0\\0", "0\\0\\1", "0\\0\\2", "0\\0\\64"],
+        );
+
+        assert_eq!(build(&within).unwrap().volume.depth, 64);
+        let message = rejection_message(&beyond);
+        assert!(
+            message.contains("would need 65 images, more than 16 per slice"),
+            "{message}"
+        );
+    }
+
+    /// The voxel budget is checked before anything is allocated per plane, so
+    /// a refused stack never asks for memory for its planes or their taps.
+    /// Two billion planes would need 64 GB of taps; the check runs in a child
+    /// process with a 2 GiB address space, so if the order ever regresses the
+    /// child aborts and this test fails instead of exhausting the machine.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interpolation_over_the_budget_is_refused_before_allocating_planes() {
+        const CHILD: &str = "DICRON_TEST_INTERPOLATION_BUDGET_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let cancel = AtomicBool::new(false);
+            let error = interpolate_slices(
+                &[0.0; 4],
+                1,
+                &[0.0, 1.0, 2.0, 3.0],
+                1.0e-9,
+                2_000_000_000,
+                &cancel,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("too large for 3D reconstruction"),
+                "{error}"
+            );
+            return;
+        }
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"ulimit -v 2097152 && exec "$0" --exact "$1" --test-threads=1"#)
+            .arg(std::env::current_exe().unwrap())
+            .arg("dicom::volume::tests::interpolation_over_the_budget_is_refused_before_allocating_planes")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{:?}\n{stdout}\n{stderr}",
+            output.status
+        );
+    }
+
+    /// Over the budget, no plane is worked out at all: even offsets no plane
+    /// could be placed between give the budget refusal, not a failure while
+    /// placing planes. Two huge planes keep this from allocating anything.
+    #[test]
+    fn interpolation_over_the_budget_places_no_plane() {
+        let cancel = AtomicBool::new(false);
+
+        let error = interpolate_slices(&[], 1_000_000_000, &[0.0], 1.0, 2, &cancel).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("too large for 3D reconstruction"),
+            "{error}"
+        );
+    }
+
+    /// A stack read from its far end obeys the same cap as one read from the
+    /// near end: 63, 62, 61 and 0 mm fill 64 planes, and 64 mm is one too many.
+    #[test]
+    fn reversed_uneven_stacks_obey_the_same_plane_cap() {
+        let within = axial_series(
+            "reversed-uneven-at-cap",
+            &["0\\0\\63", "0\\0\\62", "0\\0\\61", "0\\0\\0"],
+        );
+        let beyond = axial_series(
+            "reversed-uneven-over-cap",
+            &["0\\0\\64", "0\\0\\63", "0\\0\\62", "0\\0\\0"],
+        );
+
+        let built = build(&within).unwrap();
+        assert_eq!(built.volume.depth, 64);
+        assert_eq!(built.volume.spacing[2], 1.0);
+        assert_eq!(built.volume.plane(VolumeAxis::Z, 0).pixels, vec![0.0; 4]);
+        assert_eq!(built.volume.plane(VolumeAxis::Z, 63).pixels, vec![3.0; 4]);
+        let message = rejection_message(&beyond);
+        assert!(
+            message.contains("would need 65 images, more than 16 per slice"),
+            "{message}"
+        );
+    }
+
+    /// Uneven stacks met in practice stay far below the cap and still build
+    /// on planes their usual gap apart, from the first slice to the last.
+    #[test]
+    fn real_uneven_stacks_still_build() {
+        // (label, slice positions in mm, expected planes, expected spacing)
+        let cases: [(&str, Vec<f64>, usize, f64); 6] = [
+            (
+                "509 slices, one missing",
+                (0..510).filter(|i| *i != 300).map(f64::from).collect(),
+                510,
+                1.0,
+            ),
+            (
+                "390 slices, ten missing",
+                (0..400).filter(|i| i % 40 != 20).map(f64::from).collect(),
+                400,
+                1.0,
+            ),
+            (
+                "1 mm then 0.5 mm",
+                (0..80)
+                    .map(|i| {
+                        if i < 40 {
+                            f64::from(i)
+                        } else {
+                            39.0 + f64::from(i - 39) * 0.5
+                        }
+                    })
+                    .collect(),
+                119,
+                0.5,
+            ),
+            (
+                "0.05 mm, one missing",
+                (0..51)
+                    .filter(|i| *i != 25)
+                    .map(|i| f64::from(i) * 0.05)
+                    .collect(),
+                51,
+                0.05,
+            ),
+            (
+                "10 mm, one missing",
+                (0..31)
+                    .filter(|i| *i != 15)
+                    .map(|i| f64::from(i) * 10.0)
+                    .collect(),
+                31,
+                10.0,
+            ),
+            (
+                "two blocks 61 mm apart",
+                (0..20)
+                    .map(|i| {
+                        if i < 10 {
+                            f64::from(i)
+                        } else {
+                            f64::from(i) + 60.0
+                        }
+                    })
+                    .collect(),
+                80,
+                1.0,
+            ),
+        ];
+
+        for (label, positions, planes, spacing) in cases {
+            let series = written_stack("real-uneven", positions.len(), |index| {
+                format!("{:.2}", positions[index])
+            });
+
+            let built = build(&series).unwrap_or_else(|error| panic!("{label}: {error}"));
+
+            assert!(built.geometry.uneven_slice_offsets_mm.is_some(), "{label}");
+            assert_eq!(built.volume.depth, planes, "{label}");
+            assert!(
+                (built.volume.spacing[2] - spacing).abs() < 1.0e-9,
+                "{label}: {}",
+                built.volume.spacing[2]
+            );
+        }
+    }
+
+    /// The refusal names the usual gap it measured; a gap of 20 micrometres
+    /// must not be reported as 0 mm.
+    #[test]
+    fn the_uneven_refusal_states_a_micrometre_gap_as_nonzero() {
+        let series = axial_series(
+            "micrometre-gap",
+            &["0\\0\\0", "0\\0\\0.00002", "0\\0\\0.00004", "0\\0\\10"],
+        );
+
+        let message = rejection_message(&series);
+
+        assert!(
+            message.contains("does not support slice gaps this uneven"),
+            "{message}"
+        );
+        assert!(!message.contains(" 0.0000 mm"), "{message}");
+        assert!(message.contains("most are 0.00002 mm apart"), "{message}");
+    }
+
+    #[test]
+    fn millimetres_keep_two_significant_digits() {
+        for (distance, text) in [
+            (9000.0, "9000"),
+            (63.0, "63"),
+            (2.5, "2.5"),
+            (0.75, "0.75"),
+            (0.0011, "0.0011"),
+            (0.00002, "0.00002"),
+            (0.0, "0"),
+            (1.0e300, "1.0e300"),
+        ] {
+            assert_eq!(format_millimetres(distance), text, "{distance}");
         }
     }
 

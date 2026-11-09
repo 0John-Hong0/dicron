@@ -22,7 +22,7 @@ pub(crate) use pixels::{
     load_dicom_thumbnail, render_frame,
 };
 #[cfg(test)]
-pub(crate) use pixels::{load_dicom_frame, write_rle_test_slice};
+pub(crate) use pixels::{load_dicom_frame, monochrome_test_frame, write_rle_test_slice};
 #[cfg(test)]
 pub(crate) use scan::build_for_file;
 pub(crate) use scan::{

@@ -1526,10 +1526,19 @@ impl DicronApp {
         }
     }
 
+    /// Open the warned volume only if its series and frames are still selected.
     pub(in crate::app) fn accept_low_resolution_prompt(&mut self) {
         let Some(prompt) = self.three_d.low_resolution_prompt.take() else {
             return;
         };
+
+        // The selection can move to another series while the warning opens.
+        // The workspace takes its overlay from the selection, so the warned
+        // volume is kept for later, as a build the user left behind is.
+        if self.selected_series_identity() != Some((prompt.series_key, prompt.fingerprint)) {
+            self.three_d.cached = Some((prompt.series_key, prompt.fingerprint, prompt.prepared));
+            return;
+        }
 
         self.three_d
             .low_resolution_accepted
@@ -3352,12 +3361,14 @@ mod three_d_tests {
 
     #[test]
     fn a_low_resolution_volume_warns_until_the_user_accepts_it() {
-        let mut app = DicronApp::default();
+        let context = egui::Context::default();
+        let (mut app, _files) = app_with_three_series("low-resolution-accept");
+        let (series_key, fingerprint) = select_series(&mut app, &context, 0);
 
         app.activate_or_prompt(
             prepared_volume(Some(5.0), 5.0),
-            SERIES_KEY,
-            FINGERPRINT,
+            series_key,
+            fingerprint,
             ThreeDMode::Mpr,
         );
 
@@ -3370,9 +3381,9 @@ mod three_d_tests {
         assert!(app.three_d.active.is_none());
         assert!(app.three_d.low_resolution_accepted.is_empty());
         let (cached_key, cached_fingerprint, cached) = app.three_d.cached.take().unwrap();
-        assert_eq!((cached_key, cached_fingerprint), (SERIES_KEY, FINGERPRINT));
+        assert_eq!((cached_key, cached_fingerprint), (series_key, fingerprint));
 
-        app.activate_or_prompt(cached, SERIES_KEY, FINGERPRINT, ThreeDMode::Mpr);
+        app.activate_or_prompt(cached, series_key, fingerprint, ThreeDMode::Mpr);
         assert!(app.three_d.low_resolution_prompt.is_some());
 
         app.accept_low_resolution_prompt();
@@ -3382,7 +3393,7 @@ mod three_d_tests {
         assert!(
             app.three_d
                 .low_resolution_accepted
-                .contains(&(SERIES_KEY, FINGERPRINT))
+                .contains(&(series_key, fingerprint))
         );
         assert_eq!(app.three_d.view_mode, ViewMode::ThreeD(ThreeDMode::Mpr));
         assert!(app.three_d.active.as_ref().unwrap().low_resolution);
@@ -3406,14 +3417,18 @@ mod three_d_tests {
 
     #[test]
     fn clearing_the_document_drops_every_3d_workspace() {
-        let mut app = DicronApp::default();
+        let context = egui::Context::default();
+        let (mut app, _files) = app_with_three_series("clear-document");
+        let (series_key, fingerprint) = select_series(&mut app, &context, 0);
         app.activate_or_prompt(
             prepared_volume(Some(5.0), 5.0),
-            SERIES_KEY,
-            FINGERPRINT,
+            series_key,
+            fingerprint,
             ThreeDMode::Mpr,
         );
         app.accept_low_resolution_prompt();
+        assert!(app.three_d.active.is_some());
+        assert!(!app.three_d.low_resolution_accepted.is_empty());
 
         app.clear_loaded_dicom_state();
 
@@ -4078,6 +4093,95 @@ mod three_d_tests {
             !still_3d || displayed_key == Some(selected_key),
             "selected {selected_key:?}, displayed {displayed_key:?}, still in 3D: {still_3d}"
         );
+    }
+
+    /// A click in the tree can move the selection to another series just as
+    /// the warning opens. Accepting it then must not open the warned series
+    /// under the newly selected series' patient and series text; the volume
+    /// is kept, and the warning is asked again the next time 3D opens on it.
+    #[test]
+    fn accepting_a_warning_after_the_selection_moved_opens_nothing() {
+        let context = egui::Context::default();
+        let (mut app, _files) = app_with_three_series("accept-moved");
+        let warned = select_series(&mut app, &context, 0);
+        land_build(
+            &mut app,
+            warned,
+            Ok(VolumeJobOutput::Built(prepared_volume(Some(5.0), 5.0))),
+        );
+        assert!(app.three_d.low_resolution_prompt.is_some());
+
+        select_series(&mut app, &context, 1);
+        app.accept_low_resolution_prompt();
+
+        assert!(app.three_d.low_resolution_prompt.is_none());
+        assert!(app.three_d.active.is_none());
+        assert_eq!(app.three_d.view_mode, ViewMode::TwoD);
+        assert!(app.three_d.cached_matches(warned.0, warned.1));
+        assert!(app.three_d.low_resolution_accepted.is_empty());
+
+        select_series(&mut app, &context, 0);
+        app.open_three_d_mode(&context, ThreeDMode::Mpr);
+        assert!(app.three_d.low_resolution_prompt.is_some());
+    }
+
+    /// The selection may leave the warned series and come back before the
+    /// user answers; it names that series again, so accepting opens it.
+    #[test]
+    fn accepting_a_warning_after_the_selection_came_back_opens_the_warned_series() {
+        let context = egui::Context::default();
+        let (mut app, _files) = app_with_three_series("accept-came-back");
+        let warned = select_series(&mut app, &context, 0);
+        land_build(
+            &mut app,
+            warned,
+            Ok(VolumeJobOutput::Built(prepared_volume(Some(5.0), 5.0))),
+        );
+        assert!(app.three_d.low_resolution_prompt.is_some());
+
+        select_series(&mut app, &context, 1);
+        assert_eq!(select_series(&mut app, &context, 0), warned);
+        app.accept_low_resolution_prompt();
+
+        assert!(app.three_d.low_resolution_prompt.is_none());
+        assert_eq!(shown_series(&app), Some(warned.0));
+        let active = app.three_d.active.as_ref().unwrap();
+        assert_eq!((active.series_key, active.fingerprint), warned);
+        assert!(active.low_resolution);
+        assert!(app.three_d.low_resolution_accepted.contains(&warned));
+        assert!(app.three_d.cached.is_none());
+    }
+
+    /// The files of the warned series can change while the warning is open
+    /// (a rescan adds a slice); the selection then names other frames, and the
+    /// volume built from the old ones is not opened for them.
+    #[test]
+    fn accepting_a_warning_after_the_series_files_changed_opens_nothing() {
+        let context = egui::Context::default();
+        let (mut app, _files) = app_with_three_series("accept-changed");
+        let warned = select_series(&mut app, &context, 0);
+        land_build(
+            &mut app,
+            warned,
+            Ok(VolumeJobOutput::Built(prepared_volume(Some(5.0), 5.0))),
+        );
+        assert!(app.three_d.low_resolution_prompt.is_some());
+
+        let extra = app.dicom_index.as_ref().unwrap().patients[0].studies[0].series_groups[1]
+            .slices[0]
+            .clone();
+        app.dicom_index.as_mut().unwrap().patients[0].studies[0].series_groups[0]
+            .slices
+            .push(SliceItem {
+                sort_position: Some(2.0),
+                ..extra
+            });
+        assert_ne!(app.selected_series_identity(), Some(warned));
+        app.accept_low_resolution_prompt();
+
+        assert!(app.three_d.active.is_none());
+        assert_eq!(app.three_d.view_mode, ViewMode::TwoD);
+        assert!(app.three_d.low_resolution_accepted.is_empty());
     }
 
     #[test]
