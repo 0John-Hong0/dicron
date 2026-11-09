@@ -6,6 +6,9 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Reject DICOM files that declare values past the end of their data or nest sequences too deeply.
+  Bound header allocations during scanning and cap frame counts using the pixel data present.
+
 ## [0.6.1] - 2026-11-03
 
 - Order images without an Instance Number by Instance Creation Time, including fractional seconds.
