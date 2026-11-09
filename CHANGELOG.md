@@ -16,6 +16,7 @@ This project uses semantic versioning while it remains practical for a small des
 - Use the measured intensity range for grayscale images without a usable DICOM window or contrast lookup table.
 - Use each enhanced DICOM frame's own contrast window and rescale values for display, Reset,
   pixel readouts, and drag limits, including 8-bit grayscale RLE frames.
+- Correct the byte order of 16-bit color RLE images.
 
 ## [0.6.1] - 2026-11-03
 

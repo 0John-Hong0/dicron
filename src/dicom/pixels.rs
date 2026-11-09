@@ -331,10 +331,8 @@ impl FrameLayout {
     }
 }
 
-/// Where each segment of an RLE frame starts, once its header has been checked
-/// against the fragment and the frame's layout. The library decoder trusts the
-/// header: it allocates one entry per declared segment and slices the fragment
-/// at the declared offsets.
+/// Validate the segments needed to reconstruct a frame before allocating
+/// output or slicing the fragment at the declared offsets.
 fn rle_segment_starts(fragment: &[u8], layout: FrameLayout) -> Result<Vec<usize>> {
     const MAX_SEGMENTS: usize = 15;
     const HEADER_BYTES: usize = 64;
@@ -363,7 +361,7 @@ fn rle_segment_starts(fragment: &[u8], layout: FrameLayout) -> Result<Vec<usize>
         .map(header_value)
         .collect::<Result<Vec<_>>>()?;
     // Each segment ends where the next one starts, the last at the end of the
-    // fragment. The library reads only the needed segments, so the segments
+    // fragment. We read only the needed segments, so the segments
     // after them matter only where the first one marks the end of the last
     // needed one.
     let ends = starts[1..].iter().copied().chain([fragment.len()]);
@@ -659,72 +657,77 @@ pub(super) fn single_frame_decoding_copy(
     Ok(native)
 }
 
-/// The frame as an uncompressed copy of the object when it is 8-bit grayscale
-/// RLE. dicom-transfer-syntax-registry 0.9.1 decodes that one sample late: for
-/// one sample per pixel it starts writing at `samples_per_pixel - byte_offset`,
-/// which is 1 for 8-bit data, so the first pixel reads 0, the last is lost and
-/// every row begins with the previous row's last pixel. The one segment such a
-/// frame needs, its first, is unpacked here instead, whatever segments the
-/// header lists after it, and dicom-pixeldata decodes the copy as native pixel
-/// data with the object's own attributes.
-fn native_8_bit_rle_frame(
+/// Rebuild the frame as pixel-interleaved little-endian samples. Each RLE
+/// segment supplies one byte of one sample across all pixels, starting with
+/// the most significant byte of each sample.
+fn native_rle_frame(
     dicom_object: &DefaultDicomObject,
     frame: u32,
     layout: FrameLayout,
     fragment: &[u8],
-    segment_starts: &[usize],
-) -> Result<Option<DefaultDicomObject>> {
-    // 8-bit grayscale data needs one segment; other layouts are left to the
-    // library.
-    let (8, 1, &[segment_start, ..]) = (
-        layout.bits_allocated,
+) -> Result<DefaultDicomObject> {
+    ensure!(
+        matches!(layout.samples_per_pixel, 1 | 3) && matches!(layout.bits_allocated, 8 | 16 | 32),
+        "RLE images of {} samples per pixel with {} bits allocated are not supported",
         layout.samples_per_pixel,
-        segment_starts,
-    ) else {
-        return Ok(None);
-    };
-    // The segment ends where the next declared one starts.
-    let segment_end = segment_starts.get(1).copied().unwrap_or(fragment.len());
+        layout.bits_allocated
+    );
+    let starts = rle_segment_starts(fragment, layout)?;
+    let ends = starts[1..].iter().copied().chain([fragment.len()]);
+    let bytes_per_sample = layout.bytes_per_sample() as usize;
+    let bytes_per_pixel = usize::from(layout.samples_per_pixel) * bytes_per_sample;
+    let mut samples = vec![0; layout.pixels() as usize * bytes_per_pixel];
+    for (segment, (&start, end)) in starts.iter().zip(ends).take(bytes_per_pixel).enumerate() {
+        let sample = segment / bytes_per_sample;
+        let byte = bytes_per_sample - 1 - segment % bytes_per_sample;
+        let offset = sample * bytes_per_sample + byte;
+        let destination = samples
+            .chunks_exact_mut(bytes_per_pixel)
+            .map(|pixel| &mut pixel[offset]);
+        unpack_rle_segment(&fragment[start..end], destination)
+            .context("the RLE pixel data is damaged")?;
+    }
 
-    let samples = unpack_bits(
-        &fragment[segment_start..segment_end],
-        layout.pixels() as usize,
-    )
-    .context("the RLE pixel data is damaged")?;
-    Ok(Some(single_frame_decoding_copy(
-        dicom_object,
-        frame,
-        VR::OB,
-        PrimitiveValue::from(samples),
-    )?))
+    let mut native =
+        single_frame_decoding_copy(dicom_object, frame, VR::OB, PrimitiveValue::from(samples))?;
+    if layout.samples_per_pixel == 3 {
+        native.put_element(DataElement::new(
+            tags::PLANAR_CONFIGURATION,
+            VR::US,
+            PrimitiveValue::from(0_u16),
+        ));
+    }
+    Ok(native)
 }
 
-/// The first `length` bytes a PackBits run sequence expands to, or `None` when
-/// it ends short of them.
-fn unpack_bits(packed: &[u8], length: usize) -> Option<Vec<u8>> {
-    let mut packed = packed.iter().copied();
-    let mut unpacked = Vec::new();
-
-    while unpacked.len() < length {
-        match packed.next()? as i8 {
+/// Decode PackBits directly into one byte position of every output pixel.
+/// Return `None` when the segment ends before the destination is filled.
+fn unpack_rle_segment<'a>(
+    mut packed: &[u8],
+    mut destination: impl ExactSizeIterator<Item = &'a mut u8>,
+) -> Option<()> {
+    while destination.len() != 0 {
+        let (&control, remainder) = packed.split_first()?;
+        packed = remainder;
+        match control as i8 {
             -128 => {}
             literal @ 0.. => {
-                for _ in 0..=literal {
-                    unpacked.push(packed.next()?);
+                let (run, remainder) = packed.split_at_checked(usize::from(literal as u8) + 1)?;
+                packed = remainder;
+                for (&byte, output) in run.iter().zip(destination.by_ref()) {
+                    *output = byte;
                 }
             }
             repeat => {
-                let byte = packed.next()?;
-                unpacked.extend(std::iter::repeat_n(
-                    byte,
-                    (1 - isize::from(repeat)) as usize,
-                ));
+                let (&byte, remainder) = packed.split_first()?;
+                packed = remainder;
+                for output in destination.by_ref().take((1 - i16::from(repeat)) as usize) {
+                    *output = byte;
+                }
             }
         }
     }
-
-    unpacked.truncate(length);
-    Some(unpacked)
+    Some(())
 }
 
 fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<DecodedFrame> {
@@ -880,7 +883,7 @@ fn decode_pixel_frame_inner(
             layout.samples_per_pixel
         );
     }
-    // The library decoders for these read one fragment per frame.
+    // RLE and Deflated Image Frame Compression store one fragment per frame.
     if single_fragment_codec {
         let layout = layout.context("compressed pixel data is not encapsulated")?;
         let fragment = fragments
@@ -894,12 +897,8 @@ fn decode_pixel_frame_inner(
         if transfer_syntax == uids::DEFLATED_IMAGE_FRAME_COMPRESSION {
             ensure_deflated_frame_fits(fragment, layout)?;
         } else {
-            let segment_starts = rle_segment_starts(fragment, layout)?;
-            if let Some(native) =
-                native_8_bit_rle_frame(object, frame, layout, fragment, &segment_starts)?
-            {
-                return Ok(native.decode_pixel_data_frame(0)?.to_owned());
-            }
+            let native = native_rle_frame(object, frame, layout, fragment)?;
+            return Ok(native.decode_pixel_data_frame(0)?.to_owned());
         }
     }
     let result = if object.meta().transfer_syntax.trim_end_matches(['\0', ' '])
@@ -2531,18 +2530,89 @@ mod tests {
             set_layout(&mut object, samples_per_pixel);
 
             let case = format!("{columns}x{rows}, {samples_per_pixel} x {bits_allocated} bit");
-            let decoded = decoded_bytes(&object, 0);
-            if (samples_per_pixel, bits_allocated) == (3, 16) {
-                // dicom-transfer-syntax-registry 0.10 swaps the two bytes of
-                // 16-bit RGB RLE samples; only the size is pinned here.
-                assert_eq!(decoded.map(|bytes| bytes.len()), Ok(count * 2), "{case}");
-            } else {
-                assert_eq!(
-                    decoded,
-                    Ok(native_bytes(&samples, bits_allocated)),
-                    "{case}"
-                );
+            assert_eq!(
+                decoded_bytes(&object, 0),
+                Ok(native_bytes(&samples, bits_allocated)),
+                "{case}"
+            );
+        }
+    }
+
+    /// RLE stores color channels in separate segments even when the rebuilt
+    /// native frame presents them as interleaved pixels.
+    #[test]
+    fn sixteen_bit_rgb_rle_renders_the_correct_colours() {
+        let samples = [0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x1357, 0x2468];
+        let segments = rle_segments(&samples, 3, 2, packbits_literals);
+        let mut object = compressed_test_object(
+            uids::RLE_LOSSLESS,
+            VR::US,
+            1,
+            2,
+            16,
+            rle_frame_fragment(&segments),
+        );
+        set_layout(&mut object, 3);
+        object.put_element(DataElement::new(
+            tags::PLANAR_CONFIGURATION,
+            VR::US,
+            PrimitiveValue::from(1_u16),
+        ));
+
+        let frame = decode_frame(&object, 0).unwrap();
+        assert_eq!(
+            render_frame(&frame, None).unwrap().rgba,
+            [0x12, 0x56, 0x9A, 255, 0xDE, 0x13, 0x24, 255]
+        );
+        assert_eq!(
+            frame.pixel_probe(1, 0),
+            Some(PixelProbeValue::Rgb([0xDE, 0x13, 0x24]))
+        );
+    }
+
+    /// Each 32-bit sample contributes four byte planes, in significance order.
+    #[test]
+    fn thirty_two_bit_rle_preserves_sample_bytes() {
+        let values = [
+            0x0102_0304_u32,
+            0x0506_0708,
+            0x090A_0B0C,
+            0x0D0E_0F10,
+            0x1112_1314,
+            0x1516_1718,
+        ];
+        for samples_per_pixel in [1, 3] {
+            let channels = usize::from(samples_per_pixel);
+            let values = &values[..channels * 2];
+            let mut segments = Vec::new();
+            for channel in 0..channels {
+                for byte in 0..4 {
+                    let plane: Vec<_> = values
+                        .iter()
+                        .skip(channel)
+                        .step_by(channels)
+                        .map(|value| value.to_be_bytes()[byte])
+                        .collect();
+                    segments.push(packbits_literals(&plane));
+                }
             }
+            let mut object = compressed_test_object(
+                uids::RLE_LOSSLESS,
+                VR::US,
+                1,
+                2,
+                32,
+                rle_frame_fragment(&segments),
+            );
+            set_layout(&mut object, samples_per_pixel);
+            assert_eq!(
+                decoded_bytes(&object, 0),
+                Ok(values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect()),
+                "{channels} channels"
+            );
         }
     }
 
