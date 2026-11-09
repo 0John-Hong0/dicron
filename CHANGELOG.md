@@ -8,6 +8,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 - Reject DICOM files that declare values past the end of their data or nest sequences too deeply.
   Bound header allocations during scanning and cap frame counts using the pixel data present.
+- Check compressed frame sizes and fragment offsets before decoding, and limit overlay bitmaps
+  to the visible image area.
 
 ## [0.6.1] - 2026-11-03
 

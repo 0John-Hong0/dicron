@@ -4,6 +4,8 @@
 //! entire visible content there (for example Siemens dose report pages, whose pixel data is
 //! all zero), so a viewer that ignores them shows a black image.
 
+use std::ops::Range;
+
 use dicom_core::{PrimitiveValue, Tag};
 use dicom_object::DefaultDicomObject;
 use dicom_object::mem::InMemElement;
@@ -65,14 +67,19 @@ pub(super) fn paint_overlay_bitmaps(bitmaps: &[OverlayBitmap], image: &mut image
     }
 }
 
-/// Collects the overlay bitmaps that apply to the zero-based `frame_index` of the image.
+/// Collects the overlay bitmaps that apply to the zero-based `frame_index` of the image,
+/// cut to the part that falls on an image `image_width` x `image_height` pixels.
 pub(super) fn read_overlay_bitmaps(
     dicom_object: &DefaultDicomObject,
     frame_index: u32,
+    image_width: u32,
+    image_height: u32,
 ) -> Vec<OverlayBitmap> {
     (FIRST_OVERLAY_GROUP..=LAST_OVERLAY_GROUP)
         .step_by(2)
-        .filter_map(|group| read_overlay_bitmap(dicom_object, group, frame_index))
+        .filter_map(|group| {
+            read_overlay_bitmap(dicom_object, group, frame_index, image_width, image_height)
+        })
         .collect()
 }
 
@@ -80,6 +87,8 @@ fn read_overlay_bitmap(
     dicom_object: &DefaultDicomObject,
     group: u16,
     frame_index: u32,
+    image_width: u32,
+    image_height: u32,
 ) -> Option<OverlayBitmap> {
     let element = |element: u16| dicom_object.get(Tag(group, element));
     let data = packed_bytes(element(OVERLAY_DATA)?);
@@ -114,14 +123,35 @@ fn read_overlay_bitmap(
     let first_bit = usize::try_from(overlay_frame)
         .ok()?
         .checked_mul(bits_per_frame)?;
+    // Only the rows and columns that land on the image are kept; the rest would be clipped.
+    let visible_rows = visible_range(origin_row, rows, image_height)?;
+    let visible_columns = visible_range(origin_column, columns, image_width)?;
+    let bits = extract_bits(
+        &data,
+        first_bit,
+        columns,
+        visible_rows.clone(),
+        visible_columns.clone(),
+    )?;
 
     Some(OverlayBitmap {
-        rows,
-        columns,
-        origin_row,
-        origin_column,
-        bits: extract_bits(&data, first_bit, bits_per_frame),
+        rows: visible_rows.len(),
+        columns: visible_columns.len(),
+        origin_row: origin_row + visible_rows.start as i64,
+        origin_column: origin_column + visible_columns.start as i64,
+        bits,
     })
+}
+
+/// The indices of an overlay's `length` rows (or columns), placed at the 1-based `origin`,
+/// that fall on an image `image_length` pixels long, or `None` when none do.
+fn visible_range(origin: i64, length: usize, image_length: u32) -> Option<Range<usize>> {
+    // Index `i` lands on the 0-based image pixel `origin - 1 + i`.
+    let start = 1_i64.saturating_sub(origin).max(0);
+    let end = (i64::from(image_length) + 1)
+        .saturating_sub(origin)
+        .min(i64::try_from(length).ok()?);
+    (start < end).then_some(start as usize..end as usize)
 }
 
 /// Overlay Data is a bit stream packed LSB-first; when it was parsed as 16-bit words
@@ -138,15 +168,37 @@ fn packed_bytes(element: &InMemElement) -> Vec<u8> {
     }
 }
 
-/// Re-packs `count` bits starting at `first_bit` so the result starts on a byte boundary.
-fn extract_bits(source: &[u8], first_bit: usize, count: usize) -> Vec<u8> {
-    let mut packed = vec![0_u8; count.div_ceil(8)];
-    for offset in 0..count {
-        if bit_at(source, first_bit + offset) {
-            packed[offset / 8] |= 1 << (offset % 8);
+/// Re-packs the `rows` x `columns` window of an overlay frame that starts at `first_bit` of
+/// `source` and is `stride` bits wide, so the result starts on a byte boundary. Only bits that
+/// `source` holds are read; the rest stay clear.
+fn extract_bits(
+    source: &[u8],
+    first_bit: usize,
+    stride: usize,
+    rows: Range<usize>,
+    columns: Range<usize>,
+) -> Option<Vec<u8>> {
+    let source_bits = source.len().saturating_mul(8);
+    let width = columns.len();
+    let packed_length = (rows.len() * width).div_ceil(8);
+    let mut packed = Vec::new();
+    packed.try_reserve_exact(packed_length).ok()?;
+    packed.resize(packed_length, 0);
+
+    for (row_offset, row) in rows.enumerate() {
+        // `row * stride` stays within the frame's bit count, which did not overflow.
+        let row_start = first_bit.saturating_add(row * stride);
+        if row_start >= source_bits {
+            break;
+        }
+        for (column_offset, column) in columns.clone().enumerate() {
+            if bit_at(source, row_start + column) {
+                let offset = row_offset * width + column_offset;
+                packed[offset / 8] |= 1 << (offset % 8);
+            }
         }
     }
-    packed
+    Some(packed)
 }
 
 fn bit_at(bits: &[u8], index: usize) -> bool {
@@ -222,7 +274,7 @@ mod tests {
             dicom_value!(I16, [2, 3]),
         ));
 
-        let bitmaps = read_overlay_bitmaps(&object, 0);
+        let bitmaps = read_overlay_bitmaps(&object, 0, 8, 4);
         let mut image = black_image(8, 4);
         paint_overlay_bitmaps(&bitmaps, &mut image);
 
@@ -240,7 +292,7 @@ mod tests {
             dicom_value!(U16, [0x8001]),
         ));
 
-        let bitmaps = read_overlay_bitmaps(&object, 0);
+        let bitmaps = read_overlay_bitmaps(&object, 0, 16, 1);
         let mut image = black_image(16, 1);
         paint_overlay_bitmaps(&bitmaps, &mut image);
 
@@ -264,7 +316,7 @@ mod tests {
         ));
 
         let painted_columns = |frame_index: u32| {
-            let bitmaps = read_overlay_bitmaps(&object, frame_index);
+            let bitmaps = read_overlay_bitmaps(&object, frame_index, 3, 1);
             let mut image = black_image(3, 1);
             paint_overlay_bitmaps(&bitmaps, &mut image);
             set_pixels(&image)
@@ -289,7 +341,7 @@ mod tests {
             dicom_value!(I16, [0, 2]),
         ));
 
-        let bitmaps = read_overlay_bitmaps(&object, 0);
+        let bitmaps = read_overlay_bitmaps(&object, 0, 2, 2);
         let mut image = black_image(2, 2);
         paint_overlay_bitmaps(&bitmaps, &mut image);
 
@@ -314,7 +366,7 @@ mod tests {
             PrimitiveValue::from(1_u16),
         ));
 
-        assert_eq!(read_overlay_bitmaps(&object, 0).len(), 3);
+        assert_eq!(read_overlay_bitmaps(&object, 0, 1, 1).len(), 3);
     }
 
     #[test]
@@ -323,7 +375,45 @@ mod tests {
         put_overlay(&mut object, 0x6000, 0, 4, vec![0xFF]);
         put_overlay(&mut object, 0x6002, 4, 4, Vec::new());
 
-        assert!(read_overlay_bitmaps(&object, 0).is_empty());
+        assert!(read_overlay_bitmaps(&object, 0, 4, 4).is_empty());
+    }
+
+    /// A header claiming a 40000 x 40000 overlay with two bytes of data yields a
+    /// bitmap no larger than the image it is painted on.
+    #[test]
+    fn oversized_overlay_header_is_sized_by_the_image_and_the_data() {
+        let mut object = overlay_test_object();
+        put_overlay(&mut object, 0x6000, 40000, 40000, vec![0b0000_0101, 0xFF]);
+
+        let bitmaps = read_overlay_bitmaps(&object, 0, 4, 4);
+        let mut image = black_image(4, 4);
+        paint_overlay_bitmaps(&bitmaps, &mut image);
+
+        assert_eq!(bitmaps.len(), 1);
+        assert!(bitmaps[0].rows <= 4 && bitmaps[0].columns <= 4);
+        assert!(bitmaps[0].bits.len() <= 2);
+        // Only the first row has data; its first four bits are 1, 0, 1, 0.
+        assert_eq!(set_pixels(&image), vec![(0, 0), (2, 0)]);
+    }
+
+    /// Overlay sizes written as UL in an explicit VR file cannot abort the process.
+    #[test]
+    fn overlay_sizes_wider_than_us_do_not_abort() {
+        let mut object = overlay_test_object();
+        put_overlay(&mut object, 0x6000, 1, 1, vec![0b0000_0011]);
+        for element in [0x0010, 0x0011] {
+            object.put_element(DataElement::new(
+                Tag(0x6000, element),
+                VR::UL,
+                PrimitiveValue::from(u32::MAX),
+            ));
+        }
+
+        let bitmaps = read_overlay_bitmaps(&object, 0, 2, 2);
+        let mut image = black_image(2, 2);
+        paint_overlay_bitmaps(&bitmaps, &mut image);
+
+        assert_eq!(set_pixels(&image), vec![(0, 0), (1, 0)]);
     }
 
     #[test]
@@ -339,5 +429,133 @@ mod tests {
         paint_overlay_bitmaps(&[bitmap], &mut image);
 
         assert_eq!(set_pixels(&image), vec![(0, 0)]);
+    }
+
+    /// Every declared bit of the selected overlay frame painted where it lands,
+    /// with no trimming: the result the trimmed bitmaps must reproduce.
+    fn reference_pixels(
+        (rows, columns): (usize, usize),
+        (origin_row, origin_column): (i64, i64),
+        data: &[u8],
+        overlay_frame: usize,
+        (width, height): (u32, u32),
+    ) -> Vec<(u32, u32)> {
+        let mut pixels = Vec::new();
+        for row in 0..rows {
+            for column in 0..columns {
+                let bit = overlay_frame * rows * columns + row * columns + column;
+                let set = data
+                    .get(bit / 8)
+                    .is_some_and(|byte| byte & (1 << (bit % 8)) != 0);
+                let x = origin_column - 1 + column as i64;
+                let y = origin_row - 1 + row as i64;
+                if set && (0..i64::from(width)).contains(&x) && (0..i64::from(height)).contains(&y)
+                {
+                    pixels.push((x as u32, y as u32));
+                }
+            }
+        }
+        pixels.sort_by_key(|&(x, y)| (y, x));
+        pixels
+    }
+
+    /// Overlays smaller and larger than the image, at origins before, inside
+    /// and past its edges, with odd bit counts, several frames and data cut
+    /// short, paint exactly the pixels the untrimmed overlay would, from a
+    /// bitmap no larger than the image.
+    #[test]
+    fn trimmed_overlays_paint_what_the_whole_overlay_would() {
+        let pattern: Vec<u8> = (0_u32..64)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let origins = [
+            (1, 1),
+            (-2, -1),
+            (0, 0),
+            (2, 3),
+            (3, 1),
+            (1, 5),
+            (-6, 2),
+            (4, 6),
+        ];
+        let mut painted_cases = 0;
+
+        for (width, height) in [(5_u32, 3_u32), (3, 5), (1, 1), (6, 6)] {
+            for (rows, columns) in [(3_u16, 5_u16), (5, 3), (7, 9), (1, 13), (13, 1), (2, 2)] {
+                for origin in origins {
+                    for (multi_frame, frame_index, data_length) in [
+                        (true, 0, 64),
+                        (true, 1, 64),
+                        (true, 2, 64),
+                        (true, 3, 64),
+                        (true, 4, 64),
+                        (true, 1, 3),
+                        (false, 0, 64),
+                        (false, 1, 64),
+                        (false, 0, 1),
+                    ] {
+                        let data = pattern[..data_length].to_vec();
+                        let mut object = overlay_test_object();
+                        put_overlay(&mut object, 0x6000, rows, columns, data.clone());
+                        object.put_element(DataElement::new(
+                            Tag(0x6000, 0x0050),
+                            VR::SS,
+                            dicom_value!(I16, [origin.0 as i16, origin.1 as i16]),
+                        ));
+                        // Three overlay frames shown with image frames 2 to 4;
+                        // without these attributes, one shown with frame 1.
+                        let (frame_count, first_image_frame) = if multi_frame {
+                            object.put_element(DataElement::new(
+                                Tag(0x6000, 0x0015),
+                                VR::IS,
+                                PrimitiveValue::from("3"),
+                            ));
+                            object.put_element(DataElement::new(
+                                Tag(0x6000, 0x0051),
+                                VR::US,
+                                PrimitiveValue::from(2_u16),
+                            ));
+                            (3, 2)
+                        } else {
+                            (1, 1)
+                        };
+
+                        let bitmaps = read_overlay_bitmaps(&object, frame_index, width, height);
+                        let mut image = black_image(width, height);
+                        paint_overlay_bitmaps(&bitmaps, &mut image);
+                        let case = format!(
+                            "image {width}x{height}, overlay {columns}x{rows} at {origin:?}, \
+                             frame {frame_index} of {frame_count}, {data_length} bytes"
+                        );
+
+                        let overlay_frame = (frame_index + 1)
+                            .checked_sub(first_image_frame)
+                            .filter(|&overlay_frame| overlay_frame < frame_count);
+                        let expected = match overlay_frame {
+                            Some(overlay_frame) => reference_pixels(
+                                (usize::from(rows), usize::from(columns)),
+                                origin,
+                                &data,
+                                overlay_frame as usize,
+                                (width, height),
+                            ),
+                            None => Vec::new(),
+                        };
+                        assert_eq!(set_pixels(&image), expected, "{case}");
+                        painted_cases += usize::from(!expected.is_empty());
+                        for bitmap in &bitmaps {
+                            assert!(
+                                bitmap.rows <= height as usize
+                                    && bitmap.columns <= width as usize
+                                    && bitmap.bits.len()
+                                        <= (bitmap.rows * bitmap.columns).div_ceil(8),
+                                "{case}: {bitmap:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(painted_cases > 150, "{painted_cases}");
     }
 }
