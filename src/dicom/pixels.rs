@@ -624,6 +624,8 @@ pub(crate) fn write_rle_test_slice(
     for segment in &packed {
         rle.extend_from_slice(segment);
     }
+    // Cut short as by an interrupted copy, inside a file whose lengths agree.
+    rle.truncate((rle.len() as f64 * kept_fraction) as usize & !1);
 
     let meta = FileMetaTableBuilder::new()
         .transfer_syntax(uids::RLE_LOSSLESS)
@@ -661,14 +663,6 @@ pub(crate) fn write_rle_test_slice(
         PixelFragmentSequence::new(Vec::<u32>::new(), vec![rle]),
     ));
     object.write_to_file(path).unwrap();
-
-    let length = std::fs::metadata(path).unwrap().len();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .unwrap()
-        .set_len((length as f64 * kept_fraction) as u64)
-        .unwrap();
 }
 
 #[cfg(test)]

@@ -10,6 +10,23 @@ use dicom_dictionary_std::tags;
 
 use super::model::{PatientGroup, SeriesGroup, SliceItem, StudyGroup};
 
+/// How many frames a file whose pixel data the scan could not measure, such as
+/// a deflated data set, may index. Its declared NumberOfFrames is otherwise
+/// unchecked, and every frame costs an index entry.
+const MAX_UNMEASURED_FRAME_COUNT: u32 = 10_000;
+
+/// How much pixel data a file holds, which bounds how many of its declared
+/// frames can exist.
+pub(in crate::dicom) enum PixelDataExtent {
+    /// Native pixel data with this many bytes present in the file.
+    Native { byte_count: u64 },
+    /// Encapsulated pixel data with this many fragments after the Basic Offset
+    /// Table present in the file. Every frame starts a fragment of its own.
+    Encapsulated { fragment_count: u32 },
+    /// Pixel data the scan read as a stream and did not measure.
+    Unmeasured,
+}
+
 #[derive(Default)]
 pub(in crate::dicom) struct DicomIndexBuilder {
     patients: Vec<PatientGroup>,
@@ -104,6 +121,30 @@ impl DicomIndexMetadata {
             && self.bits_allocated.is_some_and(|value| value > 0)
             && self.photometric_interpretation.is_some()
     }
+
+    /// How many frames `pixel_data` can hold. Callers check
+    /// `has_image_pixel_metadata` first, so every frame has a size.
+    fn frame_capacity(&self, pixel_data: &PixelDataExtent) -> u32 {
+        match *pixel_data {
+            PixelDataExtent::Native { byte_count } => {
+                // BitsAllocated 1 packs frames bit by bit without padding, so
+                // the capacity is counted in bits.
+                let bits_per_frame = [
+                    self.rows,
+                    self.columns,
+                    self.samples_per_pixel,
+                    self.bits_allocated,
+                ]
+                .into_iter()
+                .map(|value| u128::from(value.unwrap_or(0)))
+                .product::<u128>();
+                let frame_count = u128::from(byte_count) * 8 / bits_per_frame;
+                u32::try_from(frame_count).unwrap_or(u32::MAX)
+            }
+            PixelDataExtent::Encapsulated { fragment_count } => fragment_count,
+            PixelDataExtent::Unmeasured => MAX_UNMEASURED_FRAME_COUNT,
+        }
+    }
 }
 
 pub(in crate::dicom) struct DicomIndexEntry {
@@ -136,11 +177,13 @@ impl DicomIndexEntry {
     pub(in crate::dicom) fn from_metadata(
         file_path: &Path,
         metadata: DicomIndexMetadata,
-        has_pixel_data: bool,
+        pixel_data: Option<PixelDataExtent>,
     ) -> Option<Self> {
-        if !has_pixel_data || !metadata.has_image_pixel_metadata() {
+        let pixel_data = pixel_data?;
+        if !metadata.has_image_pixel_metadata() {
             return None;
         }
+        let frame_capacity = metadata.frame_capacity(&pixel_data);
 
         let DicomIndexMetadata {
             patient_id,
@@ -164,7 +207,11 @@ impl DicomIndexEntry {
             image_position_patient,
             image_orientation_patient,
         );
-        let number_of_frames = number_of_frames.unwrap_or(1).max(1);
+        // A frame the pixel data cannot hold is not indexed: a corrupt
+        // NumberOfFrames would otherwise add millions of entries. One frame
+        // stays, so a file too short for any frame still shows its error when
+        // it is opened.
+        let number_of_frames = number_of_frames.unwrap_or(1).min(frame_capacity).max(1);
 
         let patient_key = patient_id.clone().unwrap_or_else(|| {
             synthetic_patient_key(
@@ -654,13 +701,20 @@ mod tests {
         }
     }
 
+    /// Native pixel data holding one frame of `image_metadata`.
+    fn one_native_frame() -> Option<PixelDataExtent> {
+        Some(PixelDataExtent::Native {
+            byte_count: 16 * 16 * 2,
+        })
+    }
+
     fn add_metadata(
         index_builder: &mut DicomIndexBuilder,
         path: &Path,
         metadata: DicomIndexMetadata,
-        has_pixel_data: bool,
+        pixel_data: Option<PixelDataExtent>,
     ) -> bool {
-        let Some(entry) = DicomIndexEntry::from_metadata(path, metadata, has_pixel_data) else {
+        let Some(entry) = DicomIndexEntry::from_metadata(path, metadata, pixel_data) else {
             return false;
         };
         index_builder.add_entry(entry);
@@ -675,7 +729,7 @@ mod tests {
             &mut index_builder,
             Path::new("structure-set"),
             DicomIndexMetadata::default(),
-            false,
+            None,
         ));
         let patients = index_builder.into_patients();
         assert!(patients.is_empty());
@@ -691,9 +745,55 @@ mod tests {
             &mut index_builder,
             Path::new("compressed-image"),
             metadata,
-            true,
+            Some(PixelDataExtent::Encapsulated { fragment_count: 3 }),
         ));
         let patients = index_builder.into_patients();
+        assert_eq!(patients[0].studies[0].series_groups[0].slices.len(), 3);
+    }
+
+    /// Single-bit frames are packed without padding, so 16x16 frames take 32
+    /// bytes each and a frame cut short is not indexed.
+    #[test]
+    fn single_bit_frames_are_bounded_by_their_packed_size() {
+        let indexed_frames = |byte_count| {
+            let mut metadata = image_metadata();
+            metadata.bits_allocated = Some(1);
+            metadata.number_of_frames = Some(3);
+            let mut index_builder = DicomIndexBuilder::default();
+            assert!(add_metadata(
+                &mut index_builder,
+                Path::new("segmentation"),
+                metadata,
+                Some(PixelDataExtent::Native { byte_count }),
+            ));
+            index_builder.into_patients()[0].studies[0].series_groups[0]
+                .slices
+                .len()
+        };
+
+        assert_eq!(indexed_frames(96), 3);
+        assert_eq!(indexed_frames(95), 2);
+    }
+
+    /// Single-bit frames whose size is not a whole number of bytes still pack
+    /// without padding: three 3x3 frames, 27 bits, fit in four bytes.
+    #[test]
+    fn single_bit_frames_are_not_padded_to_whole_bytes() {
+        let mut metadata = image_metadata();
+        metadata.rows = Some(3);
+        metadata.columns = Some(3);
+        metadata.bits_allocated = Some(1);
+        metadata.number_of_frames = Some(3);
+        let mut index_builder = DicomIndexBuilder::default();
+        assert!(add_metadata(
+            &mut index_builder,
+            Path::new("odd-segmentation"),
+            metadata,
+            Some(PixelDataExtent::Native { byte_count: 4 }),
+        ));
+
+        let patients = index_builder.into_patients();
+
         assert_eq!(patients[0].studies[0].series_groups[0].slices.len(), 3);
     }
 
@@ -705,13 +805,13 @@ mod tests {
             &mut index_builder,
             Path::new("first/image"),
             image_metadata(),
-            true,
+            one_native_frame(),
         ));
         assert!(add_metadata(
             &mut index_builder,
             Path::new("second/image"),
             image_metadata(),
-            true,
+            one_native_frame(),
         ));
         let patients = index_builder.into_patients();
 
@@ -745,13 +845,13 @@ mod tests {
             &mut index_builder,
             Path::new("first-image"),
             metadata(),
-            true,
+            one_native_frame(),
         ));
         assert!(add_metadata(
             &mut index_builder,
             Path::new("second-image"),
             metadata(),
-            true,
+            one_native_frame(),
         ));
         let patients = index_builder.into_patients();
 
@@ -776,7 +876,7 @@ mod tests {
                     image_orientation_patient: Some(AXIAL),
                     ..image_metadata()
                 },
-                true,
+                one_native_frame(),
             ));
         }
         let patients = index_builder.into_patients();
