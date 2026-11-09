@@ -294,16 +294,7 @@ impl FrameLayout {
         // The photometric interpretation as dicom-pixeldata reads it: the 2D
         // view keeps an f64 probe for the frames it calls monochrome.
         let colour = layout.samples_per_pixel >= 3
-            && object
-                .element(tags::PHOTOMETRIC_INTERPRETATION)
-                .ok()
-                .and_then(|element| element.string().ok())
-                .is_some_and(|value| {
-                    !PhotometricInterpretation::from(
-                        value.trim_matches(|c: char| c.is_whitespace() || c == '\0'),
-                    )
-                    .is_monochrome()
-                });
+            && photometric_interpretation(object).is_some_and(|value| !value.is_monochrome());
         let samples = layout.pixels() * u64::from(layout.samples_per_pixel);
         if colour {
             let bytes = samples * layout.bytes_per_sample();
@@ -329,6 +320,17 @@ impl FrameLayout {
     fn bytes_per_sample(self) -> u64 {
         u64::from(self.bits_allocated.div_ceil(8))
     }
+}
+
+fn photometric_interpretation(object: &DefaultDicomObject) -> Option<PhotometricInterpretation> {
+    let value = object
+        .element(tags::PHOTOMETRIC_INTERPRETATION)
+        .ok()?
+        .string()
+        .ok()?;
+    Some(PhotometricInterpretation::from(
+        value.trim_matches(|c: char| c.is_whitespace() || c == '\0'),
+    ))
 }
 
 /// Validate the segments needed to reconstruct a frame before allocating
@@ -657,6 +659,104 @@ pub(super) fn single_frame_decoding_copy(
     Ok(native)
 }
 
+/// Build a single frame whose decoded samples are already interleaved RGB.
+pub(super) fn rgb_decoding_copy(
+    object: &DefaultDicomObject,
+    frame: u32,
+    vr: VR,
+    samples: PrimitiveValue,
+) -> Result<DefaultDicomObject> {
+    let mut native = single_frame_decoding_copy(object, frame, vr, samples)?;
+    native.put_element(DataElement::new(
+        tags::PHOTOMETRIC_INTERPRETATION,
+        VR::CS,
+        "RGB",
+    ));
+    native.put_element(DataElement::new(
+        tags::PLANAR_CONFIGURATION,
+        VR::US,
+        PrimitiveValue::from(0_u16),
+    ));
+    Ok(native)
+}
+
+/// Convert native Y1 Y2 Cb Cr groups to two RGB pixels with shared chroma.
+fn native_ybr_full_422_frame(
+    object: &DefaultDicomObject,
+    frame: u32,
+) -> Result<DefaultDicomObject> {
+    let layout = FrameLayout::read_within_budget(object)?;
+    ensure!(
+        layout.samples_per_pixel == 3
+            && layout.bits_allocated == 8
+            && layout.rows > 0
+            && layout.columns > 0
+            && layout.columns.is_multiple_of(2),
+        "native YBR_FULL_422 needs three 8-bit samples, nonzero rows, and a positive even column count"
+    );
+    ensure!(
+        object
+            .element(tags::PLANAR_CONFIGURATION)?
+            .to_int::<u16>()?
+            == 0,
+        "native YBR_FULL_422 needs Planar Configuration 0"
+    );
+    ensure!(
+        object
+            .element(tags::PIXEL_REPRESENTATION)?
+            .to_int::<u16>()?
+            == 0,
+        "native YBR_FULL_422 needs unsigned samples"
+    );
+    let bits_stored = object.element(tags::BITS_STORED)?.to_int::<u16>()?;
+    ensure!(
+        (1..=8).contains(&bits_stored),
+        "native YBR_FULL_422 needs Bits Stored in 1..=8"
+    );
+
+    let frames = object
+        .element_opt(tags::NUMBER_OF_FRAMES)?
+        .map(|element| element.to_int::<u32>())
+        .transpose()?
+        .unwrap_or(1);
+    let number = u64::from(frame) + 1;
+    ensure!(frame < frames, "the pixel data holds no frame {number}");
+    let frame_bytes = layout.pixels() as usize * 2;
+    let start = (frame as usize)
+        .checked_mul(frame_bytes)
+        .context("native frame offset overflows")?;
+    let pixel_data = object.element(tags::PIXEL_DATA)?.to_bytes()?;
+    let stored = pixel_data
+        .get(start..)
+        .and_then(|rest| rest.get(..frame_bytes))
+        .with_context(|| format!("the pixel data holds no complete frame {number}"))?;
+
+    let maximum = (1_u16 << bits_stored) - 1;
+    let (pairs, _) = stored.as_chunks::<4>();
+    let mut rgb = Vec::with_capacity(layout.pixels() as usize * 3);
+    for &[first, second, cb, cr] in pairs {
+        for luminance in [first, second] {
+            let ybr = [luminance, cb, cr].map(|sample| u16::from(sample) & maximum);
+            rgb.extend(ybr_full_to_rgb(ybr, maximum).map(|value| value as u8));
+        }
+    }
+    rgb_decoding_copy(object, frame, VR::OB, PrimitiveValue::from(rgb))
+}
+
+/// Convert full-range YBR samples using the equations in DICOM PS3.3 C.7.6.3.1.2.
+fn ybr_full_to_rgb([luminance, cb, cr]: [u16; 3], maximum: u16) -> [u16; 3] {
+    let midpoint = f64::from(maximum / 2 + 1);
+    let luminance = f64::from(luminance);
+    let cb = f64::from(cb) - midpoint;
+    let cr = f64::from(cr) - midpoint;
+    [
+        luminance + 1.402 * cr,
+        luminance - 0.344136 * cb - 0.714136 * cr,
+        luminance + 1.772 * cb,
+    ]
+    .map(|value| value.round().clamp(0.0, f64::from(maximum)) as u16)
+}
+
 /// Rebuild the frame as pixel-interleaved little-endian samples. Each RLE
 /// segment supplies one byte of one sample across all pixels, starting with
 /// the most significant byte of each sample.
@@ -809,7 +909,7 @@ fn validate_frame_offsets(fragments: &[Vec<u8>], offsets: &[u32], frames: u32) -
     Ok(())
 }
 
-/// Validates compressed frame sizes before invoking the pixel codec.
+/// Validate frame bounds before decoding and unpack native subsampled color.
 fn decode_pixel_frame_inner(
     object: &DefaultDicomObject,
     frame: u32,
@@ -817,6 +917,15 @@ fn decode_pixel_frame_inner(
     let transfer_syntax = object.meta().transfer_syntax();
     let pixel_data = object.element(tags::PIXEL_DATA)?.value();
     let fragments = pixel_data.fragments();
+    if pixel_data.primitive().is_some()
+        && photometric_interpretation(object) == Some(PhotometricInterpretation::YbrFull422)
+        && TransferSyntaxRegistry
+            .get(transfer_syntax)
+            .is_some_and(|syntax| !syntax.is_encapsulated_pixel_data())
+    {
+        let native = native_ybr_full_422_frame(object, frame)?;
+        return Ok(native.decode_pixel_data_frame(0)?.to_owned());
+    }
     // Compressed pixel data is checked before any decoder sizes its output
     // from the header; native pixel data is already in memory at full size.
     let layout = fragments
@@ -1994,6 +2103,12 @@ mod tests {
         }
     }
 
+    fn rgb(rgba: &[u8]) -> Vec<[u8; 3]> {
+        rgba.chunks_exact(4)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect()
+    }
+
     /// Colour images have nothing to window and keep their colours.
     #[test]
     fn rgb_image_keeps_its_colours() {
@@ -2010,18 +2125,13 @@ mod tests {
             VR::CS,
             PrimitiveValue::from("RGB"),
         ));
-        let samples: Vec<u8> = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let samples = [[10, 20, 30], [40, 50, 60], [70, 80, 90], [100, 110, 120]];
         object.put_element(DataElement::new(
             tags::PIXEL_DATA,
             VR::OB,
-            PrimitiveValue::from(samples.clone()),
+            PrimitiveValue::from(samples.concat()),
         ));
         let frame = decode_frame(&object, 0).unwrap();
-        let rgb = |rgba: &[u8]| -> Vec<u8> {
-            rgba.chunks_exact(4)
-                .flat_map(|pixel| pixel[..3].to_vec())
-                .collect()
-        };
 
         assert_eq!(rgb(&render_frame(&frame, None).unwrap().rgba), samples);
         assert_eq!(frame.default_center_width(), (127.5, 255.0));
@@ -2030,6 +2140,94 @@ mod tests {
         let thumbnail = load_dicom_thumbnail(&path, 0, 2);
         std::fs::remove_file(path).unwrap();
         assert_eq!(rgb(&thumbnail.unwrap().rgba), samples);
+    }
+
+    /// Create a native single-row image with packed 4:2:2 pixel pairs.
+    fn native_ybr_full_422_row(data: &[u8], columns: u16, frame_count: u32) -> DefaultDicomObject {
+        let mut object = compressed_test_object(
+            uids::EXPLICIT_VR_LITTLE_ENDIAN,
+            VR::US,
+            1,
+            u32::from(columns),
+            8,
+            vec![],
+        );
+        set_layout(&mut object, 3);
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            "YBR_FULL_422 ",
+        ));
+        object.put_element(DataElement::new(
+            tags::NUMBER_OF_FRAMES,
+            VR::IS,
+            frame_count.to_string(),
+        ));
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from(data.to_vec()),
+        ));
+        object
+    }
+
+    /// Opening a file, rendering it, and building its thumbnail agree on
+    /// both the packed frame offset and the two pixels that share chroma.
+    #[test]
+    fn native_ybr_full_422_renders_each_frame_and_thumbnail() {
+        let object = native_ybr_full_422_row(&[50, 200, 90, 170, 0, 255, 128, 128], 2, 2);
+        let path = std::env::temp_dir().join(format!("dicron-ybr422-{}.dcm", std::process::id()));
+        object.write_to_file(&path).unwrap();
+        for (index, expected) in [
+            (0, [[109, 33, 0], [255, 183, 133]]),
+            (1, [[0, 0, 0], [255, 255, 255]]),
+        ] {
+            let loaded = load_dicom_frame(&path, index).unwrap();
+            let frame = loaded.frame;
+            assert_eq!(frame.frame_count, 2);
+            assert_eq!(rgb(&render_frame(&frame, None).unwrap().rgba), expected);
+            assert_eq!(
+                frame.pixel_probe(1, 0),
+                Some(PixelProbeValue::Rgb(expected[1]))
+            );
+            let thumbnail = load_dicom_thumbnail(&path, index, 2).unwrap();
+            assert_eq!(rgb(&thumbnail.rgba), expected);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The conversion reads the stored bits and uses their chroma midpoint.
+    #[test]
+    fn native_ybr_full_422_ignores_unused_sample_bits() {
+        let mut object = native_ybr_full_422_row(&[128, 255, 192, 192], 2, 1);
+        for (tag, value) in [(tags::BITS_STORED, 7_u16), (tags::HIGH_BIT, 6)] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        let frame = decode_frame(&object, 0).unwrap();
+        assert_eq!(
+            rgb(&render_frame(&frame, None).unwrap().rgba),
+            [[0; 3], [127; 3]]
+        );
+    }
+
+    /// Reject an incomplete frame or a layout that cannot represent pairs.
+    #[test]
+    fn native_ybr_full_422_rejects_truncated_frames_and_invalid_layouts() {
+        let truncated = native_ybr_full_422_row(&[128; 7], 2, 2);
+        assert!(decode_frame(&truncated, 0).is_ok());
+        let error = decode_frame(&truncated, 1).err().unwrap();
+        assert!(format!("{error:#}").contains("no complete frame 2"));
+
+        let odd_width = native_ybr_full_422_row(&[128; 6], 3, 1);
+        assert!(decode_error(&odd_width).contains("even column count"));
+
+        let mut by_plane = native_ybr_full_422_row(&[128; 4], 2, 1);
+        by_plane.put_element(DataElement::new(
+            tags::PLANAR_CONFIGURATION,
+            VR::US,
+            PrimitiveValue::from(1_u16),
+        ));
+        assert!(decode_error(&by_plane).contains("Planar Configuration 0"));
     }
 
     /// A requested window always wins over the implicit one.

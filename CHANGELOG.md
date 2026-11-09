@@ -17,6 +17,7 @@ This project uses semantic versioning while it remains practical for a small des
 - Use each enhanced DICOM frame's own contrast window and rescale values for display, Reset,
   pixel readouts, and drag limits, including 8-bit grayscale RLE frames.
 - Correct the byte order of 16-bit color RLE images.
+- Display native YBR_FULL_422 images in RGB and index all complete frames.
 
 ## [0.6.1] - 2026-11-03
 

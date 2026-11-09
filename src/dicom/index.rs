@@ -129,10 +129,18 @@ impl DicomIndexMetadata {
             PixelDataExtent::Native { byte_count } => {
                 // BitsAllocated 1 packs frames bit by bit without padding, so
                 // the capacity is counted in bits.
+                // Native YBR_FULL_422 stores four samples per pair of pixels.
+                let samples_per_pixel = match (
+                    self.samples_per_pixel,
+                    self.photometric_interpretation.as_deref(),
+                ) {
+                    (Some(3), Some("YBR_FULL_422")) => Some(2),
+                    (samples, _) => samples,
+                };
                 let bits_per_frame = [
                     self.rows,
                     self.columns,
-                    self.samples_per_pixel,
+                    samples_per_pixel,
                     self.bits_allocated,
                 ]
                 .into_iter()
@@ -795,6 +803,32 @@ mod tests {
         let patients = index_builder.into_patients();
 
         assert_eq!(patients[0].studies[0].series_groups[0].slices.len(), 3);
+    }
+
+    /// Native 4:2:2 needs two stored bytes per pixel at eight bits per sample.
+    #[test]
+    fn native_ybr_full_422_frame_capacity_uses_subsampled_size() {
+        let indexed_frames = |photometric: &str, byte_count| {
+            let mut metadata = image_metadata();
+            metadata.samples_per_pixel = Some(3);
+            metadata.bits_allocated = Some(8);
+            metadata.photometric_interpretation = Some(photometric.to_owned());
+            metadata.number_of_frames = Some(3);
+            let mut index_builder = DicomIndexBuilder::default();
+            assert!(add_metadata(
+                &mut index_builder,
+                Path::new("color"),
+                metadata,
+                Some(PixelDataExtent::Native { byte_count }),
+            ));
+            index_builder.into_patients()[0].studies[0].series_groups[0]
+                .slices
+                .len()
+        };
+
+        assert_eq!(indexed_frames("YBR_FULL_422", 3 * 512), 3);
+        assert_eq!(indexed_frames("YBR_FULL_422", 3 * 512 - 1), 2);
+        assert_eq!(indexed_frames("YBR_FULL", 3 * 512), 2);
     }
 
     #[test]
