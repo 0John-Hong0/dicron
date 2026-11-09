@@ -117,6 +117,33 @@ impl DecodedFrame {
         })
     }
 
+    /// Approximate bytes this frame keeps in memory: the decoded samples, the
+    /// probe values, the overlay bitmaps and any VOI LUTs. The remaining
+    /// fields are a few numbers.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        let probe_bytes = match &self.pixel_probe {
+            Some(PixelProbeData::Monochrome { values, .. }) => size_of_val(values.as_slice()),
+            Some(PixelProbeData::Rgb { values, .. }) => values.len(),
+            None => 0,
+        };
+        let overlay_bytes: usize = self
+            .overlay_bitmaps
+            .iter()
+            .map(OverlayBitmap::byte_len)
+            .sum();
+        let voi_lut_bytes: usize = self
+            .decoded
+            .voi_lut_sequence()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .iter()
+            .map(|lut| size_of_val(lut.data.as_slice()))
+            .sum();
+
+        self.decoded.data().len() + probe_bytes + overlay_bytes + voi_lut_bytes
+    }
+
     pub(crate) fn window_level_available(&self) -> bool {
         self.window_level_available
     }
@@ -995,6 +1022,43 @@ where
 }
 
 #[cfg(test)]
+/// A decoded 16-bit MONOCHROME2 frame of `rows` x `columns` zero samples.
+pub(crate) fn monochrome_test_frame(rows: u16, columns: u16) -> DecodedFrame {
+    use dicom_object::{FileDicomObject, FileMetaTableBuilder};
+
+    let meta = FileMetaTableBuilder::new()
+        .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+        .media_storage_sop_class_uid(uids::CT_IMAGE_STORAGE)
+        .media_storage_sop_instance_uid("2.25.1201")
+        .build()
+        .unwrap();
+    let mut object = FileDicomObject::new_empty_with_meta(meta);
+    for (tag, value) in [
+        (tags::ROWS, rows),
+        (tags::COLUMNS, columns),
+        (tags::SAMPLES_PER_PIXEL, 1),
+        (tags::BITS_ALLOCATED, 16),
+        (tags::BITS_STORED, 16),
+        (tags::HIGH_BIT, 15),
+        (tags::PIXEL_REPRESENTATION, 0),
+    ] {
+        object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+    }
+    object.put_element(DataElement::new(
+        tags::PHOTOMETRIC_INTERPRETATION,
+        VR::CS,
+        PrimitiveValue::from("MONOCHROME2"),
+    ));
+    object.put_element(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OW,
+        PrimitiveValue::U16(vec![0; usize::from(rows) * usize::from(columns)].into()),
+    ));
+
+    decode_frame(&object, 0).unwrap()
+}
+
+#[cfg(test)]
 pub(crate) fn write_rle_test_slice(
     path: &Path,
     position: &str,
@@ -1092,8 +1156,8 @@ mod tests {
 
     use super::{
         PixelProbeValue, decode_frame, finite_value_range, jpeg_frame_size, jpeg_restart_interval,
-        load_dicom_frame, load_dicom_thumbnail, render_frame, thumbnail_dimensions,
-        write_rle_test_slice,
+        load_dicom_frame, load_dicom_thumbnail, monochrome_test_frame, render_frame,
+        thumbnail_dimensions, write_rle_test_slice,
     };
 
     /// A compressed file cut short must fail to open, not take the
@@ -1328,6 +1392,120 @@ mod tests {
         assert_eq!((thumbnail.width, thumbnail.height), (2, 2));
         assert_eq!(thumbnail.rgba, pixels.rgba);
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// The cache budget sees every pixel three times over: the decoded
+    /// sample, its f64 probe value and the overlay bit, plus any VOI LUT.
+    #[test]
+    fn resident_size_counts_decoded_samples_probe_values_overlays_and_luts() {
+        let mut object = black_two_by_two_image_with_overlay_pixel();
+        let with_overlay = decode_frame(&object, 0).unwrap();
+        // Four 8-bit samples, four f64 probe values and one byte of overlay bits.
+        assert_eq!(with_overlay.resident_bytes(), 4 + 4 * 8 + 1);
+
+        let lut = dicom_object::InMemDicomObject::from_element_iter([
+            DataElement::new(
+                tags::LUT_DESCRIPTOR,
+                VR::US,
+                PrimitiveValue::U16(vec![256_u16, 0, 8].into()),
+            ),
+            DataElement::new(
+                tags::LUT_DATA,
+                VR::OW,
+                PrimitiveValue::U16(vec![0_u16; 256].into()),
+            ),
+        ]);
+        object.put_element(DataElement::new(
+            tags::VOILUT_SEQUENCE,
+            VR::SQ,
+            dicom_core::value::Value::new_sequence(vec![lut], dicom_core::Length::UNDEFINED),
+        ));
+        let with_lut = decode_frame(&object, 0).unwrap();
+        assert_eq!(with_lut.resident_bytes(), 4 + 4 * 8 + 1 + 256 * 2);
+
+        // 2 bytes per 16-bit sample plus 8 per probe value.
+        assert_eq!(
+            monochrome_test_frame(100, 100).resident_bytes(),
+            100 * 100 * 10
+        );
+    }
+
+    fn sixteen_bit_image(
+        photometric_interpretation: &str,
+        bits_stored: u16,
+        pixel_representation: u16,
+        samples: [u16; 4],
+    ) -> DefaultDicomObject {
+        let mut object = black_two_by_two_image_with_overlay_pixel();
+        object.remove_element(Tag(0x6000, 0x3000));
+        for (tag, value) in [
+            (tags::BITS_ALLOCATED, 16_u16),
+            (tags::BITS_STORED, bits_stored),
+            (tags::HIGH_BIT, bits_stored - 1),
+            (tags::PIXEL_REPRESENTATION, pixel_representation),
+        ] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            PrimitiveValue::from(photometric_interpretation),
+        ));
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OW,
+            PrimitiveValue::U16(samples.to_vec().into()),
+        ));
+        object
+    }
+
+    /// A colour frame keeps its samples and one byte per channel for the
+    /// probe; a frame of a multi-frame image keeps only that frame.
+    #[test]
+    fn resident_size_counts_colour_probes_by_channel_and_one_frame_of_many() {
+        let colour = |bits: u16, samples: Vec<u16>| {
+            let mut object = sixteen_bit_image("RGB", bits, 0, [0; 4]);
+            for (tag, value) in [
+                (tags::BITS_ALLOCATED, bits),
+                (tags::SAMPLES_PER_PIXEL, 3),
+                (tags::PLANAR_CONFIGURATION, 0),
+            ] {
+                object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+            }
+            object.put_element(if bits == 8 {
+                DataElement::new(
+                    tags::PIXEL_DATA,
+                    VR::OB,
+                    PrimitiveValue::from(samples.iter().map(|&s| s as u8).collect::<Vec<u8>>()),
+                )
+            } else {
+                DataElement::new(
+                    tags::PIXEL_DATA,
+                    VR::OW,
+                    PrimitiveValue::U16(samples.into()),
+                )
+            });
+            decode_frame(&object, 0).unwrap()
+        };
+        // 2 x 2 x 3 samples of one byte, and the same again for the probe.
+        assert_eq!(colour(8, vec![7; 12]).resident_bytes(), 12 + 12);
+        // Two bytes per 16-bit sample; the probe keeps 8-bit colours.
+        assert_eq!(colour(16, vec![700; 12]).resident_bytes(), 24 + 12);
+
+        let mut frames = sixteen_bit_image("MONOCHROME2", 16, 0, [0; 4]);
+        frames.put_element(DataElement::new(tags::NUMBER_OF_FRAMES, VR::IS, "3"));
+        frames.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OW,
+            PrimitiveValue::U16(vec![1_u16; 12].into()),
+        ));
+        for frame_index in 0..3 {
+            // 4 samples of 2 bytes and 4 probe values of 8 bytes.
+            assert_eq!(
+                decode_frame(&frames, frame_index).unwrap().resident_bytes(),
+                4 * 2 + 4 * 8
+            );
+        }
     }
 
     #[test]

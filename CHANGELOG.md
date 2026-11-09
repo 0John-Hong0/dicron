@@ -10,6 +10,9 @@ This project uses semantic versioning while it remains practical for a small des
   Bound header allocations during scanning and cap frame counts using the pixel data present.
 - Check compressed frame sizes and fragment offsets before decoding, and limit overlay bitmaps
   to the visible image area.
+- Refuse 3D reconstruction when uneven slice spacing would create too many planes. Ignore
+  a low-resolution warning accepted for a series that is no longer selected.
+- Evict older decoded frames and metadata when the cache exceeds its 512 MiB budget.
 
 ## [0.6.1] - 2026-11-03
 
