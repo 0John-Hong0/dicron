@@ -18,6 +18,7 @@ pub(in crate::app) fn upload_display_pixels(
 
 pub(super) fn fit_image_to_available_space(
     texture_size: egui::Vec2,
+    pixel_aspect_ratio: Option<f64>,
     available_size: egui::Vec2,
 ) -> egui::Vec2 {
     let safe_available_size = egui::vec2(available_size.x.max(1.0), available_size.y.max(1.0));
@@ -26,6 +27,10 @@ pub(super) fn fit_image_to_available_space(
         return safe_available_size;
     }
 
+    let texture_size = egui::vec2(
+        texture_size.x,
+        texture_size.y * pixel_aspect_ratio.unwrap_or(1.0) as f32,
+    );
     let width_scale = safe_available_size.x / texture_size.x;
     let height_scale = safe_available_size.y / texture_size.y;
     let scale = width_scale.min(height_scale).max(0.0);

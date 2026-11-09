@@ -8,7 +8,8 @@ use std::str::FromStr;
 use dicom_core::{PrimitiveValue, Tag};
 use dicom_dictionary_std::tags;
 
-use super::model::{PatientGroup, SeriesGroup, SliceItem, StudyGroup};
+use super::model::{InstanceCreationTime, PatientGroup, SeriesGroup, SliceItem, StudyGroup};
+use super::text_encoding::{decode_iso_2022_text, iso_2022_g1_read_as_latin_1};
 
 /// How many frames a file whose pixel data the scan could not measure, such as
 /// a deflated data set, may index. Its declared NumberOfFrames is otherwise
@@ -48,6 +49,7 @@ pub(in crate::dicom) struct DicomIndexMetadata {
     series_number: Option<i32>,
     modality: Option<String>,
     instance_number: Option<i32>,
+    instance_creation_date: Option<u32>,
     instance_creation_time: Option<u64>,
     image_position_patient: Option<[f64; 3]>,
     image_orientation_patient: Option<[f64; 6]>,
@@ -57,13 +59,16 @@ pub(in crate::dicom) struct DicomIndexMetadata {
     samples_per_pixel: Option<u32>,
     bits_allocated: Option<u32>,
     photometric_interpretation: Option<String>,
+    /// Whether the parser read ISO 2022 G1 bytes as Latin-1, from SpecificCharacterSet.
+    iso_2022_g1_read_as_latin_1: bool,
 }
 
 impl DicomIndexMetadata {
     pub(in crate::dicom) fn includes_tag(tag: Tag) -> bool {
         matches!(
             tag,
-            tags::PATIENT_ID
+            tags::SPECIFIC_CHARACTER_SET
+                | tags::PATIENT_ID
                 | tags::PATIENT_NAME
                 | tags::STUDY_INSTANCE_UID
                 | tags::STUDY_DESCRIPTION
@@ -74,6 +79,7 @@ impl DicomIndexMetadata {
                 | tags::SERIES_NUMBER
                 | tags::MODALITY
                 | tags::INSTANCE_NUMBER
+                | tags::INSTANCE_CREATION_DATE
                 | tags::INSTANCE_CREATION_TIME
                 | tags::IMAGE_POSITION_PATIENT
                 | tags::IMAGE_ORIENTATION_PATIENT
@@ -87,7 +93,13 @@ impl DicomIndexMetadata {
     }
 
     pub(in crate::dicom) fn put_primitive(&mut self, tag: Tag, value: &PrimitiveValue) {
+        let g1_read_as_latin_1 = self.iso_2022_g1_read_as_latin_1;
+        let text_value = |value| text_value(value, g1_read_as_latin_1);
         match tag {
+            // (0008,0005) comes before the text values.
+            tags::SPECIFIC_CHARACTER_SET => {
+                self.iso_2022_g1_read_as_latin_1 = iso_2022_g1_read_as_latin_1(&value.to_str());
+            }
             tags::PATIENT_ID => self.patient_id = text_value(value),
             tags::PATIENT_NAME => self.patient_name = text_value(value),
             tags::STUDY_INSTANCE_UID => self.study_instance_uid = text_value(value),
@@ -99,6 +111,7 @@ impl DicomIndexMetadata {
             tags::SERIES_NUMBER => self.series_number = first_parsed_value(value),
             tags::MODALITY => self.modality = text_value(value),
             tags::INSTANCE_NUMBER => self.instance_number = first_parsed_value(value),
+            tags::INSTANCE_CREATION_DATE => self.instance_creation_date = date_value(value),
             tags::INSTANCE_CREATION_TIME => self.instance_creation_time = time_value(value),
             tags::IMAGE_POSITION_PATIENT => self.image_position_patient = parsed_array_value(value),
             tags::IMAGE_ORIENTATION_PATIENT => {
@@ -169,7 +182,7 @@ pub(in crate::dicom) struct DicomIndexEntry {
     modality: Option<String>,
     file_path: std::path::PathBuf,
     instance_number: Option<i32>,
-    instance_creation_time: Option<u64>,
+    instance_creation_time: Option<InstanceCreationTime>,
     sort_position: Option<f64>,
     number_of_frames: u32,
 }
@@ -205,12 +218,18 @@ impl DicomIndexEntry {
             series_number,
             modality,
             instance_number,
+            instance_creation_date,
             instance_creation_time,
             image_position_patient,
             image_orientation_patient,
             number_of_frames,
             ..
         } = metadata;
+        let instance_creation_time =
+            instance_creation_time.map(|time_of_day| InstanceCreationTime {
+                date: instance_creation_date,
+                time_of_day,
+            });
         let sort_position = compute_slice_sort_position_from_values(
             image_position_patient,
             image_orientation_patient,
@@ -514,27 +533,54 @@ pub(in crate::dicom) fn sort_index(patients: &mut [PatientGroup]) {
             });
 
             for series in &mut study.series_groups {
-                series.slices.sort_by(compare_slice_items);
+                sort_slices(&mut series.slices);
             }
         }
     }
 }
 
-fn compare_slice_items(left: &SliceItem, right: &SliceItem) -> Ordering {
+fn sort_slices(slices: &mut [SliceItem]) {
+    // Creation dates order the series only when every slice ordered by its
+    // creation time has one. Comparing dates just where both slices carry one
+    // is not a consistent order: day one 23:59 < day two 00:00 by date, but an
+    // undated 12:00 would sort after the first and before the second by time.
+    let compare_creation_dates = slices
+        .iter()
+        .filter(|slice| slice.instance_number.is_none())
+        .filter_map(|slice| slice.instance_creation_time)
+        .all(|creation_time| creation_time.date.is_some());
+    slices.sort_by(|left, right| compare_slice_items(left, right, compare_creation_dates));
+}
+
+fn compare_slice_items(
+    left: &SliceItem,
+    right: &SliceItem,
+    compare_creation_dates: bool,
+) -> Ordering {
     let instance_order = match (left.instance_number, right.instance_number) {
         (Some(left), Some(right)) => left.cmp(&right),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
-        (None, None) => left
-            .instance_creation_time
-            .unwrap_or(u64::MAX)
-            .cmp(&right.instance_creation_time.unwrap_or(u64::MAX)),
+        (None, None) => creation_order(left, compare_creation_dates)
+            .cmp(&creation_order(right, compare_creation_dates)),
     };
 
     instance_order
         .then_with(|| compare_optional_f64(left.sort_position, right.sort_position))
         .then_with(|| left.path.cmp(&right.path))
         .then_with(|| left.frame_index.cmp(&right.frame_index))
+}
+
+/// The creation date and time a slice sorts by; slices without a creation
+/// time sort after the others.
+fn creation_order(slice: &SliceItem, compare_creation_dates: bool) -> (u32, u64) {
+    match slice.instance_creation_time {
+        Some(creation_time) => {
+            let date = creation_time.date.filter(|_| compare_creation_dates);
+            (date.unwrap_or(0), creation_time.time_of_day)
+        }
+        None => (u32::MAX, u64::MAX),
+    }
 }
 
 fn compare_optional_f64(left: Option<f64>, right: Option<f64>) -> Ordering {
@@ -580,9 +626,12 @@ fn project_onto_slice_normal(position: [f64; 3], orientation: [f64; 6]) -> f64 {
     position[0] * normal[0] + position[1] * normal[1] + position[2] * normal[2]
 }
 
-fn text_value(value: &PrimitiveValue) -> Option<String> {
+fn text_value(value: &PrimitiveValue, g1_read_as_latin_1: bool) -> Option<String> {
     let raw = value.to_str();
-    let value = raw.trim().trim_matches('\0').replace('\\', ", ");
+    let value = decode_iso_2022_text(&raw, g1_read_as_latin_1)
+        .trim()
+        .trim_matches('\0')
+        .replace('\\', ", ");
     (!value.is_empty()).then_some(value)
 }
 
@@ -599,6 +648,17 @@ where
         .trim()
         .parse()
         .ok()
+}
+
+/// A date as the number `YYYYMMDD`, so that dates compare in calendar order.
+/// Omitted month or day components are zero.
+fn date_value(value: &PrimitiveValue) -> Option<u32> {
+    let date = value.to_date().ok()?;
+    Some(
+        u32::from(*date.year()) * 10_000
+            + u32::from(date.month().copied().unwrap_or(0)) * 100
+            + u32::from(date.day().copied().unwrap_or(0)),
+    )
 }
 
 fn time_value(value: &PrimitiveValue) -> Option<u64> {
@@ -655,7 +715,7 @@ mod tests {
         for rotation in 0..slices.len() {
             let mut sorted = slices.clone();
             sorted.rotate_left(rotation);
-            sorted.sort_by(compare_slice_items);
+            sort_slices(&mut sorted);
 
             let names: Vec<_> = sorted
                 .iter()
@@ -670,7 +730,7 @@ mod tests {
             for slice in &mut sorted {
                 slice.instance_number = None;
             }
-            sorted.sort_by(compare_slice_items);
+            sort_slices(&mut sorted);
             let names: Vec<_> = sorted
                 .iter()
                 .map(|slice| slice.path.to_str().unwrap())

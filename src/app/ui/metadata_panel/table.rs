@@ -58,8 +58,8 @@ pub(super) fn show(
             .show_rows(ui, ROW_HEIGHT, rows.len() + 1, |ui, range| {
                 let widths = ColumnWidths::for_available_width(ui.available_width());
                 let stride = ROW_HEIGHT + ROW_GAP;
-                // Widget identities follow screen slots while expansion follows source paths.
-                // This also avoids egui's rect/ID warnings when whole rows scroll past a slot.
+                // Each cell's widgets follow its row's item (see row_cell), wrapped in a
+                // scope that follows the screen slot to keep egui's rect/ID check quiet.
                 let anchor = range.start as i64
                     + ((ui.max_rect().top() - ui.clip_rect().top()) / stride).floor() as i64;
                 egui::Grid::new("dicom_metadata_table_grid")
@@ -78,60 +78,71 @@ pub(super) fn show(
                             } else {
                                 let row = &rows[index - 1];
                                 let slot = index as i64 - anchor;
-                                ui.scope_builder(
-                                    egui::UiBuilder::new().id(ui.id().with((
-                                        "metadata_cell",
-                                        slot,
-                                        0,
-                                    ))),
-                                    |ui| {
-                                        cell(
-                                            ui,
-                                            widths.tag,
-                                            &row.item.tag,
-                                            "Copy tag ID",
-                                            &row.item.path,
-                                        );
-                                    },
-                                );
-                                ui.scope_builder(
-                                    egui::UiBuilder::new().id(ui.id().with((
-                                        "metadata_cell",
-                                        slot,
-                                        1,
-                                    ))),
-                                    |ui| {
-                                        description_cell(
-                                            ui,
-                                            widths.description,
-                                            row,
-                                            expanded_paths,
-                                            searching,
-                                        );
-                                    },
-                                );
-                                ui.scope_builder(
-                                    egui::UiBuilder::new().id(ui.id().with((
-                                        "metadata_cell",
-                                        slot,
-                                        2,
-                                    ))),
-                                    |ui| {
-                                        cell(
-                                            ui,
-                                            widths.value,
-                                            &row.item.value,
-                                            "Copy value",
-                                            &row.item.path,
-                                        );
-                                    },
-                                );
+                                row_cell(ui, slot, row.item, 0, |ui| {
+                                    cell(
+                                        ui,
+                                        widths.tag,
+                                        &row.item.tag,
+                                        "Copy tag ID",
+                                        &row.item.path,
+                                    );
+                                });
+                                row_cell(ui, slot, row.item, 1, |ui| {
+                                    description_cell(
+                                        ui,
+                                        widths.description,
+                                        row,
+                                        expanded_paths,
+                                        searching,
+                                    );
+                                });
+                                row_cell(ui, slot, row.item, 2, |ui| {
+                                    cell(
+                                        ui,
+                                        widths.value,
+                                        &row.item.value,
+                                        "Copy value",
+                                        &row.item.path,
+                                    );
+                                });
                             }
                             ui.end_row();
                         }
                     });
             });
     });
+}
+
+/// Shows one cell under ids that follow its row, so a text selection or an
+/// open menu stays with the row it was made on while the table scrolls.
+///
+/// A row is keyed by its item's path and occurrence, which name one item in the
+/// metadata tree whichever rows scroll, expand or filter, and the same element
+/// on the next slice. The path alone is not enough: a file can repeat an
+/// element, such as a File Meta element inside its data set, and both rows then
+/// share a path.
+///
+/// The cell is wrapped in a scope keyed by its screen slot. egui's debug check
+/// flags a rect that changes id between passes, and the slot id that stays at
+/// the same rect tells it that rows only scrolled past.
+fn row_cell(
+    ui: &mut egui::Ui,
+    slot: i64,
+    item: &MetadataItem,
+    column: usize,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    let table_id = ui.id();
+    let row_key = (item.path.as_str(), item.occurrence);
+    ui.scope_builder(
+        egui::UiBuilder::new().id(table_id.with(("metadata_cell", slot, column))),
+        |ui| {
+            ui.scope_builder(
+                egui::UiBuilder::new().id(table_id.with(("metadata_row_cell", row_key, column))),
+                add_contents,
+            );
+        },
+    );
 }
 
 fn header_cell(ui: &mut egui::Ui, width: f32, text: &str) {
@@ -425,6 +436,379 @@ mod tests {
         );
     }
 
+    fn numbered_items(count: usize) -> Vec<MetadataItem> {
+        (0..count)
+            .map(|index| {
+                MetadataItem::new(
+                    format!("(7777,{index:04X})"),
+                    "SH".to_owned(),
+                    format!("Value{index:03}"),
+                )
+            })
+            .collect()
+    }
+
+    fn text_rect(output: &egui::FullOutput, wanted: &str) -> egui::Rect {
+        texts(output)
+            .into_iter()
+            .find(|(text, _)| text == wanted)
+            .unwrap()
+            .1
+    }
+
+    /// Scroll the table down by `rows` rows and draw `frames` more frames, as
+    /// the scroll animates; returns the output of every frame.
+    fn scroll_rows(
+        context: &egui::Context,
+        items: &[MetadataItem],
+        expanded: &mut HashSet<String>,
+        rows: f32,
+        frames: usize,
+    ) -> Vec<egui::FullOutput> {
+        let mut outputs = vec![frame(
+            context,
+            items,
+            expanded,
+            "",
+            vec![
+                egui::Event::PointerMoved(egui::pos2(250.0, 120.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    phase: egui::TouchPhase::Move,
+                    delta: egui::vec2(0.0, -(ROW_HEIGHT + ROW_GAP) * rows),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )];
+        for _ in 0..frames {
+            outputs.push(frame(context, items, expanded, "", Vec::new()));
+        }
+        outputs
+    }
+
+    /// Red outlines egui paints in debug builds where a rect changed id
+    /// between passes.
+    #[cfg(debug_assertions)]
+    fn id_change_warnings(output: &egui::FullOutput) -> usize {
+        output
+            .shapes
+            .iter()
+            .filter(|clipped| {
+                clipped.clip_rect == egui::Rect::EVERYTHING
+                    && matches!(&clipped.shape, egui::epaint::Shape::Rect(rect)
+                        if rect.stroke.color == egui::Color32::RED && rect.stroke.width == 2.0)
+            })
+            .count()
+    }
+
+    fn copied_texts(output: &egui::FullOutput) -> Vec<&str> {
+        output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A selection belongs to the row it was made on: after the table scrolls,
+    /// Ctrl+C copies that row's value, not the one now drawn where it was.
+    #[test]
+    fn copying_a_selected_value_after_scrolling_copies_the_selected_row() {
+        let context = egui::Context::default();
+        let items = numbered_items(200);
+        let mut expanded = HashSet::new();
+        frame(&context, &items, &mut expanded, "", Vec::new());
+        let output = frame(&context, &items, &mut expanded, "", Vec::new());
+        let selected = text_rect(&output, "Value006");
+        let start = egui::pos2(selected.left() + 1.0, selected.center().y);
+        let end = egui::pos2(selected.right() + 4.0, selected.center().y);
+        frame(
+            &context,
+            &items,
+            &mut expanded,
+            "",
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            &context,
+            &items,
+            &mut expanded,
+            "",
+            vec![egui::Event::PointerMoved(end)],
+        );
+        frame(
+            &context,
+            &items,
+            &mut expanded,
+            "",
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+
+        let output = scroll_rows(&context, &items, &mut expanded, 5.0, 16)
+            .pop()
+            .unwrap();
+        assert_eq!(text_rect(&output, "Value011").top(), selected.top());
+        let output = frame(&context, &items, &mut expanded, "", vec![egui::Event::Copy]);
+
+        assert_eq!(copied_texts(&output), ["Value006"]);
+    }
+
+    /// A cell's menu belongs to the row it was opened on, so Copy value after
+    /// a scroll copies that row's value.
+    #[test]
+    fn copy_value_from_a_cell_menu_after_scrolling_copies_the_menus_row() {
+        let context = egui::Context::default();
+        let items = numbered_items(200);
+        let mut expanded = HashSet::new();
+        frame(&context, &items, &mut expanded, "", Vec::new());
+        let output = frame(&context, &items, &mut expanded, "", Vec::new());
+        let opened_on = text_rect(&output, "Value006");
+        click(
+            &context,
+            &items,
+            &mut expanded,
+            opened_on.center(),
+            egui::PointerButton::Secondary,
+        );
+
+        let output = scroll_rows(&context, &items, &mut expanded, 5.0, 16)
+            .pop()
+            .unwrap();
+        assert_eq!(text_rect(&output, "Value011").top(), opened_on.top());
+        let action = text_rect(&output, "Copy value");
+        let output = click(
+            &context,
+            &items,
+            &mut expanded,
+            action.center(),
+            egui::PointerButton::Primary,
+        );
+
+        assert_eq!(copied_texts(&output), ["Value006"]);
+    }
+
+    /// Drag across the value cell showing `wanted` with the empty query.
+    fn select_value(
+        context: &egui::Context,
+        items: &[MetadataItem],
+        expanded: &mut HashSet<String>,
+        wanted: &str,
+    ) -> egui::Rect {
+        frame(context, items, expanded, "", Vec::new());
+        let output = frame(context, items, expanded, "", Vec::new());
+        let selected = text_rect(&output, wanted);
+        let start = egui::pos2(selected.left() + 1.0, selected.center().y);
+        let end = egui::pos2(selected.right() + 4.0, selected.center().y);
+        frame(
+            context,
+            items,
+            expanded,
+            "",
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        frame(
+            context,
+            items,
+            expanded,
+            "",
+            vec![egui::Event::PointerMoved(end)],
+        );
+        frame(
+            context,
+            items,
+            expanded,
+            "",
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        selected
+    }
+
+    /// Rows also move without a scroll, when a sequence above the selection
+    /// opens: the selection stays with its row.
+    #[test]
+    fn copying_a_selected_value_after_a_sequence_above_opens_copies_the_selected_row() {
+        let context = egui::Context::default();
+        let mut items = super::super::tree::tests::fixture();
+        items.truncate(1);
+        items.extend(numbered_items(20));
+        let mut expanded = HashSet::new();
+        select_value(&context, &items, &mut expanded, "Value003");
+
+        expanded.insert(items[0].path.clone());
+        let output = frame(&context, &items, &mut expanded, "", Vec::new());
+        assert!(texts(&output).iter().any(|(text, _)| text == "Item 2"));
+        let output = frame(&context, &items, &mut expanded, "", vec![egui::Event::Copy]);
+
+        assert_eq!(copied_texts(&output), ["Value003"]);
+    }
+
+    /// Typing a search query moves the matching rows up: the selection made
+    /// before stays with its row.
+    #[test]
+    fn copying_a_selected_value_after_the_search_moves_it_copies_the_selected_row() {
+        let context = egui::Context::default();
+        let items = numbered_items(20);
+        let mut expanded = HashSet::new();
+        let selected_top = select_value(&context, &items, &mut expanded, "Value006").top();
+
+        let output = frame(&context, &items, &mut expanded, "value006", Vec::new());
+        assert!(!texts(&output).iter().any(|(text, _)| text == "Value000"));
+        assert!(text_rect(&output, "Value006").top() < selected_top);
+        let output = frame(
+            &context,
+            &items,
+            &mut expanded,
+            "value006",
+            vec![egui::Event::Copy],
+        );
+
+        assert_eq!(copied_texts(&output), ["Value006"]);
+    }
+
+    /// A file can repeat a File Meta element inside its dataset, so the full
+    /// list holds two rows with the same tag and path. Each row keeps its own
+    /// selection: selecting the second copies the second's value.
+    fn items_repeating_a_path() -> Vec<MetadataItem> {
+        let mut items = numbered_items(4);
+        for value in ["MetaCopy", "DatasetCopy"] {
+            items.push(MetadataItem::new(
+                "(0002,0013)".to_owned(),
+                "ImplementationVersionName".to_owned(),
+                value.to_owned(),
+            ));
+        }
+        MetadataItem::number_repeated_paths(&mut items);
+        items
+    }
+
+    #[test]
+    fn rows_that_share_a_path_keep_separate_selections() {
+        let context = egui::Context::default();
+        let items = items_repeating_a_path();
+        let mut expanded = HashSet::new();
+        select_value(&context, &items, &mut expanded, "DatasetCopy");
+
+        let output = frame(&context, &items, &mut expanded, "", vec![egui::Event::Copy]);
+
+        assert_eq!(copied_texts(&output), ["DatasetCopy"]);
+    }
+
+    /// A search that hides one of two rows sharing a path leaves the other
+    /// row's selection its own: the hidden row's selection does not pass to
+    /// the copy still shown, and the shown copy keeps its selection.
+    #[test]
+    fn rows_that_share_a_path_keep_separate_selections_while_a_search_hides_one() {
+        for (selected, query, copied) in [
+            ("MetaCopy", "datasetcopy", None),
+            ("DatasetCopy", "datasetcopy", Some("DatasetCopy")),
+            ("MetaCopy", "metacopy", Some("MetaCopy")),
+            ("DatasetCopy", "metacopy", None),
+        ] {
+            let context = egui::Context::default();
+            let items = items_repeating_a_path();
+            let mut expanded = HashSet::new();
+            select_value(&context, &items, &mut expanded, selected);
+
+            let output = frame(&context, &items, &mut expanded, query, Vec::new());
+            assert_eq!(
+                texts(&output)
+                    .iter()
+                    .filter(|(text, _)| text.ends_with("Copy"))
+                    .count(),
+                1
+            );
+            let output = frame(
+                &context,
+                &items,
+                &mut expanded,
+                query,
+                vec![egui::Event::Copy],
+            );
+
+            assert_eq!(
+                copied_texts(&output),
+                copied.as_slice(),
+                "{selected} selected, searching {query}"
+            );
+        }
+    }
+
+    /// When the metadata is replaced, as the viewer steps to the next slice,
+    /// the new rows can land in memory the old rows used. A selection stays
+    /// with its element: here the next slice lacks the first element, and the
+    /// rows after it shift down into the same storage.
+    #[test]
+    fn a_selection_stays_with_its_element_when_another_row_takes_its_memory() {
+        let context = egui::Context::default();
+        let mut items = numbered_items(20);
+        let mut expanded = HashSet::new();
+        select_value(&context, &items, &mut expanded, "Value006");
+
+        let storage = items.as_ptr();
+        items.remove(0);
+        assert_eq!(items.as_ptr(), storage);
+        let output = frame(&context, &items, &mut expanded, "", Vec::new());
+        assert!(!texts(&output).iter().any(|(text, _)| text == "Value000"));
+        let output = frame(&context, &items, &mut expanded, "", vec![egui::Event::Copy]);
+
+        assert_eq!(copied_texts(&output), ["Value006"]);
+    }
+
+    /// Cells take their ids from their rows, yet egui sees no rect change its
+    /// id while wheel steps of whole and half rows land mid-animation.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn scrolling_rows_raises_no_id_warnings() {
+        let context = egui::Context::default();
+        let items = numbered_items(500);
+        let mut expanded = HashSet::new();
+        frame(&context, &items, &mut expanded, "", Vec::new());
+        let mut outputs = Vec::new();
+        for _ in 0..10 {
+            for rows in [1.0, 5.0, 0.5, 3.0] {
+                outputs.extend(scroll_rows(&context, &items, &mut expanded, rows, 5));
+            }
+        }
+
+        assert!(
+            !texts(outputs.last().unwrap())
+                .iter()
+                .any(|(text, _)| text == "Value000")
+        );
+        for output in &outputs {
+            assert_eq!(id_change_warnings(output), 0);
+        }
+    }
+
     #[test]
     fn large_lists_keep_fixed_columns_and_stable_ids_while_scrolling() {
         let context = egui::Context::default();
@@ -495,8 +879,7 @@ mod tests {
             assert_eq!(geometry(&output), initial_geometry);
             assert!(texts(&output).len() < 80);
             #[cfg(debug_assertions)]
-            assert!(!output.shapes.iter().any(|clipped| clipped.clip_rect == egui::Rect::EVERYTHING && matches!(&clipped.shape,
-                egui::epaint::Shape::Rect(rect) if rect.stroke.color == egui::Color32::RED && rect.stroke.width == 2.0)));
+            assert_eq!(id_change_warnings(&output), 0);
         }
     }
 }

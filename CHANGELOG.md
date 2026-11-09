@@ -20,6 +20,10 @@ This project uses semantic versioning while it remains practical for a small des
 - Display native YBR_FULL_422 images in RGB and index all complete frames.
 - Correct YBR_FULL colors in native and compressed images, and decode deflated YBR_FULL_422 frames.
 - Recompute the Full Dynamic window from the current slice or frame.
+- Show both side orientation letters and use DICOM pixel spacing or aspect ratio for 2D proportions.
+- Decode Korean and Japanese ISO 2022 text and recognize more undeclared Korean text in Auto mode.
+- Use creation dates when sorting images across midnight, and keep metadata copy selections tied
+  to their elements when scrolling or searching.
 
 ## [0.6.1] - 2026-11-03
 
