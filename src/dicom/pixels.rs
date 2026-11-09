@@ -323,6 +323,7 @@ impl FrameLayout {
         u64::from(self.bits_allocated.div_ceil(8))
     }
 
+    /// Native frame length, with one-bit samples packed into bytes.
     fn frame_bytes(self) -> u64 {
         let samples = self.pixels() * u64::from(self.samples_per_pixel);
         if self.bits_allocated == 1 {
@@ -468,7 +469,7 @@ fn jpeg_restart_interval(stream: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes(interval.get(..2)?.try_into().ok()?))
 }
 
-/// The marker segments of a JPEG or JPEG-LS stream before its first scan, as
+/// The marker segments of a JPEG or JPEG-LS stream through its first scan header, as
 /// marker and contents, or none when the stream does not start with SOI. Like
 /// jpeg-decoder, bytes between segments and fill bytes before a marker are
 /// skipped.
@@ -496,18 +497,32 @@ fn jpeg_header_segments(stream: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
                 marker => break marker,
             }
         };
-        // The first scan starts.
-        if marker == 0xDA {
-            return None;
-        }
         let length = usize::from(u16::from_be_bytes([
             *stream.get(position)?,
             *stream.get(position + 1)?,
         ]));
         let contents = stream.get(position + 2..position + length)?;
-        position += length;
+        position = if marker == 0xDA {
+            stream.len()
+        } else {
+            position + length
+        };
         Some((marker, contents))
     })
+}
+
+/// CharLS writes separate planes for interleave mode 0 and packed pixels for
+/// line and sample interleaving. The JPEG-LS scan header specifies the mode.
+fn jpeg_ls_samples_by_plane(stream: &[u8]) -> Result<bool> {
+    let (_, scan) = jpeg_header_segments(stream)
+        .find(|&(marker, _)| marker == 0xDA)
+        .context("missing JPEG-LS scan header")?;
+    let (&components, fields) = scan.split_first().context("empty JPEG-LS scan header")?;
+    match (components, fields.get(2 * usize::from(components)..)) {
+        (1, Some([_, 0, _])) => Ok(true),
+        (3, Some([_, 1 | 2, _])) => Ok(false),
+        _ => bail!("invalid JPEG-LS color interleave mode"),
+    }
 }
 
 /// The size of a frame as its codestream declares it. The library decoders
@@ -710,6 +725,7 @@ fn ybr_full_422_frame_bytes(layout: FrameLayout) -> Result<u64> {
     Ok(layout.pixels() * 2)
 }
 
+/// Read the sample layout of a native color frame.
 fn planar_configuration(object: &DefaultDicomObject) -> Result<u16> {
     let value = object
         .element(tags::PLANAR_CONFIGURATION)?
@@ -800,6 +816,7 @@ fn ybr_full_422_frame(
     rgb_decoding_copy(object, frame, VR::OB, PrimitiveValue::from(rgb))
 }
 
+/// Check that the layout fits the 8-bit or 16-bit YBR converter.
 fn validate_ybr_full_layout(layout: FrameLayout) -> Result<()> {
     ensure!(
         layout.samples_per_pixel == 3
@@ -1090,12 +1107,14 @@ fn decode_pixel_frame_inner(
             "this JPEG Lossless image uses restart intervals, which the JPEG decoder reads wrongly"
         );
     }
+    let mut ybr_by_plane = false;
     if let Some(layout) = layout
         && let Some(read_size) = codestream_size_reader(transfer_syntax)
     {
-        let size = object
+        let stream = object
             .frame_pixel_data(frame)
-            .and_then(|stream| read_size(&stream))
+            .context("the compressed pixel data is damaged: its frame header is missing")?;
+        let size = read_size(&stream)
             .context("the compressed pixel data is damaged: its frame header is missing")?;
         ensure!(
             size.agrees_with(layout),
@@ -1108,6 +1127,14 @@ fn decode_pixel_frame_inner(
             layout.rows,
             layout.samples_per_pixel
         );
+        if photometric == Some(PhotometricInterpretation::YbrFull)
+            && matches!(
+                transfer_syntax,
+                uids::JPEGLS_LOSSLESS | uids::JPEGLS_NEAR_LOSSLESS
+            )
+        {
+            ybr_by_plane = jpeg_ls_samples_by_plane(&stream)?;
+        }
     }
     // RLE and Deflated Image Frame Compression store one fragment per frame.
     if single_fragment_codec {
@@ -1166,7 +1193,7 @@ fn decode_pixel_frame_inner(
         && photometric == Some(PhotometricInterpretation::YbrFull)
         && decodes_colour_as_stored(transfer_syntax)
     {
-        let native = ybr_full_frame(object, frame, layout, decoded.data(), false)?;
+        let native = ybr_full_frame(object, frame, layout, decoded.data(), ybr_by_plane)?;
         return Ok(native.decode_pixel_data_frame(0)?.to_owned());
     }
     Ok(decoded)
@@ -3743,9 +3770,9 @@ mod tests {
         stream
     }
 
-    /// All four paths receive the same YBR samples and produce the same RGB.
+    /// Native, RLE, and deflated frames produce the same RGB.
     #[test]
-    fn ybr_full_colors_match_for_native_rle_deflate_and_jpeg_ls() {
+    fn ybr_full_colors_match_for_native_rle_and_deflate() {
         let stored = [50_u8, 90, 170, 200, 90, 170];
         let samples = stored.map(u16::from);
         let mut native =
@@ -3771,13 +3798,55 @@ mod tests {
             8,
             raw_deflate(&stored),
         );
-        let jpeg_ls = encoded_object(uids::JPEGLS_LOSSLESS, (1, 2, 3), 8, &samples);
-        for (name, mut object) in [
-            ("native", native),
-            ("RLE", rle),
-            ("deflated", deflated),
-            ("JPEG-LS", jpeg_ls),
-        ] {
+        for (name, mut object) in [("native", native), ("RLE", rle), ("deflated", deflated)] {
+            set_layout(&mut object, 3);
+            object.put_element(DataElement::new(
+                tags::PHOTOMETRIC_INTERPRETATION,
+                VR::CS,
+                "YBR_FULL",
+            ));
+            let frame =
+                decode_frame(&object, 0).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_eq!(
+                rgb(&render_frame(&frame, None).unwrap().rgba),
+                [[109, 33, 0], [255, 183, 133]],
+                "{name}"
+            );
+        }
+    }
+
+    /// These CharLS fixtures encode the same two pixels with three layouts.
+    #[test]
+    fn ybr_full_jpeg_ls_uses_the_layout_from_the_scan_header() {
+        const HEADER: &[u8] = &[
+            0xff, 0xd8, 0xff, 0xf7, 0x00, 0x11, 0x08, 0x00, 0x01, 0x00, 0x02, 0x03, 0x01, 0x11,
+            0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+        ];
+        const PLANAR: &[u8] = &[
+            0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x62,
+            0x00, 0x00, 0x01, 0xd3, 0xff, 0xda, 0x00, 0x08, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0xb2, 0x80, 0xff, 0xda, 0x00, 0x08, 0x01, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0xa9, 0x80, 0xff, 0xd9,
+        ];
+        const LINE: &[u8] = &[
+            0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x01, 0x62, 0x00, 0x00, 0x01, 0xd3, 0x03, 0x38, 0x23, 0x54, 0x10, 0xff,
+            0xd9,
+        ];
+        const SAMPLE: &[u8] = &[
+            0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x01, 0x63, 0x06, 0x86, 0xb0, 0x00, 0x00, 0x1d, 0x38, 0x30, 0x40, 0xff,
+            0xd9,
+        ];
+        for (name, scan) in [("planar", PLANAR), ("line", LINE), ("sample", SAMPLE)] {
+            let mut object = compressed_test_object(
+                uids::JPEGLS_LOSSLESS,
+                VR::US,
+                1,
+                2,
+                8,
+                [HEADER, scan].concat(),
+            );
             set_layout(&mut object, 3);
             object.put_element(DataElement::new(
                 tags::PHOTOMETRIC_INTERPRETATION,

@@ -903,6 +903,7 @@ pub(in crate::app) struct PreparedFrame {
     metadata: crate::dicom::DicomMetadata,
 }
 
+/// Render a loaded frame and recalculate a saved Full Dynamic preset.
 pub(in crate::app) fn prepare_frame(
     entry: &DecodedCacheEntry,
     saved_window_level: Option<SavedWindowLevel>,
