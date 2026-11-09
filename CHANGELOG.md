@@ -13,6 +13,7 @@ This project uses semantic versioning while it remains practical for a small des
 - Refuse 3D reconstruction when uneven slice spacing would create too many planes. Ignore
   a low-resolution warning accepted for a series that is no longer selected.
 - Evict older decoded frames and metadata when the cache exceeds its 512 MiB budget.
+- Use the measured intensity range for grayscale images without a usable DICOM window or contrast lookup table.
 
 ## [0.6.1] - 2026-11-03
 

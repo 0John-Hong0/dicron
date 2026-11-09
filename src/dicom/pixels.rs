@@ -82,17 +82,21 @@ pub(crate) struct DecodedFrame {
     pub(crate) frame_count: u32,
     /// The file's own WindowCenter/WindowWidth, when present and finite.
     pub(crate) default_window: Option<DicomWindow>,
-    /// Rescaled (modality-LUT) value range, used to seed a sane default window
-    /// when the file carries none and to bound interactive windowing.
+    /// The window the frame is drawn with when none is requested, if the file
+    /// leaves it to the viewer; see [`implicit_window`].
+    implicit_window: Option<DicomWindow>,
+    /// Rescaled (modality-LUT) value range, used to bound interactive windowing
+    /// and to seed a default window when neither the file nor the frame's
+    /// drawing provides one.
     pub(crate) value_range: (f64, f64),
     window_level_available: bool,
 }
 
 impl DecodedFrame {
-    /// Default window for the UI readout / reset: the file's own window when
-    /// present, otherwise a full-range window derived from the data.
+    /// Use the inferred display window in the UI when available. Otherwise use
+    /// the file's window or derive the readout from the value range.
     pub(crate) fn default_center_width(&self) -> (f64, f64) {
-        if let Some(window) = self.default_window {
+        if let Some(window) = self.implicit_window.or(self.default_window) {
             return (window.center, window.width.max(1.0));
         }
 
@@ -109,12 +113,7 @@ impl DecodedFrame {
         }
 
         let values = self.decoded.to_vec_frame::<f64>(0).ok()?;
-        let (minimum, maximum) = finite_value_range(&values)?;
-
-        Some(DicomWindow {
-            center: minimum / 2.0 + maximum / 2.0,
-            width: (maximum - minimum).max(1.0),
-        })
+        finite_value_range(&values).map(spanning_window)
     }
 
     /// Approximate bytes this frame keeps in memory: the decoded samples, the
@@ -225,7 +224,14 @@ pub(crate) fn load_dicom_thumbnail(
         decoded.columns(),
         decoded.rows(),
     );
-    let rgba = contain_decoder_panic(|| render_decoded_frame(&decoded, None, &overlay_bitmaps))?;
+    let rgba = contain_decoder_panic(|| {
+        let implicit_window = implicit_window(&decoded, &overlay_bitmaps, || {
+            decoded
+                .to_vec_frame::<f64>(0)
+                .context("could not read rescaled grayscale values")
+        })?;
+        render_decoded_frame(&decoded, None, implicit_window, &overlay_bitmaps)
+    })?;
     let (width, height) = thumbnail_dimensions(rgba.width(), rgba.height(), max_edge.max(1));
     let rgba = if (width, height) == (rgba.width(), rgba.height()) {
         rgba
@@ -691,6 +697,10 @@ fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<D
     let pixel_probe = build_pixel_probe(&decoded);
     let overlay_bitmaps =
         read_overlay_bitmaps(dicom_object, frame_index, decoded.columns(), decoded.rows());
+    let implicit_window = implicit_window(&decoded, &overlay_bitmaps, || match &pixel_probe {
+        Some(PixelProbeData::Monochrome { values, .. }) => Ok(values.as_slice()),
+        _ => bail!("could not read rescaled grayscale values"),
+    })?;
 
     Ok(DecodedFrame {
         decoded,
@@ -698,6 +708,7 @@ fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<D
         pixel_probe,
         frame_count,
         default_window: read_default_window(dicom_object),
+        implicit_window,
         value_range: compute_value_range(dicom_object),
         window_level_available,
     })
@@ -873,14 +884,19 @@ fn build_pixel_probe(decoded: &DecodedPixelData<'_>) -> Option<PixelProbeData> {
 
 /// Convert a cached decoded frame to an image with the requested window/level.
 /// `window == None` defers to the file's own VOI (embedded window or VOI LUT
-/// sequence, falling back to min-max normalization) instead of fabricating a
-/// fixed window, which is correct across CT/MR/PET and arbitrary bit depths.
+/// sequence) instead of fabricating a fixed window, and draws a frame that
+/// states neither over its full dynamic range.
 pub(crate) fn render_frame(
     frame: &DecodedFrame,
     window: Option<DicomWindow>,
 ) -> Result<DisplayPixels> {
     let rgba = contain_decoder_panic(|| {
-        render_decoded_frame(&frame.decoded, window, &frame.overlay_bitmaps)
+        render_decoded_frame(
+            &frame.decoded,
+            window,
+            frame.implicit_window,
+            &frame.overlay_bitmaps,
+        )
     })?;
 
     Ok(DisplayPixels {
@@ -890,12 +906,15 @@ pub(crate) fn render_frame(
     })
 }
 
+/// Render a frame with `window`; when that is `None`, with `implicit_window`,
+/// and when both are `None`, with the file's own window or VOI LUT.
 fn render_decoded_frame(
     decoded: &DecodedPixelData<'_>,
     window: Option<DicomWindow>,
+    implicit_window: Option<DicomWindow>,
     overlay_bitmaps: &[OverlayBitmap],
 ) -> Result<image::RgbaImage> {
-    let voi_lut = match window {
+    let voi_lut = match window.or(implicit_window) {
         Some(window) if window.center.is_finite() && window.width.is_finite() => {
             VoiLutOption::Custom(WindowLevel {
                 center: window.center,
@@ -905,18 +924,8 @@ fn render_decoded_frame(
         _ => VoiLutOption::Default,
     };
 
-    // Overlay-only reports have no intensity range to normalize. Keep their zero-filled
-    // MONOCHROME2 background black so white overlay content remains visible.
     let black_overlay_background = matches!(&voi_lut, VoiLutOption::Default)
-        && !overlay_bitmaps.is_empty()
-        && matches!(
-            decoded.photometric_interpretation(),
-            PhotometricInterpretation::Monochrome2
-        )
-        && decoded.window()?.is_none()
-        && decoded.voi_lut_sequence()?.is_none()
-        && !decoded.data().is_empty()
-        && decoded.data().iter().all(|&byte| byte == 0);
+        && has_black_overlay_background(decoded, overlay_bitmaps)?;
 
     let mut rgba = if black_overlay_background {
         image::RgbaImage::from_pixel(
@@ -934,6 +943,73 @@ fn render_decoded_frame(
     paint_overlay_bitmaps(overlay_bitmaps, &mut rgba);
 
     Ok(rgba)
+}
+
+/// Overlay-only reports have no intensity range to normalize. Their zero-filled
+/// MONOCHROME2 background, without a window or VOI LUT of its own, is kept
+/// black so white overlay content remains visible.
+fn has_black_overlay_background(
+    decoded: &DecodedPixelData<'_>,
+    overlay_bitmaps: &[OverlayBitmap],
+) -> Result<bool> {
+    Ok(!overlay_bitmaps.is_empty()
+        && matches!(
+            decoded.photometric_interpretation(),
+            PhotometricInterpretation::Monochrome2
+        )
+        && decoded.window()?.is_none()
+        && decoded.voi_lut_sequence()?.is_none()
+        && !decoded.data().is_empty()
+        && decoded.data().iter().all(|&byte| byte == 0))
+}
+
+/// The window a monochrome frame is drawn with when no window is requested and
+/// the file states neither a usable window nor a VOI LUT: its full dynamic
+/// window. dicom-pixeldata's own fallback normalizes over the raw samples read
+/// as unsigned and unmasked, which draws signed data, or data with bits set
+/// above BitsStored, almost black. `None` leaves the frame to its own window,
+/// VOI LUT or black overlay background, and a flat frame, which has no range to
+/// stretch, to the decoder's own rendering. A flat frame whose stated window is
+/// not a number still gets the window spanning its value, because the decoder
+/// would otherwise fall back to that window and fail; a zero or negative width
+/// the decoder still draws.
+///
+/// `frame_values` yields the frame's rescaled values; it is only called when
+/// the window is needed, so callers that already hold them pass them in.
+fn implicit_window<V: AsRef<[f64]>>(
+    decoded: &DecodedPixelData<'_>,
+    overlay_bitmaps: &[OverlayBitmap],
+    frame_values: impl FnOnce() -> Result<V>,
+) -> Result<Option<DicomWindow>> {
+    if !decoded.photometric_interpretation().is_monochrome() {
+        return Ok(None);
+    }
+
+    let stated_window = decoded.window()?.and_then(<[_]>::first);
+    let has_usable_window = stated_window.is_some_and(|window| {
+        window.center.is_finite() && window.width.is_finite() && window.width > 0.0
+    });
+    let stated_window_is_not_a_number =
+        stated_window.is_some_and(|window| !window.center.is_finite() || !window.width.is_finite());
+    if has_usable_window
+        || decoded.voi_lut_sequence()?.is_some()
+        || has_black_overlay_background(decoded, overlay_bitmaps)?
+    {
+        return Ok(None);
+    }
+
+    let values = frame_values()?;
+    Ok(finite_value_range(values.as_ref())
+        .filter(|(minimum, maximum)| minimum < maximum || stated_window_is_not_a_number)
+        .map(spanning_window))
+}
+
+/// The window from the lowest to the highest rescaled value of a frame.
+fn spanning_window((minimum, maximum): (f64, f64)) -> DicomWindow {
+    DicomWindow {
+        center: minimum / 2.0 + maximum / 2.0,
+        width: (maximum - minimum).max(1.0),
+    }
 }
 
 fn thumbnail_dimensions(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
@@ -1430,6 +1506,7 @@ mod tests {
         );
     }
 
+    /// A 2 x 2, 16-bit monochrome image without a window, VOI LUT or overlay.
     fn sixteen_bit_image(
         photometric_interpretation: &str,
         bits_stored: u16,
@@ -1598,6 +1675,406 @@ mod tests {
             &[0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]
         );
         assert_eq!(&pixels.rgba[12..], &[255, 255, 255, 255]);
+    }
+
+    fn signed_image(photometric_interpretation: &str) -> DefaultDicomObject {
+        sixteen_bit_image(
+            photometric_interpretation,
+            16,
+            1,
+            [-1000_i16, 0, 500, 1000].map(|value| value as u16),
+        )
+    }
+
+    fn greys(rgba: &[u8]) -> Vec<u8> {
+        rgba.chunks_exact(4).map(|pixel| pixel[0]).collect()
+    }
+
+    fn thumbnail_greys(object: &DefaultDicomObject, name: &str) -> Vec<u8> {
+        let path = std::env::temp_dir().join(format!("dicron-{name}-{}.dcm", std::process::id()));
+        object.write_to_file(&path).unwrap();
+        let thumbnail = load_dicom_thumbnail(&path, 0, 2);
+        std::fs::remove_file(path).unwrap();
+        greys(&thumbnail.unwrap().rgba)
+    }
+
+    /// Without a window of its own, a signed image is drawn over its full
+    /// dynamic range, and the W/L read-out names that same window.
+    #[test]
+    fn signed_image_without_window_spans_its_values() {
+        let object = signed_image("MONOCHROME2");
+        let frame = decode_frame(&object, 0).unwrap();
+
+        assert_eq!(frame.default_center_width(), (0.0, 2000.0));
+        assert_eq!(
+            greys(&render_frame(&frame, None).unwrap().rgba),
+            [0, 128, 192, 255]
+        );
+        assert_eq!(
+            thumbnail_greys(&object, "signed-no-window"),
+            [0, 128, 192, 255]
+        );
+    }
+
+    #[test]
+    fn monochrome1_without_window_is_still_inverted() {
+        let object = signed_image("MONOCHROME1");
+        let frame = decode_frame(&object, 0).unwrap();
+
+        assert_eq!(
+            greys(&render_frame(&frame, None).unwrap().rgba),
+            [255, 127, 63, 0]
+        );
+        assert_eq!(
+            thumbnail_greys(&object, "monochrome1-no-window"),
+            [255, 127, 63, 0]
+        );
+    }
+
+    /// Bits above BitsStored are not part of the sample value.
+    #[test]
+    fn bits_above_bits_stored_do_not_change_the_rendering() {
+        let clean = sixteen_bit_image("MONOCHROME2", 12, 0, [0, 1000, 2000, 4000]);
+        let stray = sixteen_bit_image("MONOCHROME2", 12, 0, [0xF000, 1000, 0x8000 | 2000, 4000]);
+        let clean_frame = decode_frame(&clean, 0).unwrap();
+        let stray_frame = decode_frame(&stray, 0).unwrap();
+
+        assert_eq!(stray_frame.default_center_width(), (2000.0, 4000.0));
+        assert_eq!(
+            render_frame(&stray_frame, None).unwrap().rgba,
+            render_frame(&clean_frame, None).unwrap().rgba
+        );
+        assert_eq!(
+            thumbnail_greys(&stray, "stray-high-bits"),
+            thumbnail_greys(&clean, "clean-high-bits")
+        );
+    }
+
+    /// The read-out matches the drawn window, not the range BitsStored allows.
+    #[test]
+    fn default_window_without_file_window_is_the_data_range() {
+        let object = sixteen_bit_image("MONOCHROME2", 12, 0, [0, 250, 500, 1000]);
+        let frame = decode_frame(&object, 0).unwrap();
+
+        assert_eq!(frame.default_center_width(), (500.0, 1000.0));
+        assert_eq!(
+            render_frame(&frame, None).unwrap().rgba,
+            render_frame(
+                &frame,
+                Some(super::DicomWindow {
+                    center: 500.0,
+                    width: 1000.0,
+                }),
+            )
+            .unwrap()
+            .rgba
+        );
+    }
+
+    #[test]
+    fn file_window_is_drawn_and_reported_unchanged() {
+        let mut object = signed_image("MONOCHROME2");
+        object.put_element(DataElement::new(tags::WINDOW_CENTER, VR::DS, "500"));
+        object.put_element(DataElement::new(tags::WINDOW_WIDTH, VR::DS, "1000"));
+        let frame = decode_frame(&object, 0).unwrap();
+
+        assert_eq!(frame.default_center_width(), (500.0, 1000.0));
+        assert_eq!(
+            greys(&render_frame(&frame, None).unwrap().rgba),
+            [0, 0, 128, 255]
+        );
+        assert_eq!(thumbnail_greys(&object, "file-window"), [0, 0, 128, 255]);
+    }
+
+    /// A stated window that cannot be used (zero width, or a center that is
+    /// not a number) is treated like no window: the image spans its values and
+    /// the read-out names that window.
+    #[test]
+    fn unusable_file_window_is_treated_as_no_window() {
+        for (center, width) in [("500", "0"), ("NaN", "1000"), ("500", "-20")] {
+            let mut object = signed_image("MONOCHROME2");
+            object.put_element(DataElement::new(tags::WINDOW_CENTER, VR::DS, center));
+            object.put_element(DataElement::new(tags::WINDOW_WIDTH, VR::DS, width));
+            let frame = decode_frame(&object, 0).unwrap();
+
+            assert_eq!(
+                frame.default_center_width(),
+                (0.0, 2000.0),
+                "{center}/{width}"
+            );
+            assert_eq!(
+                greys(&render_frame(&frame, None).unwrap().rgba),
+                [0, 128, 192, 255],
+                "{center}/{width}"
+            );
+            assert_eq!(
+                thumbnail_greys(&object, "unusable-window"),
+                [0, 128, 192, 255],
+                "{center}/{width}"
+            );
+        }
+    }
+
+    /// The implicit window is taken over rescaled values, so a negative slope
+    /// flips the image and the read-out is in rescaled units.
+    #[test]
+    fn negative_rescale_slope_without_window_spans_rescaled_values() {
+        let mut object = sixteen_bit_image("MONOCHROME2", 12, 0, [0, 1000, 2000, 4000]);
+        object.put_element(DataElement::new(tags::RESCALE_SLOPE, VR::DS, "-1"));
+        object.put_element(DataElement::new(tags::RESCALE_INTERCEPT, VR::DS, "0"));
+        let frame = decode_frame(&object, 0).unwrap();
+
+        assert_eq!(frame.default_center_width(), (-2000.0, 4000.0));
+        let drawn = render_frame(&frame, None).unwrap().rgba;
+        assert_eq!(
+            drawn,
+            render_frame(
+                &frame,
+                Some(super::DicomWindow {
+                    center: -2000.0,
+                    width: 4000.0,
+                }),
+            )
+            .unwrap()
+            .rgba
+        );
+        let drawn = greys(&drawn);
+        assert_eq!((drawn[0], drawn[3]), (255, 0));
+        assert!(drawn[1] > drawn[2]);
+    }
+
+    /// Signed 12-bit samples are read the same whether or not the writer
+    /// sign-extended them into the unused high bits.
+    #[test]
+    fn signed_twelve_bit_without_window_spans_its_values() {
+        for minus_thousand in [0x0C18_u16, 0xFC18] {
+            let object = sixteen_bit_image("MONOCHROME2", 12, 1, [minus_thousand, 0, 500, 1000]);
+            let frame = decode_frame(&object, 0).unwrap();
+
+            assert_eq!(
+                frame.default_center_width(),
+                (0.0, 2000.0),
+                "{minus_thousand:#06x}"
+            );
+            assert_eq!(
+                greys(&render_frame(&frame, None).unwrap().rgba),
+                [0, 128, 192, 255],
+                "{minus_thousand:#06x}"
+            );
+        }
+    }
+
+    /// Signed 8-bit data without a window spans its values too.
+    #[test]
+    fn signed_eight_bit_without_window_spans_its_values() {
+        let mut object = black_two_by_two_image_with_overlay_pixel();
+        object.remove_element(Tag(0x6000, 0x3000));
+        object.put_element(DataElement::new(
+            tags::PIXEL_REPRESENTATION,
+            VR::US,
+            PrimitiveValue::from(1_u16),
+        ));
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from([-100_i8, 0, 50, 100].map(|value| value as u8).to_vec()),
+        ));
+        let frame = decode_frame(&object, 0).unwrap();
+
+        assert_eq!(frame.default_center_width(), (0.0, 200.0));
+        assert_eq!(
+            greys(&render_frame(&frame, None).unwrap().rgba),
+            [0, 128, 192, 255]
+        );
+        assert_eq!(thumbnail_greys(&object, "signed-8-bit"), [0, 128, 192, 255]);
+    }
+
+    /// An overlay-only page keeps a read-out whose window still draws its zero
+    /// background black, so Reset and the first drag do not turn it white and
+    /// hide the white overlay.
+    #[test]
+    fn zero_overlay_frame_default_window_keeps_black_background() {
+        let frame = decode_frame(&black_two_by_two_image_with_overlay_pixel(), 0).unwrap();
+        let (center, width) = frame.default_center_width();
+
+        assert_eq!(
+            greys(
+                &render_frame(&frame, Some(super::DicomWindow { center, width }))
+                    .unwrap()
+                    .rgba
+            ),
+            [0, 0, 0, 255]
+        );
+    }
+
+    /// A flat frame has no range to stretch, so it keeps the decoder's own
+    /// rendering and the read-out derived from BitsStored, as before the
+    /// implicit window existed: black for signed data, white for unsigned.
+    #[test]
+    fn flat_signed_frame_without_window_stays_black() {
+        let object = sixteen_bit_image("MONOCHROME2", 16, 1, [-1000_i16 as u16; 4]);
+        let frame = decode_frame(&object, 0).unwrap();
+
+        assert_eq!(frame.default_center_width(), (-0.5, 65535.0));
+        assert_eq!(greys(&render_frame(&frame, None).unwrap().rgba), [0; 4]);
+        assert_eq!(thumbnail_greys(&object, "flat-signed"), [0; 4]);
+    }
+
+    #[test]
+    fn flat_unsigned_frame_without_window_stays_white() {
+        let object = sixteen_bit_image("MONOCHROME2", 12, 0, [500; 4]);
+        let frame = decode_frame(&object, 0).unwrap();
+
+        assert_eq!(frame.default_center_width(), (2047.5, 4095.0));
+        assert_eq!(greys(&render_frame(&frame, None).unwrap().rgba), [255; 4]);
+        assert_eq!(thumbnail_greys(&object, "flat-unsigned"), [255; 4]);
+    }
+
+    /// A flat frame whose stated window is not a number would fall back to
+    /// that window in the decoder and fail, so it is drawn through the window
+    /// spanning its one value, and the read-out names that window.
+    #[test]
+    fn flat_frame_with_a_stated_window_that_is_not_a_number_still_draws() {
+        for (center, width) in [("NaN", "1000"), ("500", "NaN")] {
+            let mut object = sixteen_bit_image("MONOCHROME2", 16, 1, [-1000_i16 as u16; 4]);
+            object.put_element(DataElement::new(tags::WINDOW_CENTER, VR::DS, center));
+            object.put_element(DataElement::new(tags::WINDOW_WIDTH, VR::DS, width));
+            let frame = decode_frame(&object, 0).unwrap();
+
+            assert_eq!(
+                frame.default_center_width(),
+                (-1000.0, 1.0),
+                "{center}/{width}"
+            );
+            let drawn = render_frame(&frame, None).unwrap().rgba;
+            assert_eq!(greys(&drawn), [255; 4], "{center}/{width}");
+            assert_eq!(
+                thumbnail_greys(&object, "flat-unusable-window"),
+                [255; 4],
+                "{center}/{width}"
+            );
+        }
+    }
+
+    /// Colour images have nothing to window and keep their colours.
+    #[test]
+    fn rgb_image_keeps_its_colours() {
+        let mut object = black_two_by_two_image_with_overlay_pixel();
+        object.remove_element(Tag(0x6000, 0x3000));
+        for (tag, value) in [
+            (tags::SAMPLES_PER_PIXEL, 3_u16),
+            (tags::PLANAR_CONFIGURATION, 0),
+        ] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            PrimitiveValue::from("RGB"),
+        ));
+        let samples: Vec<u8> = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from(samples.clone()),
+        ));
+        let frame = decode_frame(&object, 0).unwrap();
+        let rgb = |rgba: &[u8]| -> Vec<u8> {
+            rgba.chunks_exact(4)
+                .flat_map(|pixel| pixel[..3].to_vec())
+                .collect()
+        };
+
+        assert_eq!(rgb(&render_frame(&frame, None).unwrap().rgba), samples);
+        assert_eq!(frame.default_center_width(), (127.5, 255.0));
+        let path = std::env::temp_dir().join(format!("dicron-rgb-{}.dcm", std::process::id()));
+        object.write_to_file(&path).unwrap();
+        let thumbnail = load_dicom_thumbnail(&path, 0, 2);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(rgb(&thumbnail.unwrap().rgba), samples);
+    }
+
+    /// A requested window always wins over the implicit one.
+    #[test]
+    fn requested_window_overrides_the_implicit_window() {
+        let frame = decode_frame(&signed_image("MONOCHROME2"), 0).unwrap();
+
+        assert_eq!(
+            greys(
+                &render_frame(
+                    &frame,
+                    Some(super::DicomWindow {
+                        center: 500.0,
+                        width: 1000.0,
+                    }),
+                )
+                .unwrap()
+                .rgba
+            ),
+            [0, 0, 128, 255]
+        );
+    }
+
+    /// A file with a VOI LUT Sequence but no window is drawn through its LUT,
+    /// not over its full dynamic range.
+    #[test]
+    fn voi_lut_without_window_keeps_the_lut() {
+        use dicom_core::value::DataSetSequence;
+        use dicom_object::InMemDicomObject;
+
+        let mut object = sixteen_bit_image("MONOCHROME2", 12, 0, [0, 1, 2, 3]);
+        let lut_item = InMemDicomObject::from_element_iter([
+            DataElement::new(
+                tags::LUT_DESCRIPTOR,
+                VR::US,
+                PrimitiveValue::U16(vec![4_u16, 0, 8].into()),
+            ),
+            DataElement::new(
+                tags::LUT_DATA,
+                VR::OW,
+                PrimitiveValue::U16(vec![0_u16, 255, 0, 255].into()),
+            ),
+        ]);
+        object.put_element(DataElement::new(
+            tags::VOILUT_SEQUENCE,
+            VR::SQ,
+            DataSetSequence::from(vec![lut_item]),
+        ));
+        let frame = decode_frame(&object, 0).unwrap();
+
+        assert_eq!(
+            greys(&render_frame(&frame, None).unwrap().rgba),
+            [0, 255, 0, 255]
+        );
+        assert_eq!(thumbnail_greys(&object, "voi-lut"), [0, 255, 0, 255]);
+    }
+
+    /// Each frame of a multi-frame file without a window spans its own values.
+    #[test]
+    fn multi_frame_without_window_spans_each_frame() {
+        let mut object = sixteen_bit_image("MONOCHROME2", 16, 1, [0; 4]);
+        object.put_element(DataElement::new(
+            tags::NUMBER_OF_FRAMES,
+            VR::IS,
+            PrimitiveValue::from("2"),
+        ));
+        let samples: Vec<u16> = [-1000_i16, 0, 500, 1000, 0, 100, 200, 400]
+            .map(|value| value as u16)
+            .to_vec();
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OW,
+            PrimitiveValue::U16(samples.into()),
+        ));
+        let first = decode_frame(&object, 0).unwrap();
+        let second = decode_frame(&object, 1).unwrap();
+
+        assert_eq!(first.default_center_width(), (0.0, 2000.0));
+        assert_eq!(second.default_center_width(), (200.0, 400.0));
+        assert_eq!(
+            greys(&render_frame(&second, None).unwrap().rgba),
+            [0, 64, 128, 255]
+        );
     }
 
     #[test]
@@ -3213,5 +3690,103 @@ mod tests {
                 assert!(!error.contains("frame header"), "{uid}: {error}");
             }
         }
+    }
+
+    /// Two values one unit apart are not flat: the lower one is drawn black,
+    /// the higher white, and the read-out names that one-unit window.
+    #[test]
+    fn two_adjacent_values_without_window_split_black_and_white() {
+        let object = sixteen_bit_image(
+            "MONOCHROME2",
+            16,
+            1,
+            [-1000_i16, -1000, -999, -999].map(|value| value as u16),
+        );
+        let frame = decode_frame(&object, 0).unwrap();
+
+        assert_eq!(frame.default_center_width(), (-999.5, 1.0));
+        assert_eq!(
+            greys(&render_frame(&frame, None).unwrap().rgba),
+            [0, 0, 255, 255]
+        );
+        assert_eq!(thumbnail_greys(&object, "two-values"), [0, 0, 255, 255]);
+    }
+
+    /// A flat MONOCHROME1 frame keeps the decoder's rendering too, which is
+    /// the inverse of the same MONOCHROME2 frame.
+    #[test]
+    fn flat_monochrome1_frame_without_window_is_the_inverse_of_monochrome2() {
+        for (bits_stored, representation, sample, monochrome2_grey) in
+            [(16, 1, -1000_i16 as u16, 0_u8), (12, 0, 500, 255)]
+        {
+            let object = sixteen_bit_image("MONOCHROME1", bits_stored, representation, [sample; 4]);
+            let frame = decode_frame(&object, 0).unwrap();
+            let monochrome2 = decode_frame(
+                &sixteen_bit_image("MONOCHROME2", bits_stored, representation, [sample; 4]),
+                0,
+            )
+            .unwrap();
+
+            assert_eq!(
+                frame.default_center_width(),
+                monochrome2.default_center_width(),
+                "{sample}"
+            );
+            assert_eq!(
+                greys(&render_frame(&frame, None).unwrap().rgba),
+                [255 - monochrome2_grey; 4],
+                "{sample}"
+            );
+            assert_eq!(
+                thumbnail_greys(&object, "flat-monochrome1"),
+                [255 - monochrome2_grey; 4],
+                "{sample}"
+            );
+        }
+    }
+
+    /// In a multi-frame file only the flat frame falls back to the decoder;
+    /// the other frame still spans its own values.
+    #[test]
+    fn multi_frame_with_one_flat_frame_falls_back_only_for_that_frame() {
+        let mut object = sixteen_bit_image("MONOCHROME2", 16, 1, [0; 4]);
+        object.put_element(DataElement::new(
+            tags::NUMBER_OF_FRAMES,
+            VR::IS,
+            PrimitiveValue::from("2"),
+        ));
+        let samples: Vec<u16> = [-1000_i16, 0, 500, 1000, -1000, -1000, -1000, -1000]
+            .map(|value| value as u16)
+            .to_vec();
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OW,
+            PrimitiveValue::U16(samples.into()),
+        ));
+        let first = decode_frame(&object, 0).unwrap();
+        let flat = decode_frame(&object, 1).unwrap();
+
+        assert_eq!(first.default_center_width(), (0.0, 2000.0));
+        assert_eq!(
+            greys(&render_frame(&first, None).unwrap().rgba),
+            [0, 128, 192, 255]
+        );
+        assert_eq!(flat.default_center_width(), (-0.5, 65535.0));
+        assert_eq!(greys(&render_frame(&flat, None).unwrap().rgba), [0; 4]);
+    }
+
+    /// A range narrower than one rescaled unit is not flat, and its window,
+    /// in the read-out and the Full Dynamic preset alike, is one unit wide,
+    /// the narrowest window the viewer draws.
+    #[test]
+    fn sub_unit_range_window_is_one_unit_wide() {
+        let mut object = sixteen_bit_image("MONOCHROME2", 12, 0, [0, 1, 2, 3]);
+        object.put_element(DataElement::new(tags::RESCALE_SLOPE, VR::DS, "0.25"));
+        object.put_element(DataElement::new(tags::RESCALE_INTERCEPT, VR::DS, "0"));
+        let frame = decode_frame(&object, 0).unwrap();
+
+        assert_eq!(frame.default_center_width(), (0.375, 1.0));
+        let full_dynamic = frame.full_dynamic_window().unwrap();
+        assert_eq!((full_dynamic.center, full_dynamic.width), (0.375, 1.0));
     }
 }

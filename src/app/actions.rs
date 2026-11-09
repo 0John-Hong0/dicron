@@ -2097,6 +2097,78 @@ mod loading_tests {
         object.write_to_file(path).unwrap();
     }
 
+    /// A signed image without a window opens with a W/L default that is the
+    /// window it is drawn with, equal to the Full Dynamic preset, so Reset and
+    /// the first drag start from what is on screen.
+    #[test]
+    fn signed_image_without_window_prepares_matching_default_window() {
+        let path = temporary_file("signed-no-window");
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .media_storage_sop_class_uid(uids::MR_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid("2.25.601")
+            .build()
+            .unwrap();
+        let mut object = FileDicomObject::new_empty_with_meta(meta);
+        for (tag, value) in [
+            (tags::ROWS, 2_u16),
+            (tags::COLUMNS, 2_u16),
+            (tags::SAMPLES_PER_PIXEL, 1_u16),
+            (tags::BITS_ALLOCATED, 16_u16),
+            (tags::BITS_STORED, 16_u16),
+            (tags::HIGH_BIT, 15_u16),
+            (tags::PIXEL_REPRESENTATION, 1_u16),
+        ] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            PrimitiveValue::from("MONOCHROME2"),
+        ));
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OW,
+            PrimitiveValue::U16(
+                [-1000_i16, 0, 500, 1000]
+                    .map(|value| value as u16)
+                    .to_vec()
+                    .into(),
+            ),
+        ));
+        object.write_to_file(&*path).unwrap();
+        let loaded = load_dicom_frame_with_encoding(&path, 0, TextEncoding::DicomDefault).unwrap();
+        let entry = DecodedCacheEntry {
+            path: path.to_path_buf(),
+            frame_index: 0,
+            frame: loaded.frame,
+            metadata: loaded.metadata,
+        };
+
+        let (prepared, opened) = prepare_frame(&entry, None).unwrap();
+        let expected = WindowLevel {
+            center: 0.0,
+            width: 2000.0,
+        };
+        assert_eq!(prepared.default_window, expected);
+        assert_eq!(prepared.current_window, expected);
+        assert!(!prepared.window_customized);
+        let full_dynamic = entry.frame.full_dynamic_window().unwrap();
+        assert_eq!((full_dynamic.center, full_dynamic.width), (0.0, 2000.0));
+        let opened_greys: Vec<u8> = opened.rgba.chunks_exact(4).map(|pixel| pixel[0]).collect();
+        assert_eq!(opened_greys, [0, 128, 192, 255]);
+
+        let (_, at_default) = prepare_frame(
+            &entry,
+            Some(SavedWindowLevel {
+                window: prepared.default_window,
+                preset: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(at_default.rgba, opened.rgba);
+    }
+
     fn finish_source_load(app: &mut DicronApp, context: &egui::Context) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.scan.is_active() || app.frame_load.is_active() {
