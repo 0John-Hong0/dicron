@@ -113,8 +113,10 @@ impl DecodedFrame {
             return None;
         }
 
-        let values = self.decoded.to_vec_frame::<f64>(0).ok()?;
-        finite_value_range(&values).map(spanning_window)
+        let Some(PixelProbeData::Monochrome { values, .. }) = &self.pixel_probe else {
+            return None;
+        };
+        finite_value_range(values).map(spanning_window)
     }
 
     /// Approximate bytes this frame keeps in memory: the decoded samples, the
@@ -320,6 +322,16 @@ impl FrameLayout {
     fn bytes_per_sample(self) -> u64 {
         u64::from(self.bits_allocated.div_ceil(8))
     }
+
+    /// Native frame length, with one-bit samples packed into bytes.
+    fn frame_bytes(self) -> u64 {
+        let samples = self.pixels() * u64::from(self.samples_per_pixel);
+        if self.bits_allocated == 1 {
+            samples.div_ceil(8)
+        } else {
+            samples * self.bytes_per_sample()
+        }
+    }
 }
 
 fn photometric_interpretation(object: &DefaultDicomObject) -> Option<PhotometricInterpretation> {
@@ -400,36 +412,42 @@ fn rle_segment_starts(fragment: &[u8], layout: FrameLayout) -> Result<Vec<usize>
     Ok(starts)
 }
 
-/// Refuse a Deflated Image Frame Compression frame that inflates to more
-/// than its layout holds. The library inflates the whole frame into memory
-/// with no limit, and a deflate stream of zeros inflates about 1000 times, so
-/// the frame is inflated here first, through a reader stopped one byte past
-/// the expected size, and the output discarded.
-fn ensure_deflated_frame_fits(fragment: &[u8], layout: FrameLayout) -> Result<()> {
+/// Inflate a frame once, limiting the output to its declared size plus one byte.
+fn inflate_frame(
+    fragment: &[u8],
+    layout: FrameLayout,
+    expected: u64,
+    frame: u32,
+) -> Result<Vec<u8>> {
     // Deflated Image Frame Compression is raw deflate, as the data set codec
     // of Deflated Explicit VR Little Endian is; the library builds both with
-    // its 'deflate' feature.
+    // its 'deflate' feature, so without that codec it has no decoder for
+    // these frames either.
     let Some(Codec::Dataset(Some(inflater))) = TransferSyntaxRegistry
         .get(uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN)
         .map(|transfer_syntax| transfer_syntax.codec())
     else {
-        bail!("Deflated Image Frame Compression is not supported by this build");
+        bail!("this build has no decoder for Deflated Image Frame Compression");
     };
-    let expected =
-        layout.pixels() * u64::from(layout.samples_per_pixel) * layout.bytes_per_sample();
-    let inflated = std::io::copy(
+    let mut samples = Vec::new();
+    std::io::copy(
         &mut std::io::Read::take(inflater.adapt_reader(Box::new(fragment)), expected + 1),
-        &mut std::io::sink(),
+        &mut samples,
     )
     .context("the deflated pixel data is damaged")?;
     ensure!(
-        inflated <= expected,
+        samples.len() as u64 <= expected,
         "the deflated pixel data is damaged: a frame inflates to more than the {expected} bytes \
          of a {} x {} image",
         layout.columns,
         layout.rows
     );
-    Ok(())
+    ensure!(
+        samples.len() as u64 == expected,
+        "the pixel data holds no frame {}",
+        frame + 1
+    );
+    Ok(samples)
 }
 
 /// Whether a frame of a JPEG image sets a restart interval, read from the
@@ -451,7 +469,7 @@ fn jpeg_restart_interval(stream: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes(interval.get(..2)?.try_into().ok()?))
 }
 
-/// The marker segments of a JPEG or JPEG-LS stream before its first scan, as
+/// The marker segments of a JPEG or JPEG-LS stream through its first scan header, as
 /// marker and contents, or none when the stream does not start with SOI. Like
 /// jpeg-decoder, bytes between segments and fill bytes before a marker are
 /// skipped.
@@ -479,18 +497,32 @@ fn jpeg_header_segments(stream: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
                 marker => break marker,
             }
         };
-        // The first scan starts.
-        if marker == 0xDA {
-            return None;
-        }
         let length = usize::from(u16::from_be_bytes([
             *stream.get(position)?,
             *stream.get(position + 1)?,
         ]));
         let contents = stream.get(position + 2..position + length)?;
-        position += length;
+        position = if marker == 0xDA {
+            stream.len()
+        } else {
+            position + length
+        };
         Some((marker, contents))
     })
+}
+
+/// CharLS writes separate planes for interleave mode 0 and packed pixels for
+/// line and sample interleaving. The JPEG-LS scan header specifies the mode.
+fn jpeg_ls_samples_by_plane(stream: &[u8]) -> Result<bool> {
+    let (_, scan) = jpeg_header_segments(stream)
+        .find(|&(marker, _)| marker == 0xDA)
+        .context("missing JPEG-LS scan header")?;
+    let (&components, fields) = scan.split_first().context("empty JPEG-LS scan header")?;
+    match (components, fields.get(2 * usize::from(components)..)) {
+        (1, Some([_, 0, _])) => Ok(true),
+        (3, Some([_, 1 | 2, _])) => Ok(false),
+        _ => bail!("invalid JPEG-LS color interleave mode"),
+    }
 }
 
 /// The size of a frame as its codestream declares it. The library decoders
@@ -680,12 +712,8 @@ pub(super) fn rgb_decoding_copy(
     Ok(native)
 }
 
-/// Convert native Y1 Y2 Cb Cr groups to two RGB pixels with shared chroma.
-fn native_ybr_full_422_frame(
-    object: &DefaultDicomObject,
-    frame: u32,
-) -> Result<DefaultDicomObject> {
-    let layout = FrameLayout::read_within_budget(object)?;
+/// Size of a frame stored as Y1 Y2 Cb Cr pixel pairs.
+fn ybr_full_422_frame_bytes(layout: FrameLayout) -> Result<u64> {
     ensure!(
         layout.samples_per_pixel == 3
             && layout.bits_allocated == 8
@@ -694,26 +722,49 @@ fn native_ybr_full_422_frame(
             && layout.columns.is_multiple_of(2),
         "native YBR_FULL_422 needs three 8-bit samples, nonzero rows, and a positive even column count"
     );
-    ensure!(
-        object
-            .element(tags::PLANAR_CONFIGURATION)?
-            .to_int::<u16>()?
-            == 0,
-        "native YBR_FULL_422 needs Planar Configuration 0"
-    );
+    Ok(layout.pixels() * 2)
+}
+
+/// Read the sample layout of a native color frame.
+fn planar_configuration(object: &DefaultDicomObject) -> Result<u16> {
+    let value = object
+        .element(tags::PLANAR_CONFIGURATION)?
+        .to_int::<u16>()?;
+    ensure!(value <= 1, "invalid Planar Configuration {value}");
+    Ok(value)
+}
+
+/// Validate unsigned YBR precision and return a mask for the stored bits.
+fn ybr_sample_mask(object: &DefaultDicomObject, layout: FrameLayout) -> Result<u16> {
     ensure!(
         object
             .element(tags::PIXEL_REPRESENTATION)?
             .to_int::<u16>()?
             == 0,
-        "native YBR_FULL_422 needs unsigned samples"
+        "YBR color needs unsigned samples"
     );
     let bits_stored = object.element(tags::BITS_STORED)?.to_int::<u16>()?;
     ensure!(
-        (1..=8).contains(&bits_stored),
-        "native YBR_FULL_422 needs Bits Stored in 1..=8"
+        (1..=layout.bits_allocated).contains(&bits_stored),
+        "Bits Stored {bits_stored} does not fit Bits Allocated {}",
+        layout.bits_allocated
     );
+    Ok(u16::MAX >> (16 - bits_stored))
+}
 
+/// Read the requested native frame at its packed byte offset.
+fn native_ybr_frame(
+    object: &DefaultDicomObject,
+    frame: u32,
+    subsampled: bool,
+) -> Result<DefaultDicomObject> {
+    let layout = FrameLayout::read_within_budget(object)?;
+    let frame_bytes = if subsampled {
+        ybr_full_422_frame_bytes(layout)?
+    } else {
+        validate_ybr_full_layout(layout)?;
+        layout.frame_bytes()
+    } as usize;
     let frames = object
         .element_opt(tags::NUMBER_OF_FRAMES)?
         .map(|element| element.to_int::<u32>())
@@ -721,23 +772,95 @@ fn native_ybr_full_422_frame(
         .unwrap_or(1);
     let number = u64::from(frame) + 1;
     ensure!(frame < frames, "the pixel data holds no frame {number}");
-    let frame_bytes = layout.pixels() as usize * 2;
     let start = (frame as usize)
         .checked_mul(frame_bytes)
         .context("native frame offset overflows")?;
-    let pixel_data = object.element(tags::PIXEL_DATA)?.to_bytes()?;
-    let stored = pixel_data
+    let data = object.element(tags::PIXEL_DATA)?.to_bytes()?;
+    let stored = data
         .get(start..)
         .and_then(|rest| rest.get(..frame_bytes))
         .with_context(|| format!("the pixel data holds no complete frame {number}"))?;
+    if subsampled {
+        ybr_full_422_frame(object, frame, layout, stored)
+    } else {
+        ybr_full_frame(
+            object,
+            frame,
+            layout,
+            stored,
+            planar_configuration(object)? == 1,
+        )
+    }
+}
 
-    let maximum = (1_u16 << bits_stored) - 1;
+/// Convert each packed pair directly to two RGB pixels.
+fn ybr_full_422_frame(
+    object: &DefaultDicomObject,
+    frame: u32,
+    layout: FrameLayout,
+    stored: &[u8],
+) -> Result<DefaultDicomObject> {
+    ensure!(
+        planar_configuration(object)? == 0,
+        "native YBR_FULL_422 needs Planar Configuration 0"
+    );
+    let maximum = ybr_sample_mask(object, layout)?;
     let (pairs, _) = stored.as_chunks::<4>();
     let mut rgb = Vec::with_capacity(layout.pixels() as usize * 3);
     for &[first, second, cb, cr] in pairs {
         for luminance in [first, second] {
             let ybr = [luminance, cb, cr].map(|sample| u16::from(sample) & maximum);
             rgb.extend(ybr_full_to_rgb(ybr, maximum).map(|value| value as u8));
+        }
+    }
+    rgb_decoding_copy(object, frame, VR::OB, PrimitiveValue::from(rgb))
+}
+
+/// Check that the layout fits the 8-bit or 16-bit YBR converter.
+fn validate_ybr_full_layout(layout: FrameLayout) -> Result<()> {
+    ensure!(
+        layout.samples_per_pixel == 3
+            && matches!(layout.bits_allocated, 8 | 16)
+            && layout.pixels() > 0,
+        "YBR_FULL needs three samples of 8 or 16 bits and nonzero dimensions"
+    );
+    Ok(())
+}
+
+/// Convert either planar or interleaved YBR_FULL to interleaved RGB.
+fn ybr_full_frame(
+    object: &DefaultDicomObject,
+    frame: u32,
+    layout: FrameLayout,
+    samples: &[u8],
+    by_plane: bool,
+) -> Result<DefaultDicomObject> {
+    validate_ybr_full_layout(layout)?;
+    ensure!(
+        samples.len() as u64 == layout.frame_bytes(),
+        "YBR_FULL frame {} has {} bytes, expected {}",
+        u64::from(frame) + 1,
+        samples.len(),
+        layout.frame_bytes()
+    );
+    let maximum = ybr_sample_mask(object, layout)?;
+    let pixels = layout.pixels() as usize;
+    let width = layout.bytes_per_sample() as usize;
+    let sample = |pixel: usize, channel: usize| {
+        let index = if by_plane {
+            channel * pixels + pixel
+        } else {
+            pixel * 3 + channel
+        } * width;
+        let mut bytes = [0; 2];
+        bytes[..width].copy_from_slice(&samples[index..index + width]);
+        u16::from_le_bytes(bytes) & maximum
+    };
+    let mut rgb = Vec::with_capacity(samples.len());
+    for pixel in 0..pixels {
+        let ybr = [0, 1, 2].map(|channel| sample(pixel, channel));
+        for value in ybr_full_to_rgb(ybr, maximum) {
+            rgb.extend_from_slice(&value.to_le_bytes()[..width]);
         }
     }
     rgb_decoding_copy(object, frame, VR::OB, PrimitiveValue::from(rgb))
@@ -788,6 +911,9 @@ fn native_rle_frame(
             .context("the RLE pixel data is damaged")?;
     }
 
+    if photometric_interpretation(dicom_object) == Some(PhotometricInterpretation::YbrFull) {
+        return ybr_full_frame(dicom_object, frame, layout, &samples, false);
+    }
     let mut native =
         single_frame_decoding_copy(dicom_object, frame, VR::OB, PrimitiveValue::from(samples))?;
     if layout.samples_per_pixel == 3 {
@@ -917,13 +1043,21 @@ fn decode_pixel_frame_inner(
     let transfer_syntax = object.meta().transfer_syntax();
     let pixel_data = object.element(tags::PIXEL_DATA)?.value();
     let fragments = pixel_data.fragments();
+    let photometric = photometric_interpretation(object);
     if pixel_data.primitive().is_some()
-        && photometric_interpretation(object) == Some(PhotometricInterpretation::YbrFull422)
+        && matches!(
+            photometric,
+            Some(PhotometricInterpretation::YbrFull | PhotometricInterpretation::YbrFull422)
+        )
         && TransferSyntaxRegistry
             .get(transfer_syntax)
             .is_some_and(|syntax| !syntax.is_encapsulated_pixel_data())
     {
-        let native = native_ybr_full_422_frame(object, frame)?;
+        let native = native_ybr_frame(
+            object,
+            frame,
+            photometric == Some(PhotometricInterpretation::YbrFull422),
+        )?;
         return Ok(native.decode_pixel_data_frame(0)?.to_owned());
     }
     // Compressed pixel data is checked before any decoder sizes its output
@@ -973,12 +1107,14 @@ fn decode_pixel_frame_inner(
             "this JPEG Lossless image uses restart intervals, which the JPEG decoder reads wrongly"
         );
     }
+    let mut ybr_by_plane = false;
     if let Some(layout) = layout
         && let Some(read_size) = codestream_size_reader(transfer_syntax)
     {
-        let size = object
+        let stream = object
             .frame_pixel_data(frame)
-            .and_then(|stream| read_size(&stream))
+            .context("the compressed pixel data is damaged: its frame header is missing")?;
+        let size = read_size(&stream)
             .context("the compressed pixel data is damaged: its frame header is missing")?;
         ensure!(
             size.agrees_with(layout),
@@ -991,6 +1127,14 @@ fn decode_pixel_frame_inner(
             layout.rows,
             layout.samples_per_pixel
         );
+        if photometric == Some(PhotometricInterpretation::YbrFull)
+            && matches!(
+                transfer_syntax,
+                uids::JPEGLS_LOSSLESS | uids::JPEGLS_NEAR_LOSSLESS
+            )
+        {
+            ybr_by_plane = jpeg_ls_samples_by_plane(&stream)?;
+        }
     }
     // RLE and Deflated Image Frame Compression store one fragment per frame.
     if single_fragment_codec {
@@ -1003,12 +1147,38 @@ fn decode_pixel_frame_inner(
                     frame + 1
                 )
             })?;
-        if transfer_syntax == uids::DEFLATED_IMAGE_FRAME_COMPRESSION {
-            ensure_deflated_frame_fits(fragment, layout)?;
+        let native = if transfer_syntax == uids::RLE_LOSSLESS {
+            native_rle_frame(object, frame, layout, fragment)?
         } else {
-            let native = native_rle_frame(object, frame, layout, fragment)?;
-            return Ok(native.decode_pixel_data_frame(0)?.to_owned());
-        }
+            match photometric {
+                Some(PhotometricInterpretation::YbrFull422) => {
+                    let expected = ybr_full_422_frame_bytes(layout)?;
+                    let samples = inflate_frame(fragment, layout, expected, frame)?;
+                    ybr_full_422_frame(object, frame, layout, &samples)?
+                }
+                Some(PhotometricInterpretation::YbrFull) => {
+                    validate_ybr_full_layout(layout)?;
+                    let samples = inflate_frame(fragment, layout, layout.frame_bytes(), frame)?;
+                    ybr_full_frame(
+                        object,
+                        frame,
+                        layout,
+                        &samples,
+                        planar_configuration(object)? == 1,
+                    )?
+                }
+                _ => {
+                    let samples = inflate_frame(fragment, layout, layout.frame_bytes(), frame)?;
+                    single_frame_decoding_copy(
+                        object,
+                        frame,
+                        VR::OB,
+                        PrimitiveValue::from(samples),
+                    )?
+                }
+            }
+        };
+        return Ok(native.decode_pixel_data_frame(0)?.to_owned());
     }
     let result = if object.meta().transfer_syntax.trim_end_matches(['\0', ' '])
         == jpeg_extended::TRANSFER_SYNTAX
@@ -1017,7 +1187,35 @@ fn decode_pixel_frame_inner(
     } else {
         object.decode_pixel_data_frame(frame).map_err(Into::into)
     };
-    result.with_context(|| format!("could not decode DICOM pixel data frame {}", frame + 1))
+    let decoded =
+        result.with_context(|| format!("could not decode DICOM pixel data frame {}", frame + 1))?;
+    if let Some(layout) = layout
+        && photometric == Some(PhotometricInterpretation::YbrFull)
+        && decodes_colour_as_stored(transfer_syntax)
+    {
+        let native = ybr_full_frame(object, frame, layout, decoded.data(), ybr_by_plane)?;
+        return Ok(native.decode_pixel_data_frame(0)?.to_owned());
+    }
+    Ok(decoded)
+}
+
+/// These codecs return the stored color channels. JPEG Baseline and Extended
+/// already convert YCbCr to RGB, so they take the regular decoding path.
+fn decodes_colour_as_stored(transfer_syntax: &str) -> bool {
+    matches!(
+        transfer_syntax,
+        uids::JPEG_LOSSLESS
+            | uids::JPEG_LOSSLESS_SV1
+            | uids::JPEGLS_LOSSLESS
+            | uids::JPEGLS_NEAR_LOSSLESS
+            | uids::JPEG2000_LOSSLESS
+            | uids::JPEG2000
+            | uids::JPEG2000MC_LOSSLESS
+            | uids::JPEG2000MC
+            | uids::HTJ2K_LOSSLESS
+            | uids::HTJ2K_LOSSLESS_RPCL
+            | uids::HTJ2K
+    )
 }
 
 fn build_pixel_probe(decoded: &DecodedPixelData<'_>) -> Option<PixelProbeData> {
@@ -3551,6 +3749,170 @@ mod tests {
                 "{columns} x {rows}: {error}"
             );
         }
+    }
+
+    /// Compress raw pixel bytes without changing the sample layout.
+    fn raw_deflate(bytes: &[u8]) -> Vec<u8> {
+        use dicom_encoding::transfer_syntax::Codec;
+        use std::io::Write;
+
+        let Some(Codec::Dataset(Some(adapter))) = TransferSyntaxRegistry
+            .get(uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN)
+            .map(|transfer_syntax| transfer_syntax.codec())
+        else {
+            panic!("no deflate codec");
+        };
+        let mut stream = Vec::new();
+        {
+            let mut writer = adapter.adapt_writer(Box::new(&mut stream));
+            writer.write_all(bytes).unwrap();
+        }
+        stream
+    }
+
+    /// Native, RLE, and deflated frames produce the same RGB.
+    #[test]
+    fn ybr_full_colors_match_for_native_rle_and_deflate() {
+        let stored = [50_u8, 90, 170, 200, 90, 170];
+        let samples = stored.map(u16::from);
+        let mut native =
+            compressed_test_object(uids::EXPLICIT_VR_LITTLE_ENDIAN, VR::US, 1, 2, 8, vec![]);
+        native.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from(stored.to_vec()),
+        ));
+        let rle = compressed_test_object(
+            uids::RLE_LOSSLESS,
+            VR::US,
+            1,
+            2,
+            8,
+            rle_frame_fragment(&rle_segments(&samples, 3, 1, packbits_literals)),
+        );
+        let deflated = compressed_test_object(
+            uids::DEFLATED_IMAGE_FRAME_COMPRESSION,
+            VR::US,
+            1,
+            2,
+            8,
+            raw_deflate(&stored),
+        );
+        for (name, mut object) in [("native", native), ("RLE", rle), ("deflated", deflated)] {
+            set_layout(&mut object, 3);
+            object.put_element(DataElement::new(
+                tags::PHOTOMETRIC_INTERPRETATION,
+                VR::CS,
+                "YBR_FULL",
+            ));
+            let frame =
+                decode_frame(&object, 0).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_eq!(
+                rgb(&render_frame(&frame, None).unwrap().rgba),
+                [[109, 33, 0], [255, 183, 133]],
+                "{name}"
+            );
+        }
+    }
+
+    /// These CharLS fixtures encode the same two pixels with three layouts.
+    #[test]
+    fn ybr_full_jpeg_ls_uses_the_layout_from_the_scan_header() {
+        const HEADER: &[u8] = &[
+            0xff, 0xd8, 0xff, 0xf7, 0x00, 0x11, 0x08, 0x00, 0x01, 0x00, 0x02, 0x03, 0x01, 0x11,
+            0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+        ];
+        const PLANAR: &[u8] = &[
+            0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x62,
+            0x00, 0x00, 0x01, 0xd3, 0xff, 0xda, 0x00, 0x08, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0xb2, 0x80, 0xff, 0xda, 0x00, 0x08, 0x01, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0xa9, 0x80, 0xff, 0xd9,
+        ];
+        const LINE: &[u8] = &[
+            0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x01, 0x62, 0x00, 0x00, 0x01, 0xd3, 0x03, 0x38, 0x23, 0x54, 0x10, 0xff,
+            0xd9,
+        ];
+        const SAMPLE: &[u8] = &[
+            0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0x00, 0x01, 0x63, 0x06, 0x86, 0xb0, 0x00, 0x00, 0x1d, 0x38, 0x30, 0x40, 0xff,
+            0xd9,
+        ];
+        for (name, scan) in [("planar", PLANAR), ("line", LINE), ("sample", SAMPLE)] {
+            let mut object = compressed_test_object(
+                uids::JPEGLS_LOSSLESS,
+                VR::US,
+                1,
+                2,
+                8,
+                [HEADER, scan].concat(),
+            );
+            set_layout(&mut object, 3);
+            object.put_element(DataElement::new(
+                tags::PHOTOMETRIC_INTERPRETATION,
+                VR::CS,
+                "YBR_FULL",
+            ));
+            let frame =
+                decode_frame(&object, 0).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            assert_eq!(
+                rgb(&render_frame(&frame, None).unwrap().rgba),
+                [[109, 33, 0], [255, 183, 133]],
+                "{name}"
+            );
+        }
+    }
+
+    /// Each plane retains its sample precision and neutral chroma midpoint.
+    #[test]
+    fn planar_twelve_bit_ybr_full_preserves_luminance() {
+        let mut object =
+            compressed_test_object(uids::EXPLICIT_VR_LITTLE_ENDIAN, VR::US, 1, 2, 16, vec![]);
+        set_layout(&mut object, 3);
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            "YBR_FULL",
+        ));
+        for (tag, value) in [
+            (tags::BITS_STORED, 12_u16),
+            (tags::HIGH_BIT, 11),
+            (tags::PLANAR_CONFIGURATION, 1),
+        ] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        let samples = [0xF123, 0x0ABC, 0x0800, 0x0800, 0x0800, 0x0800];
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OW,
+            PrimitiveValue::U16(samples.to_vec().into()),
+        ));
+        let expected = native_bytes(&[0x0123, 0x0123, 0x0123, 0x0ABC, 0x0ABC, 0x0ABC], 16);
+        assert_eq!(decoded_bytes(&object, 0), Ok(expected));
+    }
+
+    /// Deflate uses the stored size of the shared chroma pairs.
+    #[test]
+    fn deflated_ybr_full_422_decodes_the_packed_frame() {
+        let mut object = compressed_test_object(
+            uids::DEFLATED_IMAGE_FRAME_COMPRESSION,
+            VR::US,
+            1,
+            2,
+            8,
+            raw_deflate(&[50, 200, 90, 170]),
+        );
+        set_layout(&mut object, 3);
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            "YBR_FULL_422",
+        ));
+        let frame = decode_frame(&object, 0).unwrap();
+        assert_eq!(
+            rgb(&render_frame(&frame, None).unwrap().rgba),
+            [[109, 33, 0], [255, 183, 133]]
+        );
     }
 
     /// `samples` as frames of `rows` x `columns` x `samples_per_pixel`,

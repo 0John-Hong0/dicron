@@ -903,14 +903,28 @@ pub(in crate::app) struct PreparedFrame {
     metadata: crate::dicom::DicomMetadata,
 }
 
+/// Render a loaded frame and recalculate a saved Full Dynamic preset.
 pub(in crate::app) fn prepare_frame(
     entry: &DecodedCacheEntry,
     saved_window_level: Option<SavedWindowLevel>,
 ) -> anyhow::Result<(PreparedFrame, crate::dicom::DisplayPixels)> {
     let (default_center, default_width) = entry.frame.default_center_width();
     let window_customized = saved_window_level.is_some();
-    let center = saved_window_level.map_or(default_center, |saved| saved.window.center);
-    let width = saved_window_level.map_or(default_width, |saved| saved.window.width);
+    let mut saved_window = saved_window_level.map(|saved| saved.window);
+    if saved_window_level.is_some_and(|saved| saved.preset == Some(WindowPreset::FullDynamic))
+        && entry.frame.window_level_available()
+    {
+        let range = entry
+            .frame
+            .full_dynamic_window()
+            .ok_or_else(|| anyhow::anyhow!("Full Dynamic requires a finite pixel value range"))?;
+        saved_window = Some(WindowLevel {
+            center: range.center,
+            width: range.width,
+        });
+    }
+    let center = saved_window.map_or(default_center, |window| window.center);
+    let width = saved_window.map_or(default_width, |window| window.width);
     let effective_window = window_customized.then_some(DicomWindow { center, width });
     let pixels = render_frame(&entry.frame, effective_window)?;
     let prepared = PreparedFrame {
@@ -1012,6 +1026,11 @@ impl DicronApp {
             prepared.window_level_available,
             prepared.active_window_preset,
         );
+        if prepared.active_window_preset == Some(WindowPreset::FullDynamic)
+            && prepared.window_level_available
+        {
+            self.save_current_series_window_level();
+        }
         self.selected_dicom_frame_index = frame_index;
         self.selected_dicom_frame_count = prepared.frame_count;
         self.loaded_texture = Some(loaded_texture);
@@ -2095,6 +2114,237 @@ mod loading_tests {
             PrimitiveValue::from(samples),
         ));
         object.write_to_file(path).unwrap();
+    }
+
+    /// A one-row, unsigned 16-bit grayscale image of `values`, without a window.
+    fn write_16_bit_row_dicom(path: &std::path::Path, values: &[u16]) {
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+            .media_storage_sop_class_uid(uids::CT_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid("2.25.602")
+            .build()
+            .unwrap();
+        let mut object = FileDicomObject::new_empty_with_meta(meta);
+        for (tag, value) in [
+            (tags::ROWS, 1_u16),
+            (tags::COLUMNS, values.len() as u16),
+            (tags::SAMPLES_PER_PIXEL, 1_u16),
+            (tags::BITS_ALLOCATED, 16_u16),
+            (tags::BITS_STORED, 16_u16),
+            (tags::HIGH_BIT, 15_u16),
+            (tags::PIXEL_REPRESENTATION, 0_u16),
+        ] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        object.put_element(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            PrimitiveValue::from("MONOCHROME2"),
+        ));
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OW,
+            PrimitiveValue::U16(values.to_vec().into()),
+        ));
+        object.write_to_file(path).unwrap();
+    }
+
+    /// Full Dynamic spans the values of the slice on screen, so stepping to a
+    /// slice with a wider range windows that slice to its own range under the
+    /// same label. A window set by another preset or typed in is a fixed pair
+    /// of numbers and carries over to the next slice unchanged.
+    #[test]
+    fn full_dynamic_follows_each_slice_while_other_windows_carry_over() {
+        let narrow = temporary_file("full-dynamic-narrow");
+        let wide = temporary_file("full-dynamic-wide");
+        write_16_bit_row_dicom(&narrow, &[0, 100]);
+        write_16_bit_row_dicom(&wide, &[0, 1000]);
+        let mut index = build_for_file(&narrow).unwrap();
+        index.patients[0].studies[0].series_groups[0]
+            .slices
+            .push(SliceItem {
+                path: wide.to_path_buf(),
+                display_name: "wide".to_owned(),
+                frame_index: 0,
+                instance_number: None,
+                instance_creation_time: None,
+                sort_position: None,
+            });
+        let context = egui::Context::default();
+        let mut app = DicronApp {
+            dicom_index: Some(index),
+            ..Default::default()
+        };
+        let series = (0, 0, 0);
+
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
+        app.apply_window_preset(&context, WindowPreset::FullDynamic);
+        assert_eq!(
+            app.window_level.current,
+            WindowLevel {
+                center: 50.0,
+                width: 100.0,
+            }
+        );
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 1));
+        assert_eq!(
+            app.window_level.current,
+            WindowLevel {
+                center: 500.0,
+                width: 1000.0,
+            }
+        );
+        assert_eq!(app.window_level.active_preset_label(), "Full Dynamic");
+        assert_eq!(
+            app.window_level.by_series[&series].window, app.window_level.current,
+            "the 3D planes open on the window the slice is shown with"
+        );
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
+        assert_eq!(
+            app.window_level.current,
+            WindowLevel {
+                center: 50.0,
+                width: 100.0,
+            }
+        );
+
+        app.apply_window_preset(&context, WindowPreset::Lung);
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 1));
+        assert_eq!(
+            app.window_level.current,
+            WindowPreset::Lung.fixed_window().unwrap()
+        );
+        assert_eq!(app.window_level.active_preset, Some(WindowPreset::Lung));
+
+        let typed = WindowLevel {
+            center: 30.0,
+            width: 60.0,
+        };
+        app.window_level.by_series.insert(
+            series,
+            SavedWindowLevel {
+                window: typed,
+                preset: None,
+            },
+        );
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
+        assert_eq!(app.window_level.current, typed);
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 1));
+        assert_eq!(app.window_level.current, typed);
+        assert_eq!(app.window_level.active_preset_label(), "Custom");
+    }
+
+    /// A one-row, unsigned 16-bit grayscale image with a frame for each of
+    /// `frames`, all of one length, without a window.
+    fn write_16_bit_frames_dicom(path: &std::path::Path, frames: &[&[u16]]) {
+        write_16_bit_row_dicom(path, &frames.concat());
+        let mut object = dicom_object::open_file(path).unwrap();
+        object.put_element(DataElement::new(
+            tags::COLUMNS,
+            VR::US,
+            PrimitiveValue::from(frames[0].len() as u16),
+        ));
+        object.put_element(DataElement::new(
+            tags::NUMBER_OF_FRAMES,
+            VR::IS,
+            PrimitiveValue::from(frames.len().to_string()),
+        ));
+        object.write_to_file(path).unwrap();
+    }
+
+    /// Stepping through the frames of one multi-frame image under Full
+    /// Dynamic windows each frame to its own range, as stepping through
+    /// single-frame slices does.
+    #[test]
+    fn full_dynamic_follows_each_frame_of_a_multi_frame_image() {
+        let path = temporary_file("full-dynamic-frames");
+        write_16_bit_frames_dicom(&path, &[&[0, 100], &[0, 1000]]);
+        let index = build_for_file(&path).unwrap();
+        let slices = &index.patients[0].studies[0].series_groups[0].slices;
+        assert_eq!(
+            slices
+                .iter()
+                .map(|slice| slice.frame_index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        let context = egui::Context::default();
+        let mut app = DicronApp {
+            dicom_index: Some(index),
+            ..Default::default()
+        };
+
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
+        app.apply_window_preset(&context, WindowPreset::FullDynamic);
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 1));
+
+        assert_eq!(
+            app.window_level.current,
+            WindowLevel {
+                center: 500.0,
+                width: 1000.0,
+            }
+        );
+        assert_eq!(app.window_level.active_preset_label(), "Full Dynamic");
+    }
+
+    /// Full Dynamic measures a slice in its rescaled (modality) values, the
+    /// same units the window is given in, whether the preset is pressed on
+    /// that slice or carried to it from another.
+    #[test]
+    fn full_dynamic_carried_to_a_rescaled_slice_spans_its_rescaled_values() {
+        let plain = temporary_file("full-dynamic-plain");
+        let rescaled = temporary_file("full-dynamic-rescaled");
+        write_16_bit_row_dicom(&plain, &[0, 100]);
+        write_16_bit_row_dicom(&rescaled, &[0, 1000]);
+        let mut object = dicom_object::open_file(&*rescaled).unwrap();
+        for (tag, value) in [
+            (tags::RESCALE_INTERCEPT, "-1000"),
+            (tags::RESCALE_SLOPE, "2"),
+        ] {
+            object.put_element(DataElement::new(tag, VR::DS, PrimitiveValue::from(value)));
+        }
+        object.write_to_file(&*rescaled).unwrap();
+        let mut index = build_for_file(&plain).unwrap();
+        index.patients[0].studies[0].series_groups[0]
+            .slices
+            .push(SliceItem {
+                path: rescaled.to_path_buf(),
+                display_name: "rescaled".to_owned(),
+                frame_index: 0,
+                instance_number: None,
+                instance_creation_time: None,
+                sort_position: None,
+            });
+        let context = egui::Context::default();
+        let mut app = DicronApp {
+            dicom_index: Some(index),
+            ..Default::default()
+        };
+        // -1000 .. 1000 after the rescale.
+        let rescaled_full_dynamic = WindowLevel {
+            center: 0.0,
+            width: 2000.0,
+        };
+
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 1));
+        app.apply_window_preset(&context, WindowPreset::FullDynamic);
+        assert_eq!(app.window_level.current, rescaled_full_dynamic);
+
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
+        assert_eq!(
+            app.window_level.current,
+            WindowLevel {
+                center: 50.0,
+                width: 100.0,
+            }
+        );
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 1));
+        assert_eq!(app.window_level.current, rescaled_full_dynamic);
+        assert_eq!(
+            app.effective_window().map(|w| (w.center, w.width)),
+            Some((0.0, 2000.0))
+        );
     }
 
     /// A signed image without a window opens with a W/L default that is the
