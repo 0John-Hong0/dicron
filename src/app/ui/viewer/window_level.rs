@@ -106,7 +106,7 @@ impl DicronApp {
         self.refresh_dicom_texture(context);
     }
 
-    pub(super) fn save_current_series_window_level(&mut self) {
+    pub(in crate::app) fn save_current_series_window_level(&mut self) {
         let Some(series_key) = self.current_series_key() else {
             return;
         };
