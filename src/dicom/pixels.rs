@@ -4,15 +4,16 @@ use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use dicom_core::header::HasLength;
+use dicom_core::header::{HasLength, Header};
+use dicom_core::value::DataSetSequence;
 use dicom_core::{DataElement, PrimitiveValue, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_encoding::adapters::PixelDataObject;
 use dicom_encoding::transfer_syntax::{Codec, TransferSyntaxIndex};
 use dicom_object::DefaultDicomObject;
 use dicom_pixeldata::{
-    ConvertOptions, DecodedPixelData, PhotometricInterpretation, PixelDecoder, VoiLutOption,
-    WindowLevel,
+    ConvertOptions, DecodedPixelData, PhotometricInterpretation, PixelDecoder, PixelRepresentation,
+    VoiLutOption, WindowLevel,
 };
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 
@@ -80,7 +81,7 @@ pub(crate) struct DecodedFrame {
     overlay_bitmaps: Vec<OverlayBitmap>,
     pixel_probe: Option<PixelProbeData>,
     pub(crate) frame_count: u32,
-    /// The file's own WindowCenter/WindowWidth, when present and finite.
+    /// The decoded frame's own window, when usable.
     pub(crate) default_window: Option<DicomWindow>,
     /// The window the frame is drawn with when none is requested, if the file
     /// leaves it to the viewer; see [`implicit_window`].
@@ -611,6 +612,53 @@ fn jp2_codestream(file: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// Rebuild one decoded frame as native pixel data, retaining shared attributes
+/// and only that frame's item from the per-frame functional groups.
+pub(super) fn single_frame_decoding_copy(
+    object: &DefaultDicomObject,
+    frame: u32,
+    vr: VR,
+    samples: PrimitiveValue,
+) -> Result<DefaultDicomObject> {
+    let frame_groups = object
+        .element_opt(tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE)?
+        .map(|sequence| {
+            sequence
+                .value()
+                .items()
+                .and_then(|items| items.get(frame as usize))
+                .with_context(|| {
+                    format!(
+                        "missing functional groups for frame {}",
+                        u64::from(frame) + 1
+                    )
+                })
+        })
+        .transpose()?;
+
+    let mut meta = object.meta().clone();
+    meta.transfer_syntax = uids::EXPLICIT_VR_LITTLE_ENDIAN.to_owned();
+    let mut native = DefaultDicomObject::new_empty_with_meta(meta);
+    for element in object.iter().filter(|element| {
+        !matches!(
+            element.tag(),
+            tags::PIXEL_DATA | tags::NUMBER_OF_FRAMES | tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE
+        )
+    }) {
+        native.put_element(element.clone());
+    }
+    native.put_element(DataElement::new(tags::PIXEL_DATA, vr, samples));
+    native.put_element(DataElement::new(tags::NUMBER_OF_FRAMES, VR::IS, "1"));
+    if let Some(frame_groups) = frame_groups {
+        native.put_element(DataElement::new(
+            tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE,
+            VR::SQ,
+            DataSetSequence::from(vec![frame_groups.clone()]),
+        ));
+    }
+    Ok(native)
+}
+
 /// The frame as an uncompressed copy of the object when it is 8-bit grayscale
 /// RLE. dicom-transfer-syntax-registry 0.9.1 decodes that one sample late: for
 /// one sample per pixel it starts writing at `samples_per_pixel - byte_offset`,
@@ -621,6 +669,7 @@ fn jp2_codestream(file: &[u8]) -> Option<&[u8]> {
 /// data with the object's own attributes.
 fn native_8_bit_rle_frame(
     dicom_object: &DefaultDicomObject,
+    frame: u32,
     layout: FrameLayout,
     fragment: &[u8],
     segment_starts: &[usize],
@@ -642,20 +691,12 @@ fn native_8_bit_rle_frame(
         layout.pixels() as usize,
     )
     .context("the RLE pixel data is damaged")?;
-    let mut native = dicom_object.clone();
-    native.put_element(DataElement::new(
-        tags::PIXEL_DATA,
+    Ok(Some(single_frame_decoding_copy(
+        dicom_object,
+        frame,
         VR::OB,
         PrimitiveValue::from(samples),
-    ));
-    native.put_element(DataElement::new(
-        tags::NUMBER_OF_FRAMES,
-        VR::IS,
-        PrimitiveValue::from("1"),
-    ));
-    native.meta_mut().transfer_syntax = uids::EXPLICIT_VR_LITTLE_ENDIAN.to_owned();
-
-    Ok(Some(native))
+    )?))
 }
 
 /// The first `length` bytes a PackBits run sequence expands to, or `None` when
@@ -701,15 +742,24 @@ fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<D
         Some(PixelProbeData::Monochrome { values, .. }) => Ok(values.as_slice()),
         _ => bail!("could not read rescaled grayscale values"),
     })?;
+    let default_window = decoded
+        .window()?
+        .and_then(<[_]>::first)
+        .filter(|window| usable_window(window))
+        .map(|window| DicomWindow {
+            center: window.center,
+            width: window.width,
+        });
+    let value_range = compute_value_range(&decoded)?;
 
     Ok(DecodedFrame {
         decoded,
         overlay_bitmaps,
         pixel_probe,
         frame_count,
-        default_window: read_default_window(dicom_object),
+        default_window,
         implicit_window,
-        value_range: compute_value_range(dicom_object),
+        value_range,
         window_level_available,
     })
 }
@@ -845,7 +895,8 @@ fn decode_pixel_frame_inner(
             ensure_deflated_frame_fits(fragment, layout)?;
         } else {
             let segment_starts = rle_segment_starts(fragment, layout)?;
-            if let Some(native) = native_8_bit_rle_frame(object, layout, fragment, &segment_starts)?
+            if let Some(native) =
+                native_8_bit_rle_frame(object, frame, layout, fragment, &segment_starts)?
             {
                 return Ok(native.decode_pixel_data_frame(0)?.to_owned());
             }
@@ -986,12 +1037,9 @@ fn implicit_window<V: AsRef<[f64]>>(
     }
 
     let stated_window = decoded.window()?.and_then(<[_]>::first);
-    let has_usable_window = stated_window.is_some_and(|window| {
-        window.center.is_finite() && window.width.is_finite() && window.width > 0.0
-    });
     let stated_window_is_not_a_number =
         stated_window.is_some_and(|window| !window.center.is_finite() || !window.width.is_finite());
-    if has_usable_window
+    if stated_window.is_some_and(usable_window)
         || decoded.voi_lut_sequence()?.is_some()
         || has_black_overlay_background(decoded, overlay_bitmaps)?
     {
@@ -1026,39 +1074,33 @@ fn thumbnail_dimensions(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
     }
 }
 
-fn read_default_window(dicom_object: &DefaultDicomObject) -> Option<DicomWindow> {
-    let center = first_parsed::<f64>(dicom_object, "WindowCenter")?;
-    let width = first_parsed::<f64>(dicom_object, "WindowWidth")?;
-
-    if !center.is_finite() || !width.is_finite() || width <= 0.0 {
-        return None;
-    }
-
-    Some(DicomWindow { center, width })
+fn usable_window(window: &WindowLevel) -> bool {
+    window.center.is_finite() && window.width.is_finite() && window.width > 0.0
 }
 
-/// Rescaled value range from BitsStored / PixelRepresentation and the modality
-/// LUT (RescaleSlope/Intercept). Used to bound interactive windowing and to
-/// derive a default window for files without WindowCenter/WindowWidth.
-fn compute_value_range(dicom_object: &DefaultDicomObject) -> (f64, f64) {
-    let bits_stored = first_parsed::<u32>(dicom_object, "BitsStored")
-        .unwrap_or(16)
-        .clamp(1, 32);
-    let is_signed = first_parsed::<u32>(dicom_object, "PixelRepresentation").unwrap_or(0) == 1;
-    let slope = finite_or(first_parsed::<f64>(dicom_object, "RescaleSlope"), 1.0);
-    let intercept = finite_or(first_parsed::<f64>(dicom_object, "RescaleIntercept"), 0.0);
+/// Bound interactive windowing using the stored sample range and the same
+/// rescale parameters the decoder uses for this frame.
+fn compute_value_range(decoded: &DecodedPixelData<'_>) -> Result<(f64, f64)> {
+    let bits_stored = i32::from(decoded.bits_stored().clamp(1, 32));
+    let rescale = decoded
+        .rescale()?
+        .first()
+        .context("missing frame rescale parameters")?;
+    let slope = finite_or(rescale.slope, 1.0);
+    let intercept = finite_or(rescale.intercept, 0.0);
 
-    let (stored_min, stored_max) = if is_signed {
-        let half = 2_f64.powi(bits_stored as i32 - 1);
+    let (stored_min, stored_max) = if decoded.pixel_representation() == PixelRepresentation::Signed
+    {
+        let half = 2_f64.powi(bits_stored - 1);
         (-half, half - 1.0)
     } else {
-        (0.0, 2_f64.powi(bits_stored as i32) - 1.0)
+        (0.0, 2_f64.powi(bits_stored) - 1.0)
     };
 
     let first = slope * stored_min + intercept;
     let second = slope * stored_max + intercept;
 
-    (first.min(second), first.max(second))
+    Ok((first.min(second), first.max(second)))
 }
 
 fn finite_value_range(values: &[f64]) -> Option<(f64, f64)> {
@@ -1072,11 +1114,8 @@ fn finite_value_range(values: &[f64]) -> Option<(f64, f64)> {
         })
 }
 
-fn finite_or(value: Option<f64>, fallback: f64) -> f64 {
-    match value {
-        Some(value) if value.is_finite() => value,
-        _ => fallback,
-    }
+fn finite_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() { value } else { fallback }
 }
 
 fn first_parsed<T>(dicom_object: &DefaultDicomObject, keyword: &str) -> Option<T>
@@ -2648,6 +2687,138 @@ mod tests {
                     "{bits_allocated} bit"
                 );
             }
+        }
+    }
+
+    fn enhanced_frame_groups(
+        center: &str,
+        width: &str,
+        slope: &str,
+        intercept: &str,
+    ) -> dicom_object::InMemDicomObject {
+        use dicom_core::value::DataSetSequence;
+        use dicom_object::InMemDicomObject;
+
+        let voi = InMemDicomObject::from_element_iter([
+            DataElement::new(tags::WINDOW_CENTER, VR::DS, center),
+            DataElement::new(tags::WINDOW_WIDTH, VR::DS, width),
+        ]);
+        let rescale = InMemDicomObject::from_element_iter([
+            DataElement::new(tags::RESCALE_SLOPE, VR::DS, slope),
+            DataElement::new(tags::RESCALE_INTERCEPT, VR::DS, intercept),
+        ]);
+        InMemDicomObject::from_element_iter([
+            DataElement::new(
+                tags::FRAME_VOILUT_SEQUENCE,
+                VR::SQ,
+                DataSetSequence::from(vec![voi]),
+            ),
+            DataElement::new(
+                tags::PIXEL_VALUE_TRANSFORMATION_SEQUENCE,
+                VR::SQ,
+                DataSetSequence::from(vec![rescale]),
+            ),
+        ])
+    }
+
+    /// Two 8-bit grayscale frames with the same samples on each decode path.
+    fn enhanced_test_image(transfer_syntax: &str) -> DefaultDicomObject {
+        const SAMPLE: u16 = 11;
+        if transfer_syntax == uids::RLE_LOSSLESS {
+            let fragment = rle_frame_fragment(&[packbits_literals(&[SAMPLE as u8; 64])]);
+            let mut object = compressed_test_object(uids::RLE_LOSSLESS, VR::US, 8, 8, 8, vec![]);
+            object.put_element(DataElement::new(tags::NUMBER_OF_FRAMES, VR::IS, "2"));
+            return with_fragments(&object, vec![], vec![fragment.clone(), fragment]);
+        }
+
+        if transfer_syntax == uids::JPEG_EXTENDED12_BIT {
+            let baseline = encoded_object(uids::JPEG_BASELINE8_BIT, (8, 8, 1), 8, &[SAMPLE; 128]);
+            let (_, fragments) = pixel_fragments(&baseline);
+            let mut object = with_fragments(&baseline, vec![], fragments);
+            object.meta_mut().transfer_syntax = transfer_syntax.to_owned();
+            return object;
+        }
+
+        encoded_object(transfer_syntax, (8, 8, 1), 8, &[SAMPLE; 128])
+    }
+
+    #[test]
+    fn enhanced_frames_use_their_own_window_and_rescale() {
+        use dicom_core::value::DataSetSequence;
+
+        for syntax in [
+            uids::EXPLICIT_VR_LITTLE_ENDIAN,
+            uids::RLE_LOSSLESS,
+            uids::JPEG_EXTENDED12_BIT,
+        ] {
+            let mut object = enhanced_test_image(syntax);
+            object.put_element(DataElement::new(
+                tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE,
+                VR::SQ,
+                DataSetSequence::from(vec![
+                    enhanced_frame_groups("20", "40", "2", "-5"),
+                    enhanced_frame_groups("150", "200", "3", "100"),
+                ]),
+            ));
+
+            for (index, window, range, sample) in [
+                (0, (20.0, 40.0), (-5.0, 505.0), 17.0),
+                (1, (150.0, 200.0), (100.0, 865.0), 133.0),
+            ] {
+                let frame = decode_frame(&object, index).unwrap();
+                assert_eq!(
+                    frame.default_center_width(),
+                    window,
+                    "{syntax}, frame {index}"
+                );
+                assert_eq!(frame.value_range, range, "{syntax}, frame {index}");
+                assert_eq!(
+                    frame.pixel_probe(0, 0),
+                    Some(PixelProbeValue::Monochrome(sample)),
+                    "{syntax}, frame {index}"
+                );
+                let (center, width) = window;
+                let original = render_frame(&frame, None).unwrap();
+                let explicit =
+                    render_frame(&frame, Some(super::DicomWindow { center, width })).unwrap();
+                assert_eq!(original.rgba, explicit.rgba, "{syntax}, frame {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn rebuilt_frames_keep_shared_groups_and_reject_missing_frame_items() {
+        use dicom_core::value::DataSetSequence;
+
+        for syntax in [uids::RLE_LOSSLESS, uids::JPEG_EXTENDED12_BIT] {
+            let mut object = enhanced_test_image(syntax);
+            object.put_element(DataElement::new(
+                tags::SHARED_FUNCTIONAL_GROUPS_SEQUENCE,
+                VR::SQ,
+                DataSetSequence::from(vec![enhanced_frame_groups("20", "40", "2", "-5")]),
+            ));
+            let second = decode_frame(&object, 1).unwrap();
+            assert_eq!(second.default_center_width(), (20.0, 40.0), "{syntax}");
+            assert_eq!(
+                second.pixel_probe(0, 0),
+                Some(PixelProbeValue::Monochrome(17.0)),
+                "{syntax}"
+            );
+
+            object.remove_element(tags::SHARED_FUNCTIONAL_GROUPS_SEQUENCE);
+            object.put_element(DataElement::new(
+                tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE,
+                VR::SQ,
+                DataSetSequence::from(vec![enhanced_frame_groups("20", "40", "2", "-5")]),
+            ));
+            assert!(decode_frame(&object, 0).is_ok(), "{syntax}");
+            let error = decode_frame(&object, 1)
+                .err()
+                .expect("missing group must fail");
+            assert!(
+                format!("{error:#}").contains("missing functional groups for frame 2"),
+                "{syntax}: {error:#}"
+            );
         }
     }
 

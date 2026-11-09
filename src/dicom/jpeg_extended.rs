@@ -5,11 +5,13 @@ use std::ffi::{CStr, c_void};
 use std::ptr::NonNull;
 
 use anyhow::{Context, Result, ensure};
-use dicom_core::{DataElement, Length, PrimitiveValue, VR, value::Value};
+use dicom_core::{DataElement, PrimitiveValue, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_object::DefaultDicomObject;
 use dicom_pixeldata::{DecodedPixelData, PixelDecoder};
 use turbojpeg_sys as jpeg;
+
+use super::pixels::single_frame_decoding_copy;
 
 // The crate's pregenerated bindings define size_t as c_ulong, which differs from
 // size_t on 64-bit Windows. These three size-taking calls use usize on every target.
@@ -68,26 +70,8 @@ pub(super) fn decode_frame(
     let decoder = Decoder::new()?;
     let decoded = decoder.decode(&encoded, width, height, samples, allocated, stored)?;
 
-    // Feed the decoded samples back through dicom-pixeldata's normal presentation handling.
-    // Only this temporary object changes; the source file and displayed metadata keep their
-    // original transfer syntax. Retain the selected frame's functional groups for its rescale/VOI.
-    let mut native = object.clone();
-    native.meta_mut().transfer_syntax = uids::EXPLICIT_VR_LITTLE_ENDIAN.to_owned();
-    native.put_element(DataElement::new(tags::PIXEL_DATA, VR::OW, decoded));
-    native.put_element(DataElement::new(tags::NUMBER_OF_FRAMES, VR::IS, "1"));
-    if let Some(groups) = object.element_opt(tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE)? {
-        let selected = groups
-            .value()
-            .items()
-            .and_then(|items| items.get(frame as usize))
-            .context("Missing functional groups for JPEG frame")?
-            .clone();
-        native.put_element(DataElement::new(
-            tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE,
-            VR::SQ,
-            Value::new_sequence(vec![selected], Length::UNDEFINED),
-        ));
-    }
+    // Apply the selected frame's presentation settings to the decoded samples.
+    let mut native = single_frame_decoding_copy(object, frame, VR::OW, decoded)?;
     if samples == 3 {
         native.put_element(DataElement::new(
             tags::PHOTOMETRIC_INTERPRETATION,
