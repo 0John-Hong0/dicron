@@ -5,13 +5,13 @@ use std::ffi::{CStr, c_void};
 use std::ptr::NonNull;
 
 use anyhow::{Context, Result, ensure};
-use dicom_core::{DataElement, PrimitiveValue, VR};
+use dicom_core::{PrimitiveValue, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_object::DefaultDicomObject;
 use dicom_pixeldata::{DecodedPixelData, PixelDecoder};
 use turbojpeg_sys as jpeg;
 
-use super::pixels::single_frame_decoding_copy;
+use super::pixels::{rgb_decoding_copy, single_frame_decoding_copy};
 
 // The crate's pregenerated bindings define size_t as c_ulong, which differs from
 // size_t on 64-bit Windows. These three size-taking calls use usize on every target.
@@ -71,19 +71,11 @@ pub(super) fn decode_frame(
     let decoded = decoder.decode(&encoded, width, height, samples, allocated, stored)?;
 
     // Apply the selected frame's presentation settings to the decoded samples.
-    let mut native = single_frame_decoding_copy(object, frame, VR::OW, decoded)?;
-    if samples == 3 {
-        native.put_element(DataElement::new(
-            tags::PHOTOMETRIC_INTERPRETATION,
-            VR::CS,
-            "RGB",
-        ));
-        native.put_element(DataElement::new(
-            tags::PLANAR_CONFIGURATION,
-            VR::US,
-            PrimitiveValue::from(0_u16),
-        ));
-    }
+    let native = if samples == 3 {
+        rgb_decoding_copy(object, frame, VR::OW, decoded)?
+    } else {
+        single_frame_decoding_copy(object, frame, VR::OW, decoded)?
+    };
     Ok(native.decode_pixel_data_frame(0)?.to_owned())
 }
 
