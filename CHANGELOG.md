@@ -6,6 +6,8 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-11
+
 - Build Debian packages on Ubuntu 20.04 and reject binaries that require glibc newer than 2.31.
 - Add window/level and Full Dynamic controls for color images, keeping color and grayscale
   windows separate within a series and showing CT presets only for grayscale frames.
