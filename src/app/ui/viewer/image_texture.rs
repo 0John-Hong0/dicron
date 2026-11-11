@@ -44,43 +44,54 @@ pub(in crate::app) fn upload_display_pixels(
     context.load_texture(texture_name, color_image, egui::TextureOptions::LINEAR)
 }
 
-/// The pixels shrunk by one whole factor on both sides, so that neither side
-/// exceeds `max_texture_side`. Each texel is the mean of the block of pixels
-/// it stands for.
+/// Fit oversized pixels to the texture limit, rounding the shorter side to
+/// preserve their proportions. Average each source pixel's area of overlap
+/// with the output texel, including fractional edge pixels.
 fn shrunk_to_texture_side(pixels: DisplayPixels, max_texture_side: usize) -> DisplayPixels {
-    let factor = pixels
-        .width
-        .max(pixels.height)
-        .div_ceil(max_texture_side.max(1));
-    if factor <= 1 {
+    let longest_side = pixels.width.max(pixels.height);
+    let limit = max_texture_side.max(1);
+    if longest_side <= limit {
         return pixels;
     }
 
-    let width = pixels.width.div_ceil(factor);
-    let height = pixels.height.div_ceil(factor);
+    let scaled_side = |side: usize| {
+        ((side as u128 * limit as u128 + longest_side as u128 / 2) / longest_side as u128).max(1)
+            as usize
+    };
+    let width = scaled_side(pixels.width);
+    let height = scaled_side(pixels.height);
     let mut rgba = Vec::with_capacity(width * height * 4);
 
     for row in 0..height {
-        let block_rows = row * factor..((row + 1) * factor).min(pixels.height);
+        let top = row as f64 * pixels.height as f64 / height as f64;
+        let bottom = (row + 1) as f64 * pixels.height as f64 / height as f64;
+        let block_rows = top.floor() as usize..(bottom.ceil() as usize).min(pixels.height);
 
         for column in 0..width {
-            let block_columns = column * factor..((column + 1) * factor).min(pixels.width);
-            let mut channel_sums = [0_u64; 4];
+            let left = column as f64 * pixels.width as f64 / width as f64;
+            let right = (column + 1) as f64 * pixels.width as f64 / width as f64;
+            let block_columns = left.floor() as usize..(right.ceil() as usize).min(pixels.width);
+            let mut channel_sums = [0.0_f64; 4];
 
             for block_row in block_rows.clone() {
+                let row_weight = bottom.min((block_row + 1) as f64) - top.max(block_row as f64);
                 let row_start = block_row * pixels.width;
-                let block_pixels = &pixels.rgba
-                    [(row_start + block_columns.start) * 4..(row_start + block_columns.end) * 4];
-
-                for pixel in block_pixels.chunks_exact(4) {
-                    for (sum, &channel) in channel_sums.iter_mut().zip(pixel) {
-                        *sum += u64::from(channel);
+                for block_column in block_columns.clone() {
+                    let column_weight =
+                        right.min((block_column + 1) as f64) - left.max(block_column as f64);
+                    let weight = row_weight * column_weight;
+                    let offset = (row_start + block_column) * 4;
+                    for (sum, &channel) in channel_sums
+                        .iter_mut()
+                        .zip(&pixels.rgba[offset..offset + 4])
+                    {
+                        *sum += f64::from(channel) * weight;
                     }
                 }
             }
 
-            let pixel_count = (block_rows.len() * block_columns.len()) as u64;
-            rgba.extend(channel_sums.map(|sum| ((sum + pixel_count / 2) / pixel_count) as u8));
+            let area = (bottom - top) * (right - left);
+            rgba.extend(channel_sums.map(|sum| (sum / area).round() as u8));
         }
     }
 
@@ -116,8 +127,8 @@ mod tests {
     use crate::dicom::DisplayPixels;
 
     #[test]
-    fn oversized_pixels_shrink_to_the_block_means() {
-        // Five grey pixels in a row, two to a texel; the last texel holds one.
+    fn oversized_pixels_average_fractional_source_areas() {
+        // Five gray pixels span three output texels, each covering 5/3 source pixels.
         let greys = [10_u8, 20, 30, 41, 50];
         let pixels = DisplayPixels {
             width: 5,
@@ -133,7 +144,7 @@ mod tests {
         assert_eq!([shrunk.width, shrunk.height], [3, 1]);
         assert_eq!(
             shrunk.rgba,
-            [15, 15, 15, 255, 36, 36, 36, 255, 50, 50, 50, 255]
+            [14, 14, 14, 255, 30, 30, 30, 255, 46, 46, 46, 255]
         );
     }
 
@@ -152,11 +163,10 @@ mod tests {
         }
     }
 
-    /// A tall image shrinks on both sides by one factor, each channel
-    /// averaged over its own block of rows and columns, partial blocks
-    /// included.
+    /// A tall image averages all channels over the source areas it covers,
+    /// with fractional rows contributing to both output rows.
     #[test]
-    fn tall_pixels_shrink_by_one_factor_per_channel() {
+    fn tall_pixels_average_each_channel_over_fractional_rows() {
         let tall = pixels(3, 5, |column, row| {
             let value = (10 * row + column) as u8;
             [value, 100 - value, column as u8 * 50, 200 + row as u8]
@@ -165,10 +175,29 @@ mod tests {
         let shrunk = shrunk_to_texture_side(tall, 2);
 
         assert_eq!([shrunk.width, shrunk.height], [1, 2]);
-        assert_eq!(shrunk.rgba, [11, 89, 50, 201, 36, 64, 50, 204]);
+        assert_eq!(shrunk.rgba, [9, 91, 50, 201, 33, 67, 50, 203]);
     }
 
-    /// Images at the limit keep every pixel; one pixel over halves them.
+    /// Crossing the texture limit by one pixel keeps nearly full resolution
+    /// and retains fine alternating lines near the edges in either orientation.
+    #[test]
+    fn images_just_over_the_limit_retain_resolution_and_detail() {
+        for (width, height, expected_size) in [(8193, 512, [8192, 512]), (512, 8193, [512, 8192])] {
+            let source = pixels(width, height, |column, row| {
+                let index = if width > height { column } else { row };
+                let value = if index % 2 == 0 { 0 } else { 255 };
+                [value, value, value, 200]
+            });
+            let shrunk = shrunk_to_texture_side(source, 8192);
+            assert_eq!([shrunk.width, shrunk.height], expected_size);
+            let offset = if width > height { 4 } else { shrunk.width * 4 };
+            assert_eq!(&shrunk.rgba[..4], &[0, 0, 0, 200]);
+            assert_eq!(&shrunk.rgba[offset..offset + 4], &[255, 255, 255, 200]);
+            assert_eq!(&shrunk.rgba[shrunk.rgba.len() - 4..], &[0, 0, 0, 200]);
+        }
+    }
+
+    /// Images at the limit keep every pixel; oversized images use the limit.
     #[test]
     fn only_images_over_the_limit_shrink() {
         let row = |width| pixels(width, 1, |column, _| [column as u8; 4]);
@@ -178,7 +207,7 @@ mod tests {
         assert_eq!(at_limit.rgba, row(4).rgba);
 
         let over_limit = shrunk_to_texture_side(row(5), 4);
-        assert_eq!([over_limit.width, over_limit.height], [3, 1]);
+        assert_eq!([over_limit.width, over_limit.height], [4, 1]);
 
         let single = shrunk_to_texture_side(row(1), 0);
         assert_eq!([single.width, single.height], [1, 1]);

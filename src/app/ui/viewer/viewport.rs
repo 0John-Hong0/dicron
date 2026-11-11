@@ -883,9 +883,8 @@ mod tests {
         assert_eq!(texture_size, [3000, 16]);
     }
 
-    /// Shrinking a one-row strip keeps its single row, so the texture is half
-    /// as long for its height as the source; the strip is still laid out and
-    /// probed at the source's proportions.
+    /// A one-row strip uses the full texture limit and keeps its single row,
+    /// while layout and the probe use the source dimensions.
     #[test]
     fn oversized_one_row_strips_keep_their_source_proportions() {
         let context = egui::Context::default();
@@ -894,7 +893,7 @@ mod tests {
         let (image_rect, texture_id) = painted_image(&paint_viewer(&context, &mut app, None));
         let texture_size = context.tex_manager().read().meta(texture_id).unwrap().size;
 
-        assert_eq!(texture_size, [4100, 1]);
+        assert_eq!(texture_size, [8192, 1]);
         assert!(
             (image_rect.aspect_ratio() / 8200.0 - 1.0).abs() < 0.01,
             "{image_rect:?}"
