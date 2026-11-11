@@ -3,12 +3,38 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Dicron — DICOM Viewer</title>
-  <meta name="description" content="Dicron is a native desktop DICOM viewer for Linux and Windows. Open local files and folders, browse series, inspect tags, and adjust window/level.">
+  <title>Dicron — Free DICOM Viewer for Linux and Windows</title>
+  <meta name="description" content="Dicron is a free, open-source DICOM viewer for Linux and Windows. Browse series, search every tag, set window/level, and view CT and MR series in 3D.">
+  <link rel="canonical" href="https://dicron.0john-hong0.com/">
   <meta name="color-scheme" content="dark light">
-  <meta property="og:title" content="Dicron — DICOM Viewer">
-  <meta property="og:description" content="A native desktop DICOM viewer for Linux and Windows, built with Rust and egui.">
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Dicron">
+  <meta property="og:url" content="https://dicron.0john-hong0.com/">
+  <meta property="og:title" content="Dicron — Free DICOM Viewer for Linux and Windows">
+  <meta property="og:description" content="A free, open-source desktop DICOM viewer for Linux and Windows, built with Rust and egui.">
+  <meta property="og:image" content="https://dicron.0john-hong0.com/assets/og-image.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Dicron showing a head CT angiography slice between the series list and the DICOM tag table.">
+  <meta name="twitter:card" content="summary_large_image">
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "Dicron",
+      "url": "https://dicron.0john-hong0.com/",
+      "description": "A free, open-source desktop DICOM viewer for Linux and Windows.",
+      "applicationCategory": "MultimediaApplication",
+      "applicationSubCategory": "DICOM viewer",
+      "operatingSystem": "Linux, Windows",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "license": "https://spdx.org/licenses/GPL-3.0-or-later.html",
+      "downloadUrl": "https://github.com/0John-Hong0/dicron/releases/latest",
+      "image": "https://dicron.0john-hong0.com/assets/og-image.jpg",
+      "screenshot": "https://dicron.0john-hong0.com/assets/screens/viewer-dark.webp",
+      "sameAs": ["https://github.com/0John-Hong0/dicron"]
+    }
+  </script>
   <link rel="icon" type="image/png" href="assets/icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -36,9 +62,10 @@
         <p class="eyebrow mono">DICOM viewer · Linux · Windows</p>
         <h1>Open a folder of DICOM files and look at them.</h1>
         <p class="lede">
-          Dicron is a native desktop viewer for local DICOM files. It scans folders, groups
-          images by patient, study, and series, shows every tag, and lets you set window/level
-          with a mouse drag.
+          Dicron is a free, open-source desktop viewer for local DICOM files. It scans folders,
+          groups images by patient, study, and series, shows every tag, and lets you set
+          window/level with a mouse drag. CT and MR stacks also open in 3D, with MPR, thick-slab
+          MIP, and volume rendering.
         </p>
         <div class="actions">
           <a class="button primary" href="#download">Download</a>
@@ -179,7 +206,7 @@
           </li>
           <li>
             <h3>Compressed pixel data</h3>
-            <p>JPEG Baseline, JPEG Extended (12-bit), JPEG-LS, JPEG 2000 Lossless, and RLE Lossless.</p>
+            <p>JPEG Baseline, JPEG Extended (12-bit), JPEG Lossless, JPEG-LS, JPEG 2000 Lossless, and RLE Lossless.</p>
           </li>
           <li>
             <h3>Overlay planes</h3>

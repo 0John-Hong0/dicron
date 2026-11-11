@@ -6,6 +6,7 @@ rust-version = "1.92"
 description = "A simple native DICOM viewer built with Rust and egui"
 license = "GPL-3.0-or-later"
 authors = ["0John-Hong0"]
+homepage = "https://dicron.0john-hong0.com/"
 repository = "https://github.com/0John-Hong0/dicron"
 readme = "README.md"
 keywords = ["dicom", "viewer", "medical-imaging", "egui"]

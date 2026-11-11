@@ -1,0 +1,45 @@
+name: Debian package
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/debian-package.yml
+      - .github/workflows/release.yml
+      - scripts/build-deb.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debian-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Ubuntu 20.04 package / glibc 2.31
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Install cargo-about
+        run: cargo install --locked cargo-about --version 0.9.1 --features cli
+
+      - name: Fetch fonts
+        run: bash scripts/fetch-fonts.sh
+
+      - name: Generate third-party license report
+        run: bash scripts/generate-third-party-licenses.sh
+
+      - name: Build Debian package and check glibc requirement
+        run: bash scripts/build-deb.sh
+
+      - name: Inspect Debian package
+        run: dpkg-deb --info target/debian/*.deb

@@ -2,6 +2,8 @@
 
 Dicron is a native desktop viewer for quickly opening local DICOM files and folders, browsing studies, inspecting metadata, and adjusting window/level.
 
+Screenshots and downloads: [dicron.0john-hong0.com](https://dicron.0john-hong0.com/)
+
 > Dicron is not a diagnostic medical device. Do not use it for clinical decisions.
 
 ## Features
@@ -23,7 +25,7 @@ Dicron is a native desktop viewer for quickly opening local DICOM files and fold
 Download the latest version from [GitHub Releases](https://github.com/0John-Hong0/dicron/releases):
 
 - Windows: installer executable
-- Debian and Ubuntu: `.deb` package
+- Debian and Ubuntu: `.deb` package, for Ubuntu 20.04 or newer and Debian 11 or newer
 - Arch Linux: `.pkg.tar.zst` package
 
 On Linux, Dicron currently uses X11/XWayland.
