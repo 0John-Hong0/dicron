@@ -13,7 +13,7 @@ use super::DicronApp;
 use super::actions::{PreparedFrame, prepare_frame, texture_name};
 use super::frame_cache::DecodedCacheEntry;
 use super::state::{ReopenViewState, SliceSelection};
-use super::ui::upload_display_pixels;
+use super::ui::ViewerImage;
 use crate::dicom::{SliceItem, load_dicom_frame_with_encoding};
 
 #[derive(Default)]
@@ -64,7 +64,7 @@ struct FrameLoadRequest {
 struct ReadyFrame {
     entry: DecodedCacheEntry,
     prepared: PreparedFrame,
-    texture: egui::TextureHandle,
+    image: ViewerImage,
 }
 
 impl FrameLoadController {
@@ -135,11 +135,11 @@ impl DicronApp {
                 let _ = sender.send(FrameLoadMessage::Progress(FrameLoadPhase::PreparingDisplay));
                 context.request_repaint();
                 // ColorImage conversion also scales with the image's pixel count.
-                let texture = upload_display_pixels(&context, texture_name(&entry.path), pixels);
+                let image = ViewerImage::upload(&context, texture_name(&entry.path), pixels);
                 Ok(Box::new(ReadyFrame {
                     entry,
                     prepared,
-                    texture,
+                    image,
                 }))
             })();
             if !cancel.load(Ordering::Relaxed) {
@@ -180,7 +180,7 @@ impl DicronApp {
                     request.frame_index,
                     Some(request.selection),
                     ready.prepared,
-                    ready.texture,
+                    ready.image,
                 );
                 if let Some(state) = request.reopen_view_state {
                     self.viewport_transform = state.viewport_transform;

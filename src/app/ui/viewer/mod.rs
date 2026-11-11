@@ -5,7 +5,7 @@ mod image_texture;
 mod viewport;
 mod window_level;
 
-pub(in crate::app) use image_texture::upload_display_pixels;
+pub(in crate::app) use image_texture::{ViewerImage, upload_display_pixels};
 
 pub(super) enum ViewerControlAction {
     OpenThreeD(crate::app::state::ThreeDMode),
