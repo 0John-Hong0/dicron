@@ -34,6 +34,7 @@ env:
   PACKAGE_NAME: dicron
   BINARY_NAME: dicron
   WINDOWS_INSTALLER_PREFIX: DicronSetup
+  CARGO_ABOUT_VERSION: "0.9.1"
 
 jobs:
   prepare-release:
@@ -522,10 +523,13 @@ jobs:
           fi
 
   # ==============================================================
-  # DEBIAN
+  # THIRD-PARTY LICENSES
+  #
+  # Every package ships this report of the Rust crates compiled
+  # into Dicron, so the package jobs wait for it.
   # ==============================================================
 
-  build-deb:
+  third-party-licenses:
     needs: prepare-release
     runs-on: ubuntu-latest
 
@@ -534,6 +538,63 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare-release.outputs.tag_name }}
+
+      - name: Install Rust
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Install cargo-about
+        run: cargo install --locked cargo-about --version "$CARGO_ABOUT_VERSION" --features cli
+
+      - name: Generate third-party license report
+        run: bash scripts/generate-third-party-licenses.sh
+
+      - name: Upload license report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+          REPORT_ASSET="dist/${PACKAGE_NAME}-${VERSION}-third-party-licenses.html"
+
+          cp dist/THIRD_PARTY_LICENSES.html "$REPORT_ASSET"
+
+          gh release upload \
+            "${{ needs.prepare-release.outputs.tag_name }}" \
+            "$REPORT_ASSET" \
+            --clobber
+
+  # ==============================================================
+  # DEBIAN
+  # ==============================================================
+
+  build-deb:
+    needs:
+      - prepare-release
+      - third-party-licenses
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag_name }}
+
+      - name: Download license report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+
+          mkdir -p dist
+
+          gh release download \
+            "${{ needs.prepare-release.outputs.tag_name }}" \
+            --pattern "${PACKAGE_NAME}-${VERSION}-third-party-licenses.html" \
+            --output dist/THIRD_PARTY_LICENSES.html \
+            --clobber
 
       - name: Install Rust
         run: |
@@ -589,7 +650,9 @@ jobs:
   # ==============================================================
 
   build-arch:
-    needs: prepare-release
+    needs:
+      - prepare-release
+      - third-party-licenses
     runs-on: ubuntu-latest
 
     steps:
@@ -597,6 +660,21 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare-release.outputs.tag_name }}
+
+      - name: Download license report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+
+          mkdir -p dist
+
+          gh release download \
+            "${{ needs.prepare-release.outputs.tag_name }}" \
+            --pattern "${PACKAGE_NAME}-${VERSION}-third-party-licenses.html" \
+            --output dist/THIRD_PARTY_LICENSES.html \
+            --clobber
 
       - name: Build Arch package
         run: |
@@ -634,6 +712,7 @@ jobs:
                 mesa \
                 wayland \
                 libxkbcommon \
+                libxkbcommon-x11 \
                 charls \
                 zstd
 
@@ -680,7 +759,9 @@ jobs:
   # ==============================================================
 
   build-windows:
-    needs: prepare-release
+    needs:
+      - prepare-release
+      - third-party-licenses
     runs-on: windows-latest
 
     steps:
@@ -688,6 +769,22 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare-release.outputs.tag_name }}
+
+      - name: Download license report
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+
+          mkdir -p dist
+
+          gh release download \
+            "${{ needs.prepare-release.outputs.tag_name }}" \
+            --pattern "${PACKAGE_NAME}-${VERSION}-third-party-licenses.html" \
+            --output dist/THIRD_PARTY_LICENSES.html \
+            --clobber
 
       - name: Install Rust
         shell: pwsh
@@ -741,15 +838,67 @@ jobs:
             $exePath.FullName `
             "dist/windows/app/dicron.exe"
 
-          if (Test-Path "assets/licenses") {
-            New-Item `
-              -ItemType Directory `
-              -Force `
-              "dist/windows/app/licenses"
+          # dicron.exe links the Visual C++ runtime dynamically. CharLS's CMake
+          # build selects the DLL runtime even under +crt-static, so ship the
+          # runtime DLLs next to the exe instead of linking them statically.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
 
-            Copy-Item `
-              "assets/licenses/*" `
-              "dist/windows/app/licenses/"
+          if (-not $vsPath) {
+            throw "Visual Studio with the C++ build tools was not found"
+          }
+
+          $redistDir = Get-ChildItem "$vsPath\VC\Redist\MSVC" -Directory |
+            Where-Object { $_.Name -match '^\d+(\.\d+)+$' } |
+            Sort-Object { [version]$_.Name } |
+            Select-Object -Last 1
+
+          $crtDir = if ($redistDir) {
+            Get-ChildItem "$($redistDir.FullName)\x64" -Directory -Filter "Microsoft.VC*.CRT" |
+              Select-Object -First 1
+          }
+
+          if (-not $crtDir) {
+            throw "Visual C++ runtime redistributable folder was not found"
+          }
+
+          Write-Host "Using Visual C++ runtime: $($crtDir.FullName)"
+
+          Copy-Item `
+            "$($crtDir.FullName)\*.dll" `
+            "dist/windows/app/"
+
+          $dumpbin = & $vswhere `
+            -latest `
+            -products * `
+            -find "VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe" |
+            Select-Object -First 1
+
+          if (-not $dumpbin) {
+            throw "dumpbin.exe was not found"
+          }
+
+          $dependents = & $dumpbin /nologo /dependents "dist/windows/app/dicron.exe" |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -match '\.dll$' }
+
+          if ($LASTEXITCODE -ne 0 -or -not $dependents) {
+            throw "Could not read the DLL imports of dicron.exe"
+          }
+
+          Write-Host "dicron.exe imports:"
+          $dependents | ForEach-Object { Write-Host "  $_" }
+
+          $missingRuntime = $dependents |
+            Where-Object { $_ -match '^(vcruntime|msvcp|concrt|vccorlib)' } |
+            Where-Object { -not (Test-Path "dist/windows/app/$_") }
+
+          if ($missingRuntime) {
+            throw "Visual C++ runtime DLLs are not staged: $($missingRuntime -join ', ')"
           }
 
           Write-Host "Checking dist/windows/app..."

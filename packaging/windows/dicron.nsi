@@ -25,6 +25,13 @@ Section "Install"
     SetOutPath "$INSTDIR"
 
     File /r "dist\windows\app\*"
+    File "/oname=LICENSE.txt" "LICENSE"
+    File "THIRD_PARTY_NOTICES.md"
+
+    SetOutPath "$INSTDIR\licenses"
+    File "assets\licenses\*"
+    File "dist\THIRD_PARTY_LICENSES.html"
+    SetOutPath "$INSTDIR"
 
     CreateDirectory "$SMPROGRAMS\Dicron"
     CreateShortcut "$SMPROGRAMS\Dicron\Dicron.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0
@@ -76,6 +83,8 @@ Section "Uninstall"
 
     Delete "$INSTDIR\${APP_EXE}"
     Delete "$INSTDIR\*.dll"
+    Delete "$INSTDIR\LICENSE.txt"
+    Delete "$INSTDIR\THIRD_PARTY_NOTICES.md"
     RMDir /r "$INSTDIR\licenses"
     Delete "$INSTDIR\Uninstall.exe"
     RMDir "$INSTDIR"
