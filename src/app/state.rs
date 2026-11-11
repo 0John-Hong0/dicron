@@ -18,6 +18,7 @@ use super::series_thumbnail_cache::SeriesThumbnailCache;
 use super::three_d_state::{
     GpuBudget, MprMode, MprQuality, MprState, SavedMprView, VolumeRenderState,
 };
+use super::ui::ViewerImage;
 use super::volume_job::{PreparedVolume, VolumeJobController, volume_is_at_target};
 
 pub(super) type SeriesKey = (usize, usize, usize);
@@ -182,6 +183,13 @@ impl WindowPreset {
 
         Some(WindowLevel { center, width })
     }
+
+    /// Whether the preset applies to a grayscale or a colour frame. The fixed
+    /// presets are CT windows in Hounsfield units, which mean nothing to the
+    /// 0-255 values a colour frame is windowed in.
+    pub(super) fn applies_to(self, grayscale: bool) -> bool {
+        grayscale || self.fixed_window().is_none()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -190,10 +198,46 @@ pub(super) struct SavedWindowLevel {
     pub(super) preset: Option<WindowPreset>,
 }
 
+/// The windows a series keeps: one for its grayscale frames, in their
+/// rescaled values, and one for its colour frames, in the 0-255 values they
+/// are shown with. Ultrasound and secondary-capture series can hold both, and
+/// a window in one kind of values would wash out the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct SeriesWindows {
+    pub(super) grayscale: Option<SavedWindowLevel>,
+    pub(super) colour: Option<SavedWindowLevel>,
+}
+
+impl SeriesWindows {
+    #[cfg(test)]
+    pub(super) fn grayscale(saved: SavedWindowLevel) -> Self {
+        Self {
+            grayscale: Some(saved),
+            colour: None,
+        }
+    }
+
+    pub(super) fn window_for(&self, grayscale: bool) -> Option<SavedWindowLevel> {
+        if grayscale {
+            self.grayscale
+        } else {
+            self.colour
+        }
+    }
+
+    pub(super) fn window_for_mut(&mut self, grayscale: bool) -> &mut Option<SavedWindowLevel> {
+        if grayscale {
+            &mut self.grayscale
+        } else {
+            &mut self.colour
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct ReopenViewState {
     pub(super) viewport_transform: ViewportTransform,
-    pub(super) window_level: Option<SavedWindowLevel>,
+    pub(super) window_level: Option<SeriesWindows>,
 }
 
 pub(super) struct WindowLevelState {
@@ -203,7 +247,7 @@ pub(super) struct WindowLevelState {
     pub(super) customized: bool,
     pub(super) available: bool,
     pub(super) active_preset: Option<WindowPreset>,
-    pub(super) by_series: HashMap<SeriesKey, SavedWindowLevel>,
+    pub(super) by_series: HashMap<SeriesKey, SeriesWindows>,
 }
 
 impl Default for WindowLevelState {
@@ -507,7 +551,11 @@ pub(crate) struct DicronApp {
     pub(super) selected_dicom_path: Option<PathBuf>,
     pub(super) selected_dicom_frame_index: u32,
     pub(super) selected_dicom_frame_count: u32,
-    pub(super) loaded_texture: Option<egui::TextureHandle>,
+    pub(super) loaded_image: Option<ViewerImage>,
+    /// Whether the frame on screen is grayscale. The 3D workspace
+    /// reconstructs a volume from grayscale values, so only such a series
+    /// opens it; colour frames still take a window, on each channel.
+    pub(super) loaded_frame_grayscale: bool,
     pub(super) decoded_cache: DecodedCache,
     pub(super) series_thumbnails: SeriesThumbnailCache,
     pub(super) current_frame_key: Option<(PathBuf, u32)>,
@@ -536,6 +584,9 @@ pub(crate) struct DicronApp {
     // Bumped when the preference changes so CollapsingHeaders get fresh ids.
     pub(super) tree_view_generation: u64,
     pub(super) settings: AppSettings,
+    /// Paths given at launch, opened on the first frame: only then does egui
+    /// know the GPU's texture limit that the uploaded image must fit.
+    pub(super) startup_paths: Vec<PathBuf>,
 }
 
 impl Default for DicronApp {
@@ -551,7 +602,8 @@ impl Default for DicronApp {
             selected_dicom_path: None,
             selected_dicom_frame_index: 0,
             selected_dicom_frame_count: 1,
-            loaded_texture: None,
+            loaded_image: None,
+            loaded_frame_grayscale: false,
             decoded_cache: DecodedCache::default(),
             series_thumbnails: SeriesThumbnailCache::default(),
             current_frame_key: None,
@@ -574,6 +626,7 @@ impl Default for DicronApp {
             panel_layout: PanelLayout::default(),
             tree_view_generation: 0,
             settings,
+            startup_paths: Vec::new(),
         }
     }
 }

@@ -4,7 +4,8 @@ use eframe::egui;
 
 use crate::app::DicronApp;
 use crate::app::state::{
-    SavedWindowLevel, SeriesKey, SliceSelection, WindowLevel, WindowLevelState, WindowPreset,
+    SavedWindowLevel, SeriesKey, SeriesWindows, SliceSelection, WindowLevel, WindowLevelState,
+    WindowPreset,
 };
 use crate::dicom::DicomWindow;
 use crate::theme;
@@ -106,30 +107,40 @@ impl DicronApp {
         self.refresh_dicom_texture(context);
     }
 
+    /// Saves the window on screen as its series' window for frames of the
+    /// kind on screen, grayscale or colour.
     pub(in crate::app) fn save_current_series_window_level(&mut self) {
         let Some(series_key) = self.current_series_key() else {
             return;
         };
-        self.window_level.by_series.insert(
-            series_key,
-            SavedWindowLevel {
-                window: self.window_level.current,
-                preset: self.window_level.active_preset,
-            },
-        );
+        *self
+            .window_level
+            .by_series
+            .entry(series_key)
+            .or_default()
+            .window_for_mut(self.loaded_frame_grayscale) = Some(SavedWindowLevel {
+            window: self.window_level.current,
+            preset: self.window_level.active_preset,
+        });
     }
 
     pub(super) fn clear_current_series_window_level(&mut self) {
         let Some(series_key) = self.current_series_key() else {
             return;
         };
-        self.window_level.by_series.remove(&series_key);
+        let Some(windows) = self.window_level.by_series.get_mut(&series_key) else {
+            return;
+        };
+        *windows.window_for_mut(self.loaded_frame_grayscale) = None;
+        if *windows == SeriesWindows::default() {
+            self.window_level.by_series.remove(&series_key);
+        }
     }
 
     pub(in crate::app) fn window_level_for_selection(
         &self,
         selection: Option<SliceSelection>,
-    ) -> Option<SavedWindowLevel> {
+    ) -> Option<SeriesWindows> {
         self.window_level
             .by_series
             .get(&selection?.series_key())
@@ -145,7 +156,7 @@ impl DicronApp {
         context: &egui::Context,
         preset: WindowPreset,
     ) {
-        if !self.window_level.is_available() {
+        if !self.window_level.is_available() || !preset.applies_to(self.loaded_frame_grayscale) {
             return;
         }
 

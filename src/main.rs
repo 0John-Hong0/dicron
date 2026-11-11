@@ -45,28 +45,32 @@ fn main() -> eframe::Result {
             configure_fonts(&creation_context.egui_ctx);
             theme::configure(&creation_context.egui_ctx);
 
-            let mut app = DicronApp::new(&creation_context.egui_ctx);
-
-            if !startup_paths.is_empty() {
-                app.open_startup_paths(&creation_context.egui_ctx, startup_paths.clone());
-            }
-
-            Ok(Box::new(app))
+            Ok(Box::new(DicronApp::new(
+                &creation_context.egui_ctx,
+                startup_paths,
+            )))
         }),
     )
 }
 
-/// eframe's wgpu setup, asking for the 3D texture size the adapter offers.
+/// eframe's wgpu setup, asking for the 2D and 3D texture sizes the adapter
+/// offers.
 ///
-/// egui-wgpu requests WebGL2's limits from a GL adapter, whose 256 voxel 3D
-/// textures would halve volume rendering's resolution on a machine that falls
-/// back to OpenGL, though native GL drivers offer 2048 or more.
+/// egui-wgpu requests at most 8192 texels a side for 2D textures, though most
+/// adapters offer 16384 or more, which a long stitched radiograph can need.
+/// From a GL adapter it requests WebGL2's limits, whose 256 voxel 3D textures
+/// would halve volume rendering's resolution on a machine that falls back to
+/// OpenGL, though native GL drivers offer 2048 or more.
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     let default_descriptor = Arc::clone(&setup.device_descriptor);
 
     setup.device_descriptor = Arc::new(move |adapter| {
         let mut descriptor = default_descriptor(adapter);
+        descriptor.required_limits.max_texture_dimension_2d = descriptor
+            .required_limits
+            .max_texture_dimension_2d
+            .max(adapter.limits().max_texture_dimension_2d);
         descriptor.required_limits.max_texture_dimension_3d = descriptor
             .required_limits
             .max_texture_dimension_3d
@@ -212,5 +216,46 @@ mod tests {
     fn unrecognized_or_short_bytes_report_zero() {
         assert_eq!(ttc_face_count(&[0, 1, 2]), 0);
         assert_eq!(ttc_face_count(&[0xFF; 12]), 0);
+    }
+
+    /// The device asks for the largest 2D and 3D textures the adapter offers,
+    /// not egui-wgpu's default of 8192 texels a side.
+    #[test]
+    fn the_device_requests_the_adapters_texture_sizes() {
+        use std::future::Future;
+
+        use eframe::wgpu;
+
+        #[cfg(target_os = "macos")]
+        let backends = wgpu::Backends::METAL;
+        #[cfg(not(target_os = "macos"))]
+        let backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapters = std::pin::pin!(instance.enumerate_adapters(backends))
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        let std::task::Poll::Ready(adapters) = adapters else {
+            panic!("native adapters are enumerated at once");
+        };
+        let Some(adapter) = adapters.into_iter().next() else {
+            eprintln!("skipped: no native GPU adapter");
+            return;
+        };
+        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = wgpu_options().wgpu_setup else {
+            panic!("the app creates its own device");
+        };
+
+        let limits = (setup.device_descriptor)(&adapter).required_limits;
+
+        assert_eq!(
+            limits.max_texture_dimension_2d,
+            adapter.limits().max_texture_dimension_2d
+        );
+        assert_eq!(
+            limits.max_texture_dimension_3d,
+            adapter.limits().max_texture_dimension_3d
+        );
     }
 }

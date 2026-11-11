@@ -58,11 +58,11 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui) {
 
     app.handle_viewer_scroll(ui.ctx(), is_pointer_over_viewer);
 
-    if app.loaded_texture.is_some() && viewer_response.dragged_by(egui::PointerButton::Primary) {
+    if app.loaded_image.is_some() && viewer_response.dragged_by(egui::PointerButton::Primary) {
         app.handle_window_level_drag(ui.ctx(), &viewer_response);
     }
 
-    if app.loaded_texture.is_some() {
+    if app.loaded_image.is_some() {
         handle_viewport_transform(
             &mut app.viewport_transform,
             &mut app.viewport_zoom_anchor,
@@ -86,27 +86,29 @@ pub(super) fn show(app: &mut DicronApp, ui: &mut egui::Ui) {
         app.jump_to_slice(ui.ctx(), requested_slice_index);
     }
 
-    if let Some(loaded_texture) = &app.loaded_texture {
-        let texture_size = loaded_texture.size_vec2();
+    if let Some(loaded_image) = &app.loaded_image {
         let pixel_aspect_ratio = app
             .metadata
             .overlay
             .as_ref()
             .and_then(|metadata| metadata.pixel_aspect_ratio);
-        let fitted_image_size =
-            fit_image_to_available_space(texture_size, pixel_aspect_ratio, viewer_rect.size());
+        let fitted_image_size = fit_image_to_available_space(
+            loaded_image.source_size,
+            pixel_aspect_ratio,
+            viewer_rect.size(),
+        );
 
         if fitted_image_size.x > 0.0 && fitted_image_size.y > 0.0 {
             let image_rect =
                 transformed_image_rect(viewer_rect, fitted_image_size, app.viewport_transform);
             paint_transformed_image(
                 &ui.painter().with_clip_rect(viewer_rect),
-                loaded_texture.id(),
+                loaded_image.texture.id(),
                 image_rect,
                 app.viewport_transform,
             );
 
-            show_viewer_overlays(app, ui, viewer_rect, image_rect, loaded_texture.size());
+            show_viewer_overlays(app, ui, viewer_rect, image_rect, loaded_image.source_size);
         }
     } else {
         ui.painter().text(
@@ -591,6 +593,18 @@ mod tests {
         [columns, rows]: [u16; 2],
         text_elements: &[(Tag, VR, &str)],
     ) -> crate::app::DicronApp {
+        // The texture limit the viewer is given, before anything uploads.
+        let _ = context.run_ui(viewer_input(Vec::new()), |_| {});
+        app_loading_image(context, label, [columns, rows], text_elements)
+    }
+
+    /// The same image, loaded without running a frame first.
+    fn app_loading_image(
+        context: &egui::Context,
+        label: &str,
+        [columns, rows]: [u16; 2],
+        text_elements: &[(Tag, VR, &str)],
+    ) -> crate::app::DicronApp {
         let path = std::env::temp_dir().join(format!(
             "dicron-viewport-{label}-{}.dcm",
             std::process::id()
@@ -643,19 +657,26 @@ mod tests {
         app
     }
 
-    fn viewer_input() -> egui::RawInput {
+    fn viewer_input(events: Vec<egui::Event>) -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(600.0, 400.0),
             )),
+            max_texture_side: Some(8192),
+            events,
             ..Default::default()
         }
     }
 
-    /// Everything the viewer paints in one frame.
-    fn paint_viewer(context: &egui::Context, app: &mut crate::app::DicronApp) -> Vec<egui::Shape> {
-        let output = context.run_ui(viewer_input(), |ui| {
+    /// Everything the viewer paints in one frame, with the pointer at `pointer`.
+    fn paint_viewer(
+        context: &egui::Context,
+        app: &mut crate::app::DicronApp,
+        pointer: Option<egui::Pos2>,
+    ) -> Vec<egui::Shape> {
+        let events = pointer.map(egui::Event::PointerMoved).into_iter().collect();
+        let output = context.run_ui(viewer_input(events), |ui| {
             egui::CentralPanel::default().show_inside(ui, |ui| super::show(app, ui));
         });
 
@@ -686,6 +707,37 @@ mod tests {
             .collect()
     }
 
+    /// Where the image is painted, and the texture it is painted from.
+    fn painted_image(shapes: &[egui::Shape]) -> (egui::Rect, egui::TextureId) {
+        let mesh = shapes
+            .iter()
+            .find_map(|shape| match shape {
+                egui::Shape::Mesh(mesh) => Some(mesh),
+                _ => None,
+            })
+            .expect("the image is painted");
+
+        (mesh.calc_bounds(), mesh.texture_id)
+    }
+
+    /// The source pixel the probe reports with the pointer at the given
+    /// fraction of the painted image.
+    fn probed_pixel(
+        context: &egui::Context,
+        app: &mut crate::app::DicronApp,
+        image_rect: egui::Rect,
+        fraction: egui::Vec2,
+    ) -> String {
+        let pointer = image_rect.min + fraction * image_rect.size();
+        let texts = painted_texts(&paint_viewer(context, app, Some(pointer)));
+        let probe = texts
+            .iter()
+            .find(|text| text.starts_with("X: "))
+            .expect("the probe is shown");
+
+        probe.split("  ").take(2).collect::<Vec<_>>().join(" ")
+    }
+
     /// Both side letters must show however the app's fonts measure at the
     /// display's scale factor.
     #[test]
@@ -709,8 +761,8 @@ mod tests {
                 &[(tags::IMAGE_ORIENTATION_PATIENT, VR::DS, "1\\0\\0\\0\\1\\0")],
             );
 
-            paint_viewer(&context, &mut app);
-            let texts = painted_texts(&paint_viewer(&context, &mut app));
+            paint_viewer(&context, &mut app, None);
+            let texts = painted_texts(&paint_viewer(&context, &mut app, None));
 
             assert_eq!(context.pixels_per_point(), pixels_per_point);
             for letter in ["R", "L"] {
@@ -736,8 +788,8 @@ mod tests {
                 [100, 50],
                 &[(tag, vr, value)],
             );
-            let texture = app.loaded_texture.as_ref().unwrap().id();
-            let shapes = paint_viewer(&context, &mut app);
+            let texture = app.loaded_image.as_ref().unwrap().texture.id();
+            let shapes = paint_viewer(&context, &mut app, None);
             let image = shapes
                 .iter()
                 .find_map(|shape| match shape {
@@ -751,10 +803,105 @@ mod tests {
         }
     }
 
+    /// A long stitched radiograph wider or taller than the GPU allows is
+    /// uploaded smaller, but still shown and probed at its own size.
+    #[test]
+    fn images_larger_than_the_texture_limit_are_shown_at_their_own_size() {
+        for (size, fraction, expected_pixel) in [
+            ([8200, 16], egui::vec2(6150.5 / 8200.0, 0.5), "X: 6150 Y: 8"),
+            ([16, 8200], egui::vec2(0.5, 6150.5 / 8200.0), "X: 8 Y: 6150"),
+        ] {
+            let context = egui::Context::default();
+            let mut app = app_showing_image(&context, "oversized", size, &[]);
+
+            let (image_rect, texture_id) = painted_image(&paint_viewer(&context, &mut app, None));
+            let texture_size = context.tex_manager().read().meta(texture_id).unwrap().size;
+
+            assert!(
+                texture_size.iter().all(|&side| side <= 8192),
+                "{texture_size:?}"
+            );
+            let source_aspect = f32::from(size[0]) / f32::from(size[1]);
+            let texture_aspect = texture_size[0] as f32 / texture_size[1] as f32;
+            assert!(
+                (texture_aspect / source_aspect - 1.0).abs() < 0.01,
+                "{texture_size:?}"
+            );
+            assert!(
+                (image_rect.aspect_ratio() / source_aspect - 1.0).abs() < 0.01,
+                "{image_rect:?}"
+            );
+            assert_eq!(
+                probed_pixel(&context, &mut app, image_rect, fraction),
+                expected_pixel
+            );
+        }
+    }
+
     fn assert_approximately_equal(actual: f32, expected: f32) {
         assert!(
             (actual - expected).abs() < 0.001,
             "expected {expected}, got {actual}"
+        );
+    }
+
+    /// Until the first frame tells egui the GPU's texture limit, egui assumes
+    /// 2048 texels a side. A file opened from the command line waits for that
+    /// frame, and an image loaded in it, well inside every GPU's limit,
+    /// uploads at full size.
+    #[test]
+    fn images_opened_before_the_first_frame_upload_at_full_size() {
+        let context = egui::Context::default();
+        let missing_path = std::env::temp_dir().join(format!(
+            "dicron-viewport-missing-startup-{}.dcm",
+            std::process::id()
+        ));
+        let mut startup_app = crate::app::DicronApp::new(&context, vec![missing_path]);
+        assert_eq!(
+            startup_app.error_message, None,
+            "opened before the first frame"
+        );
+
+        let mut first_frame_app = None;
+        let _ = context.run_ui(viewer_input(Vec::new()), |ui| {
+            eframe::App::logic(
+                &mut startup_app,
+                ui.ctx(),
+                &mut eframe::Frame::_new_kittest(),
+            );
+            first_frame_app = Some(app_loading_image(ui.ctx(), "first-frame", [3000, 16], &[]));
+        });
+        assert!(
+            startup_app.error_message.is_some(),
+            "not opened on the first frame"
+        );
+
+        let mut app = first_frame_app.unwrap();
+        let (_, texture_id) = painted_image(&paint_viewer(&context, &mut app, None));
+        let texture_size = context.tex_manager().read().meta(texture_id).unwrap().size;
+
+        assert_eq!(texture_size, [3000, 16]);
+    }
+
+    /// Shrinking a one-row strip keeps its single row, so the texture is half
+    /// as long for its height as the source; the strip is still laid out and
+    /// probed at the source's proportions.
+    #[test]
+    fn oversized_one_row_strips_keep_their_source_proportions() {
+        let context = egui::Context::default();
+        let mut app = app_showing_image(&context, "oversized-strip", [8200, 1], &[]);
+
+        let (image_rect, texture_id) = painted_image(&paint_viewer(&context, &mut app, None));
+        let texture_size = context.tex_manager().read().meta(texture_id).unwrap().size;
+
+        assert_eq!(texture_size, [4100, 1]);
+        assert!(
+            (image_rect.aspect_ratio() / 8200.0 - 1.0).abs() < 0.01,
+            "{image_rect:?}"
+        );
+        assert_eq!(
+            probed_pixel(&context, &mut app, image_rect, egui::vec2(0.9999, 0.5)),
+            "X: 8199 Y: 0"
         );
     }
 

@@ -9,15 +9,17 @@ use rfd::FileDialog;
 
 use crate::app::DicronApp;
 use crate::app::frame_cache::DecodedCacheEntry;
+#[cfg(test)]
+use crate::app::state::SavedWindowLevel;
 use crate::app::state::{
     ActiveVolumeView, LowResolutionPrompt, OpenSource, PLAYBACK_MAX_FPS, PLAYBACK_MIN_FPS,
-    PlaybackLoopMode, ReopenViewState, SavedWindowLevel, SeriesKey, SliceSelection, ThreeDMode,
+    PlaybackLoopMode, ReopenViewState, SeriesKey, SeriesWindows, SliceSelection, ThreeDMode,
     ViewMode, WINDOW_PRESETS, WindowLevel, WindowPreset,
 };
 use crate::app::three_d_state::{
     GpuBudget, GpuVolume, MprQuality, MprState, TransferPreset, VolumeRenderState,
 };
-use crate::app::ui::{GPU_UNAVAILABLE_MESSAGE, THREE_D_UNSUPPORTED_MESSAGE, upload_display_pixels};
+use crate::app::ui::{GPU_UNAVAILABLE_MESSAGE, THREE_D_UNSUPPORTED_MESSAGE, ViewerImage};
 use crate::app::volume_job::{
     PreparedVolume, VolumeJobKind, VolumeJobOutput, VolumeJobRequest, series_fingerprint,
     spatially_ordered_slices,
@@ -30,7 +32,7 @@ use crate::dicom::{
 };
 
 impl DicronApp {
-    pub(crate) fn open_startup_paths(
+    pub(super) fn open_startup_paths(
         &mut self,
         context: &egui::Context,
         startup_paths: Vec<PathBuf>,
@@ -458,10 +460,11 @@ impl DicronApp {
         }
 
         let preset_shortcuts_enabled = self.window_level.is_available();
+        let grayscale = self.loaded_frame_grayscale;
         let (slice_keys, window_preset) = context.input_mut(|input_state| {
             (
                 consume_slice_keys(input_state),
-                consume_window_preset_keys(input_state, preset_shortcuts_enabled),
+                consume_window_preset_keys(input_state, preset_shortcuts_enabled, grayscale),
             )
         });
 
@@ -671,15 +674,19 @@ fn consume_slice_keys(input_state: &mut egui::InputState) -> SliceKeys {
     }
 }
 
+/// The preset whose key was pressed, among those that apply to the frame on
+/// screen; the keys of the others are left alone.
 fn consume_window_preset_keys(
     input_state: &mut egui::InputState,
     enabled: bool,
+    grayscale: bool,
 ) -> Option<WindowPreset> {
     enabled
         .then(|| {
             WINDOW_PRESETS
                 .iter()
                 .copied()
+                .filter(|preset| preset.applies_to(grayscale))
                 .find(|preset| consume_window_preset_key(input_state, *preset))
         })
         .flatten()
@@ -900,15 +907,21 @@ pub(in crate::app) struct PreparedFrame {
     frame_count: u32,
     value_range: (f64, f64),
     window_level_available: bool,
+    grayscale: bool,
     metadata: crate::dicom::DicomMetadata,
 }
 
 /// Render a loaded frame and recalculate a saved Full Dynamic preset.
 pub(in crate::app) fn prepare_frame(
     entry: &DecodedCacheEntry,
-    saved_window_level: Option<SavedWindowLevel>,
+    saved_windows: Option<SeriesWindows>,
 ) -> anyhow::Result<(PreparedFrame, crate::dicom::DisplayPixels)> {
     let (default_center, default_width) = entry.frame.default_center_width();
+    // The series keeps a window for its grayscale frames and one for its
+    // colour frames; a frame that takes no window takes neither.
+    let saved_window_level = saved_windows
+        .and_then(|windows| windows.window_for(entry.frame.is_grayscale()))
+        .filter(|_| entry.frame.window_level_available());
     let window_customized = saved_window_level.is_some();
     let mut saved_window = saved_window_level.map(|saved| saved.window);
     if saved_window_level.is_some_and(|saved| saved.preset == Some(WindowPreset::FullDynamic))
@@ -938,6 +951,7 @@ pub(in crate::app) fn prepare_frame(
         frame_count: entry.frame.frame_count,
         value_range: entry.frame.value_range,
         window_level_available: entry.frame.window_level_available(),
+        grayscale: entry.frame.is_grayscale(),
         metadata: entry.metadata.clone(),
     };
     Ok((prepared, pixels))
@@ -986,13 +1000,13 @@ impl DicronApp {
             }
         };
 
-        let loaded_texture = upload_display_pixels(context, texture_name(&dicom_path), pixels);
+        let loaded_image = ViewerImage::upload(context, texture_name(&dicom_path), pixels);
         self.display_prepared_frame(
             dicom_path,
             frame_index,
             target_selection,
             prepared,
-            loaded_texture,
+            loaded_image,
         );
         true
     }
@@ -1003,7 +1017,7 @@ impl DicronApp {
         frame_index: u32,
         target_selection: Option<SliceSelection>,
         prepared: PreparedFrame,
-        loaded_texture: egui::TextureHandle,
+        loaded_image: ViewerImage,
     ) {
         let should_fit_viewport = target_selection.is_some_and(|target| {
             self.selected_slice
@@ -1018,6 +1032,8 @@ impl DicronApp {
             self.last_slice_by_series
                 .insert(selection.series_key(), selection.slice_index);
         }
+        // Set before saving below, which saves the window of this frame's kind.
+        self.loaded_frame_grayscale = prepared.grayscale;
         self.window_level.apply_loaded_frame(
             prepared.default_window,
             prepared.current_window,
@@ -1033,7 +1049,7 @@ impl DicronApp {
         }
         self.selected_dicom_frame_index = frame_index;
         self.selected_dicom_frame_count = prepared.frame_count;
-        self.loaded_texture = Some(loaded_texture);
+        self.loaded_image = Some(loaded_image);
         self.metadata.replace(prepared.metadata);
         self.current_frame_key = Some((dicom_path.clone(), frame_index));
         self.selected_dicom_path = Some(dicom_path);
@@ -1054,8 +1070,7 @@ impl DicronApp {
 
         match rendered {
             Ok(pixels) => {
-                self.loaded_texture =
-                    Some(upload_display_pixels(context, texture_name(&path), pixels));
+                self.loaded_image = Some(ViewerImage::upload(context, texture_name(&path), pixels));
                 self.error_message = None;
             }
             Err(error) => {
@@ -1106,11 +1121,10 @@ impl DicronApp {
         Some(series.slices.as_slice())
     }
 
-    /// Whether the selected series can be reconstructed: a grayscale image, by
-    /// the same test the window controls use, with at least two single-frame
-    /// slices.
+    /// Whether the selected series can be reconstructed: a grayscale image on
+    /// screen, with at least two single-frame slices.
     pub(in crate::app) fn series_supports_three_d(&self) -> bool {
-        self.window_level.is_available()
+        self.loaded_frame_grayscale
             && self.selected_series_slices().is_some_and(|slices| {
                 slices.len() >= 2 && slices.iter().all(|slice| slice.frame_index == 0)
             })
@@ -1729,8 +1743,13 @@ impl DicronApp {
     /// would let one hot spot, such as a PET bladder, darken every other slice.
     fn mpr_window(&self, series_key: SeriesKey, series: &SeriesVolume) -> WindowLevel {
         // The voxels keep their stored values, MONOCHROME1 or not, so every
-        // window here applies to them unchanged, as it does in 2D.
-        if let Some(saved) = self.window_level.by_series.get(&series_key) {
+        // grayscale window here applies to them unchanged, as it does in 2D.
+        if let Some(saved) = self
+            .window_level
+            .by_series
+            .get(&series_key)
+            .and_then(|windows| windows.grayscale)
+        {
             return saved.window;
         }
 
@@ -1767,7 +1786,8 @@ impl DicronApp {
     pub(in crate::app) fn clear_loaded_dicom_state(&mut self) {
         self.frame_load.clear();
         self.selected_dicom_path = None;
-        self.loaded_texture = None;
+        self.loaded_image = None;
+        self.loaded_frame_grayscale = false;
         self.decoded_cache.clear();
         self.series_thumbnails.clear();
         self.current_frame_key = None;
@@ -2059,7 +2079,7 @@ mod loading_tests {
         write_single_pixel(path, "MONOCHROME2", vec![128], window);
     }
 
-    /// A one-pixel colour image, which has no window to level.
+    /// A one-pixel colour image of (200, 100, 50).
     pub(super) fn write_single_pixel_rgb_dicom(path: &std::path::Path) {
         write_single_pixel(path, "RGB", vec![200, 100, 50], None);
     }
@@ -2196,7 +2216,11 @@ mod loading_tests {
         );
         assert_eq!(app.window_level.active_preset_label(), "Full Dynamic");
         assert_eq!(
-            app.window_level.by_series[&series].window, app.window_level.current,
+            app.window_level.by_series[&series]
+                .grayscale
+                .unwrap()
+                .window,
+            app.window_level.current,
             "the 3D planes open on the window the slice is shown with"
         );
         assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
@@ -2222,10 +2246,10 @@ mod loading_tests {
         };
         app.window_level.by_series.insert(
             series,
-            SavedWindowLevel {
+            SeriesWindows::grayscale(SavedWindowLevel {
                 window: typed,
                 preset: None,
-            },
+            }),
         );
         assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
         assert_eq!(app.window_level.current, typed);
@@ -2410,10 +2434,10 @@ mod loading_tests {
 
         let (_, at_default) = prepare_frame(
             &entry,
-            Some(SavedWindowLevel {
+            Some(SeriesWindows::grayscale(SavedWindowLevel {
                 window: prepared.default_window,
                 preset: None,
-            }),
+            })),
         )
         .unwrap();
         assert_eq!(at_default.rgba, opened.rgba);
@@ -2479,7 +2503,9 @@ mod loading_tests {
             preset: None,
         };
         app.viewport_transform = viewport;
-        app.window_level.by_series.insert((0, 0, 0), saved_window);
+        app.window_level
+            .by_series
+            .insert((0, 0, 0), SeriesWindows::grayscale(saved_window));
 
         app.reopen_with_encoding(&context, TextEncoding::Auto);
         assert_eq!(app.text_encoding, TextEncoding::Auto);
@@ -2558,7 +2584,7 @@ mod loading_tests {
         let displayed_selection = app.selected_slice;
         let displayed_path = app.selected_dicom_path.clone();
         let displayed_frame_key = app.current_frame_key.clone();
-        let displayed_texture_id = app.loaded_texture.as_ref().map(egui::TextureHandle::id);
+        let displayed_texture_id = app.loaded_image.as_ref().map(|image| image.texture.id());
         let displayed_metadata: Vec<_> = app
             .metadata
             .all_items
@@ -2587,7 +2613,7 @@ mod loading_tests {
         assert_eq!(app.selected_dicom_path, displayed_path);
         assert_eq!(app.current_frame_key, displayed_frame_key);
         assert_eq!(
-            app.loaded_texture.as_ref().map(egui::TextureHandle::id),
+            app.loaded_image.as_ref().map(|image| image.texture.id()),
             displayed_texture_id
         );
         let current_metadata: Vec<_> = app
@@ -3039,10 +3065,10 @@ mod three_d_tests {
         };
         app.window_level.by_series.insert(
             series_key,
-            crate::app::state::SavedWindowLevel {
+            SeriesWindows::grayscale(crate::app::state::SavedWindowLevel {
                 window,
                 preset: None,
-            },
+            }),
         );
         let mut prepared = prepared_volume_of(
             Some(1.0),
@@ -4119,7 +4145,8 @@ mod three_d_tests {
         app.dicom_index = Some(index);
         assert!(!app.series_supports_three_d());
 
-        // Colour images have no window to reconstruct a grayscale volume with.
+        // Colour images take a window on each channel, but have no grayscale
+        // values to reconstruct a volume from.
         let colour = [
             temporary_file("supports-colour-first"),
             temporary_file("supports-colour-second"),
@@ -4144,6 +4171,127 @@ mod three_d_tests {
         };
         assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
         assert!(!app.series_supports_three_d());
+    }
+
+    /// A colour image takes window/level, its presets and Full Dynamic on each
+    /// channel: Full Dynamic spans 50 to 200 for its one pixel of
+    /// (200, 100, 50).
+    #[test]
+    fn colour_images_take_window_level() {
+        let context = egui::Context::default();
+        let path = temporary_file("colour-window-level");
+        write_single_pixel_rgb_dicom(&path);
+        let mut app = DicronApp {
+            dicom_index: Some(build_for_file(&path).unwrap()),
+            ..Default::default()
+        };
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
+        assert!(app.window_level.is_available());
+
+        app.apply_window_preset(&context, WindowPreset::FullDynamic);
+
+        assert_eq!(app.error_message, None);
+        assert_eq!(
+            app.window_level.active_preset,
+            Some(WindowPreset::FullDynamic)
+        );
+        let current = app.window_level.current();
+        assert_eq!((current.center, current.width), (125.0, 150.0));
+    }
+
+    /// A series of a grayscale and a colour slice keeps a window for each, as
+    /// their values differ: a CT window set on the grayscale slice does not
+    /// wash out the colour one, the colour slice's Full Dynamic does not reach
+    /// the grayscale one, and Reset clears only the window of the slice on
+    /// screen. 3D opens on the grayscale one.
+    #[test]
+    fn grayscale_and_colour_slices_of_a_series_keep_their_own_windows() {
+        let context = egui::Context::default();
+        let grey = temporary_file("mixed-grey");
+        let colour = temporary_file("mixed-colour");
+        write_single_pixel_dicom(&grey);
+        write_single_pixel_rgb_dicom(&colour);
+        let mut index = build_for_file(&grey).unwrap();
+        index.patients[0].studies[0].series_groups[0]
+            .slices
+            .push(SliceItem {
+                path: colour.to_path_buf(),
+                display_name: "colour".to_owned(),
+                frame_index: 0,
+                instance_number: Some(2),
+                instance_creation_time: None,
+                sort_position: Some(1.0),
+            });
+        let mut app = DicronApp {
+            dicom_index: Some(index),
+            ..Default::default()
+        };
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
+        app.apply_window_preset(&context, WindowPreset::Abdomen);
+
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 1));
+        assert!(!app.window_level.customized);
+        assert_eq!(app.window_level.active_preset, Some(WindowPreset::Default));
+        app.apply_window_preset(&context, WindowPreset::FullDynamic);
+        let colour_window = app.window_level.current();
+        assert_eq!((colour_window.center, colour_window.width), (125.0, 150.0));
+
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
+        assert_eq!(
+            app.window_level.current(),
+            WindowPreset::Abdomen.fixed_window().unwrap()
+        );
+        assert_eq!(app.window_level.active_preset, Some(WindowPreset::Abdomen));
+        let windows = app.window_level.by_series[&SERIES_KEY];
+        assert_eq!(
+            windows.grayscale.unwrap().preset,
+            Some(WindowPreset::Abdomen)
+        );
+        assert_eq!(
+            windows.colour.unwrap().preset,
+            Some(WindowPreset::FullDynamic)
+        );
+
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 1));
+        app.reset_window_level(&context);
+        let windows = app.window_level.by_series[&SERIES_KEY];
+        assert_eq!(windows.colour, None);
+        assert_eq!(
+            windows.grayscale.unwrap().preset,
+            Some(WindowPreset::Abdomen)
+        );
+    }
+
+    /// The CT presets, windows in Hounsfield units, leave a colour image
+    /// alone, whether applied or pressed as keys 2-9, whose key events stay
+    /// unconsumed; Default and Full Dynamic still apply.
+    #[test]
+    fn ct_presets_leave_colour_images_alone() {
+        assert!(WindowPreset::Lung.applies_to(true));
+        assert!(!WindowPreset::Lung.applies_to(false));
+        assert!(WindowPreset::Default.applies_to(false));
+        assert!(WindowPreset::FullDynamic.applies_to(false));
+
+        let context = egui::Context::default();
+        let path = temporary_file("colour-ct-presets");
+        write_single_pixel_rgb_dicom(&path);
+        let mut app = DicronApp {
+            dicom_index: Some(build_for_file(&path).unwrap()),
+            ..Default::default()
+        };
+        assert!(app.load_slice_by_indices(&context, 0, 0, 0, 0));
+
+        app.apply_window_preset(&context, WindowPreset::Lung);
+        assert!(!app.window_level.customized);
+        assert_eq!(app.window_level.active_preset, Some(WindowPreset::Default));
+        assert_eq!(press_key(&mut app, egui::Key::Num3), 1);
+        assert!(!app.window_level.customized);
+
+        assert_eq!(press_key(&mut app, egui::Key::Num1), 0);
+        assert_eq!(
+            app.window_level.active_preset,
+            Some(WindowPreset::FullDynamic)
+        );
     }
 
     /// A mode chosen inside 3D while the selected series is still being

@@ -27,7 +27,8 @@ pub(super) fn show_control_row(
 ) -> Option<ViewerControlAction> {
     let mut action = None;
     let window_level_available = app.window_level.is_available();
-    let image_loaded = app.loaded_texture.is_some();
+    let grayscale = app.loaded_frame_grayscale;
+    let image_loaded = app.loaded_image.is_some();
     let active_window_preset = app.window_level.active_preset;
     let preset_button_label = format!("Preset: {}", app.window_level.active_preset_label());
     let three_d_supported = app.series_supports_three_d();
@@ -63,6 +64,7 @@ pub(super) fn show_control_row(
             ui,
             &preset_button_label,
             window_level_available,
+            grayscale,
             active_window_preset,
             &mut action,
         );
@@ -97,10 +99,12 @@ pub(super) fn show_control_row(
     action
 }
 
+/// The preset menu, listing the presets that apply to the frame on screen.
 fn show_window_preset_menu(
     ui: &mut egui::Ui,
     button_label: &str,
     window_level_available: bool,
+    grayscale: bool,
     active_preset: Option<WindowPreset>,
     action: &mut Option<ViewerControlAction>,
 ) {
@@ -114,7 +118,10 @@ fn show_window_preset_menu(
         .ui(ui, |ui| {
             ui.set_min_width(190.0);
 
-            for preset in WINDOW_PRESETS {
+            for preset in WINDOW_PRESETS
+                .into_iter()
+                .filter(|preset| preset.applies_to(grayscale))
+            {
                 let response = ui.selectable_label(
                     active_preset == Some(preset),
                     format!("{}  {}", preset.shortcut(), preset.label()),

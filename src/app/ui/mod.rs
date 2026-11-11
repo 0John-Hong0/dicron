@@ -11,7 +11,7 @@ mod toolbar;
 mod viewer;
 
 pub(in crate::app) use three_d::{GPU_UNAVAILABLE_MESSAGE, THREE_D_UNSUPPORTED_MESSAGE};
-pub(in crate::app) use viewer::upload_display_pixels;
+pub(in crate::app) use viewer::{ViewerImage, upload_display_pixels};
 
 pub(super) fn show(
     app: &mut crate::app::DicronApp,

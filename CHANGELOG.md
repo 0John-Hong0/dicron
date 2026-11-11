@@ -6,6 +6,11 @@ This project uses semantic versioning while it remains practical for a small des
 
 ## [Unreleased]
 
+- Add window/level and Full Dynamic controls for color images, keeping color and grayscale
+  windows separate within a series and showing CT presets only for grayscale frames.
+- Display images larger than the GPU texture limit using a reduced texture while preserving
+  their DICOM proportions and original pixel coordinates.
+
 - Reject DICOM files that declare values past the end of their data or nest sequences too deeply.
   Bound header allocations during scanning and cap frame counts using the pixel data present.
 - Check compressed frame sizes and fragment offsets before decoding, and limit overlay bitmaps

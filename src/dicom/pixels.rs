@@ -13,7 +13,7 @@ use dicom_encoding::transfer_syntax::{Codec, TransferSyntaxIndex};
 use dicom_object::DefaultDicomObject;
 use dicom_pixeldata::{
     ConvertOptions, DecodedPixelData, PhotometricInterpretation, PixelDecoder, PixelRepresentation,
-    VoiLutOption, WindowLevel,
+    VoiLutOption, WindowLevel, WindowLevelTransform,
 };
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 
@@ -113,10 +113,24 @@ impl DecodedFrame {
             return None;
         }
 
-        let Some(PixelProbeData::Monochrome { values, .. }) = &self.pixel_probe else {
-            return None;
+        let range = match &self.pixel_probe {
+            Some(PixelProbeData::Monochrome { values, .. }) => finite_value_range(values),
+            Some(PixelProbeData::Rgb { values, .. }) => values
+                .iter()
+                .fold(None, |range, &value| {
+                    let (minimum, maximum) = range.unwrap_or((value, value));
+                    Some((minimum.min(value), maximum.max(value)))
+                })
+                .map(|(minimum, maximum)| (f64::from(minimum), f64::from(maximum))),
+            None => None,
         };
-        finite_value_range(values).map(spanning_window)
+        range.map(spanning_window)
+    }
+
+    /// Whether the frame is grayscale, which the 3D workspace needs: it
+    /// reconstructs a volume from grayscale values.
+    pub(crate) fn is_grayscale(&self) -> bool {
+        self.decoded.photometric_interpretation().is_monochrome()
     }
 
     /// Approximate bytes this frame keeps in memory: the decoded samples, the
@@ -963,7 +977,12 @@ fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<D
         .unwrap_or(1)
         .max(1);
 
-    let window_level_available = decoded.photometric_interpretation().is_monochrome();
+    // The decoder draws colour frames without a window, so their channels are
+    // windowed here, in the 8-bit values they are shown with. A Window Center
+    // and Width in a colour file do not apply: PS3.3 C.11.2 defines them for
+    // grayscale.
+    let colour = is_colour(&decoded);
+    let window_level_available = colour || decoded.photometric_interpretation().is_monochrome();
     let pixel_probe = build_pixel_probe(&decoded);
     let overlay_bitmaps =
         read_overlay_bitmaps(dicom_object, frame_index, decoded.columns(), decoded.rows());
@@ -971,15 +990,23 @@ fn decode_frame(dicom_object: &DefaultDicomObject, frame_index: u32) -> Result<D
         Some(PixelProbeData::Monochrome { values, .. }) => Ok(values.as_slice()),
         _ => bail!("could not read rescaled grayscale values"),
     })?;
-    let default_window = decoded
-        .window()?
-        .and_then(<[_]>::first)
-        .filter(|window| usable_window(window))
-        .map(|window| DicomWindow {
-            center: window.center,
-            width: window.width,
-        });
-    let value_range = compute_value_range(&decoded)?;
+    let default_window = if colour {
+        None
+    } else {
+        decoded
+            .window()?
+            .and_then(<[_]>::first)
+            .filter(|window| usable_window(window))
+            .map(|window| DicomWindow {
+                center: window.center,
+                width: window.width,
+            })
+    };
+    let value_range = if colour {
+        (0.0, 255.0)
+    } else {
+        compute_value_range(&decoded)?
+    };
 
     Ok(DecodedFrame {
         decoded,
@@ -1297,9 +1324,38 @@ fn render_decoded_frame(
             .context("could not convert DICOM pixel data to image")?
             .into_rgba8()
     };
+    if is_colour(decoded)
+        && let Some(window) = window
+        && window.center.is_finite()
+        && window.width.is_finite()
+    {
+        window_colour_channels(&mut rgba, window);
+    }
     paint_overlay_bitmaps(overlay_bitmaps, &mut rgba);
 
     Ok(rgba)
+}
+
+/// Whether the decoder draws the frame as colour: three samples a pixel, RGB
+/// or converted from YBR. It leaves the modality and VOI LUTs out of these.
+fn is_colour(decoded: &DecodedPixelData<'_>) -> bool {
+    decoded.samples_per_pixel() == 3
+}
+
+/// Windows each channel of a colour frame's shown 8-bit values with the
+/// linear VOI function the decoder applies to grayscale frames, cutting the
+/// result to a whole value as it does.
+fn window_colour_channels(rgba: &mut image::RgbaImage, window: DicomWindow) {
+    let transform = WindowLevelTransform::linear(WindowLevel {
+        center: window.center,
+        width: window.width,
+    });
+    let shown: [u8; 256] = std::array::from_fn(|value| transform.apply(value as f64, 255.0) as u8);
+    for pixel in rgba.pixels_mut() {
+        for channel in &mut pixel.0[..3] {
+            *channel = shown[usize::from(*channel)];
+        }
+    }
 }
 
 /// Overlay-only reports have no intensity range to normalize. Their zero-filled
@@ -1576,9 +1632,9 @@ mod tests {
     use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
 
     use super::{
-        PixelProbeValue, decode_frame, finite_value_range, jpeg_frame_size, jpeg_restart_interval,
-        load_dicom_frame, load_dicom_thumbnail, monochrome_test_frame, render_frame,
-        thumbnail_dimensions, write_rle_test_slice,
+        DicomWindow, PixelProbeValue, decode_frame, finite_value_range, jpeg_frame_size,
+        jpeg_restart_interval, load_dicom_frame, load_dicom_thumbnail, monochrome_test_frame,
+        render_frame, thumbnail_dimensions, write_rle_test_slice,
     };
 
     /// A compressed file cut short must fail to open, not take the
@@ -2307,9 +2363,9 @@ mod tests {
             .collect()
     }
 
-    /// Colour images have nothing to window and keep their colours.
-    #[test]
-    fn rgb_image_keeps_its_colours() {
+    /// A 2 x 2 8-bit RGB image of `samples`, red, green and blue for each
+    /// pixel in turn.
+    fn rgb_two_by_two(samples: Vec<u8>) -> DefaultDicomObject {
         let mut object = black_two_by_two_image_with_overlay_pixel();
         object.remove_element(Tag(0x6000, 0x3000));
         for (tag, value) in [
@@ -2323,21 +2379,119 @@ mod tests {
             VR::CS,
             PrimitiveValue::from("RGB"),
         ));
-        let samples = [[10, 20, 30], [40, 50, 60], [70, 80, 90], [100, 110, 120]];
         object.put_element(DataElement::new(
             tags::PIXEL_DATA,
             VR::OB,
-            PrimitiveValue::from(samples.concat()),
+            PrimitiveValue::from(samples),
         ));
+        object
+    }
+
+    /// A one-row 8-bit MONOCHROME2 image of `values`.
+    fn grey_row(values: &[u8]) -> DefaultDicomObject {
+        let mut object = black_two_by_two_image_with_overlay_pixel();
+        object.remove_element(Tag(0x6000, 0x3000));
+        for (tag, value) in [(tags::ROWS, 1_u16), (tags::COLUMNS, values.len() as u16)] {
+            object.put_element(DataElement::new(tag, VR::US, PrimitiveValue::from(value)));
+        }
+        object.put_element(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from(values.to_vec()),
+        ));
+        object
+    }
+
+    fn shown_rgb(rgba: &[u8]) -> Vec<u8> {
+        rgba.chunks_exact(4)
+            .flat_map(|pixel| pixel[..3].to_vec())
+            .collect()
+    }
+
+    /// A colour frame takes a window on each of its channels, as a grayscale
+    /// frame of the same values takes it: by the linear VOI function of
+    /// PS3.3 C.11.2.1.2.1, which for center 128 and width 128 runs from black
+    /// at 64 to white above 191. 96 shows as 64.25, 128 as 128.50, 160 as
+    /// 192.76, 130 as 132.52, 127 as 126.50 and 129 as 130.51, each cut to a
+    /// whole 8-bit value as the decoder cuts grayscale ones.
+    #[test]
+    fn colour_frames_take_a_window_on_each_channel() {
+        let samples = vec![64, 96, 128, 160, 192, 255, 0, 130, 250, 127, 128, 129];
+        let colour = decode_frame(&rgb_two_by_two(samples.clone()), 0).unwrap();
+        let grey = decode_frame(&grey_row(&samples), 0).unwrap();
+        let window = Some(DicomWindow {
+            center: 128.0,
+            width: 128.0,
+        });
+
+        let colour_rgba = render_frame(&colour, window).unwrap().rgba;
+        let shown = shown_rgb(&colour_rgba);
+        assert_eq!(
+            shown,
+            vec![0, 64, 128, 192, 255, 255, 0, 132, 255, 126, 128, 130]
+        );
+        assert!(colour_rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        let grey_shown: Vec<u8> = render_frame(&grey, window)
+            .unwrap()
+            .rgba
+            .chunks_exact(4)
+            .map(|pixel| pixel[0])
+            .collect();
+        assert_eq!(shown, grey_shown);
+    }
+
+    /// Colour frames, RGB or converted from YBR, are windowed in the 8-bit
+    /// values they are shown with and the pixel probe reports: 0 to 255,
+    /// starting from the window spanning them. A Window Center and Width in a
+    /// colour file are left out, as PS3.3 C.11.2 defines them for grayscale.
+    #[test]
+    fn colour_frames_are_windowed_in_their_shown_values() {
+        let mut object = rgb_two_by_two((0..12).map(|value| value * 20).collect());
+        for (tag, value) in [(tags::WINDOW_CENTER, "40"), (tags::WINDOW_WIDTH, "400")] {
+            object.put_element(DataElement::new(tag, VR::DS, PrimitiveValue::from(value)));
+        }
+        let rgb = decode_frame(&object, 0).unwrap();
+        assert!(rgb.window_level_available());
+        assert_eq!(rgb.value_range, (0.0, 255.0));
+        assert_eq!(rgb.default_center_width(), (127.5, 255.0));
+
+        let ybr = decode_frame(&native_ybr_full_422_row(&[50, 200, 90, 170], 2, 1), 0).unwrap();
+        assert!(ybr.window_level_available());
+        assert_eq!(ybr.value_range, (0.0, 255.0));
+        assert_eq!(ybr.default_center_width(), (127.5, 255.0));
+    }
+
+    /// Full Dynamic on a colour frame spans its lowest to its highest shown
+    /// channel value, here 10 to 120.
+    #[test]
+    fn colour_full_dynamic_spans_the_shown_channel_values() {
+        let frame = decode_frame(
+            &rgb_two_by_two((1..=12).map(|value| value * 10).collect()),
+            0,
+        )
+        .unwrap();
+
+        let window = frame.full_dynamic_window().unwrap();
+        assert_eq!((window.center, window.width), (65.0, 110.0));
+    }
+
+    /// Colour images keep their colours until a window is asked for.
+    #[test]
+    fn rgb_image_keeps_its_colours() {
+        let samples: Vec<u8> = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let object = rgb_two_by_two(samples.clone());
         let frame = decode_frame(&object, 0).unwrap();
 
-        assert_eq!(rgb(&render_frame(&frame, None).unwrap().rgba), samples);
+        assert_eq!(
+            shown_rgb(&render_frame(&frame, None).unwrap().rgba),
+            samples
+        );
         assert_eq!(frame.default_center_width(), (127.5, 255.0));
         let path = std::env::temp_dir().join(format!("dicron-rgb-{}.dcm", std::process::id()));
         object.write_to_file(&path).unwrap();
         let thumbnail = load_dicom_thumbnail(&path, 0, 2);
         std::fs::remove_file(path).unwrap();
-        assert_eq!(rgb(&thumbnail.unwrap().rgba), samples);
+        assert_eq!(shown_rgb(&thumbnail.unwrap().rgba), samples);
     }
 
     /// Create a native single-row image with packed 4:2:2 pixel pairs.
