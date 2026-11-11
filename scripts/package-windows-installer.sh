@@ -42,6 +42,12 @@ if ! command -v makensis >/dev/null 2>&1; then
     exit 1
 fi
 
+if [[ ! -f dist/THIRD_PARTY_LICENSES.html ]]; then
+    echo "ERROR: dist/THIRD_PARTY_LICENSES.html not found."
+    echo "Run scripts/generate-third-party-licenses.sh first."
+    exit 1
+fi
+
 EXE_PATH="$(find "target/$TARGET/release" -maxdepth 1 -type f -name '*.exe' | head -n 1)"
 
 if [[ -z "$EXE_PATH" ]]; then

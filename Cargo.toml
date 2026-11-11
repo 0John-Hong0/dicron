@@ -47,12 +47,15 @@ copyright = "2026, 0John-Hong0"
 extended-description = """
 A simple native DICOM viewer built with Rust and egui.
 """
-depends = "$auto"
+# winit loads its X11 libraries at runtime, so $auto cannot see them.
+depends = "$auto, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0"
 section = "graphics"
 priority = "optional"
 assets = [
     ["target/release/dicron", "usr/bin/dicron", "755"],
     ["packaging/linux/dicron.desktop", "usr/share/applications/dicron.desktop", "644"],
     ["assets/icon.png", "usr/share/icons/hicolor/256x256/apps/dicron.png", "644"],
+    ["THIRD_PARTY_NOTICES.md", "usr/share/doc/dicron/THIRD_PARTY_NOTICES.md", "644"],
     ["assets/licenses/*", "usr/share/doc/dicron/licenses/", "644"],
+    ["dist/THIRD_PARTY_LICENSES.html", "usr/share/doc/dicron/licenses/THIRD_PARTY_LICENSES.html", "644"],
 ]

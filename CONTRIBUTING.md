@@ -36,7 +36,10 @@ Before opening a PR:
 1. Run `cargo fmt --check`.
 2. Run `cargo clippy --all-targets --all-features -- -D warnings`.
 3. Run `cargo test`.
-4. Update `README.md`, `CHANGELOG.md`, or packaging docs when user-visible behavior changes.
+4. When adding or updating dependencies, run `./scripts/generate-third-party-licenses.sh`
+   (it needs `cargo install --locked cargo-about --features cli`). It fails when a crate uses a
+   license that `about.toml` does not accept yet.
+5. Update `README.md`, `CHANGELOG.md`, or packaging docs when user-visible behavior changes.
 
 Good PR descriptions include:
 

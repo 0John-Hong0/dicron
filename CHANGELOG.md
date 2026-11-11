@@ -24,6 +24,10 @@ This project uses semantic versioning while it remains practical for a small des
 - Decode Korean and Japanese ISO 2022 text and recognize more undeclared Korean text in Auto mode.
 - Use creation dates when sorting images across midnight, and keep metadata copy selections tied
   to their elements when scrolling or searching.
+- Declare the X11 runtime libraries needed by the Linux packages and bundle the Visual C++
+  runtime with the Windows installer.
+- Ship the GPL text with the Windows installer. Include third-party notices, font licenses,
+  and a generated Rust dependency license report in packages, and attach the report to releases.
 
 ## [0.6.1] - 2026-11-03
 

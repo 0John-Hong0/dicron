@@ -6,7 +6,7 @@ pkgrel=1
 pkgdesc="Native DICOM image viewer"
 arch=("x86_64")
 url="https://github.com/0John-Hong0/dicron"
-license=("GPL-3.0-or-later" "OFL-1.1")
+license=("GPL-3.0-or-later" "OFL-1.1" "BSD-2-Clause" "BSD-3-Clause" "IJG")
 # rust-lld cannot link GCC slim-LTO objects bundled by native Rust dependencies
 # such as ring, so keep makepkg's native LTO disabled for this package.
 options=("!debug" "!lto")
@@ -17,6 +17,7 @@ depends=(
   "fontconfig"
   "freetype2"
   "libx11"
+  "libxcb"
   "libxi"
   "libxcursor"
   "libxrandr"
@@ -24,6 +25,7 @@ depends=(
   "mesa"
   "wayland"
   "libxkbcommon"
+  "libxkbcommon-x11"
   "gtk3"
   "charls"
 )
@@ -40,7 +42,16 @@ makedepends=(
 source=("${pkgname}::git+file://${startdir}/../..")
 sha256sums=("SKIP")
 
+# Generated outside the git checkout by scripts/generate-third-party-licenses.sh.
+_third_party_licenses="${startdir}/../../dist/THIRD_PARTY_LICENSES.html"
+
 prepare() {
+  if [[ ! -f "${_third_party_licenses}" ]]; then
+    echo "ERROR: ${_third_party_licenses} not found."
+    echo "Run scripts/generate-third-party-licenses.sh from the project root first."
+    return 1
+  fi
+
   cd "${srcdir}/${pkgname}"
   bash scripts/fetch-fonts.sh
 }
@@ -87,4 +98,10 @@ package() {
     install -d "${pkgdir}/usr/share/licenses/${pkgname}"
     install -m644 assets/licenses/* "${pkgdir}/usr/share/licenses/${pkgname}/"
   fi
+
+  install -Dm644 "THIRD_PARTY_NOTICES.md" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_NOTICES.md"
+
+  install -Dm644 "${_third_party_licenses}" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_LICENSES.html"
 }
